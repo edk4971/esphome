@@ -9,6 +9,12 @@
 
 #include "esphome/components/microphone/microphone_source.h"
 #include "esphome/components/ring_buffer/ring_buffer.h"
+#ifdef USE_MEDIA_PLAYER
+#include "esphome/components/media_player/media_player.h"
+#endif
+#ifdef USE_MICRO_WAKE_WORD
+#include "esphome/components/micro_wake_word/micro_wake_word.h"
+#endif
 #ifdef USE_SPEAKER
 #include "esphome/components/speaker/speaker.h"
 #endif
@@ -23,6 +29,14 @@
 #include <vector>
 
 namespace esphome::openai_assistant {
+
+struct Timer {
+  std::string id;
+  std::string name;
+  uint32_t total_seconds{0};
+  uint32_t seconds_left{0};
+  bool is_active{false};
+};
 
 enum class State : uint8_t {
   IDLE,
@@ -39,7 +53,7 @@ enum class State : uint8_t {
 class OpenAIAssistant : public Component {
  public:
   OpenAIAssistant();
-  ~OpenAIAssistant() override;
+  ~OpenAIAssistant();
 
   void setup() override;
   void loop() override;
@@ -52,6 +66,18 @@ class OpenAIAssistant : public Component {
   void set_endpoint(const std::string &endpoint) { this->endpoint_ = endpoint; }
   void set_system_prompt(const std::string &system_prompt) { this->system_prompt_ = system_prompt; }
   void set_use_wake_word(bool use_wake_word) { this->use_wake_word_ = use_wake_word; }
+  void set_wake_word(const std::string &wake_word) { this->wake_word_ = wake_word; }
+  void set_noise_suppression_level(uint8_t noise_suppression_level) {
+    this->noise_suppression_level_ = noise_suppression_level;
+  }
+  void set_auto_gain(uint8_t auto_gain) { this->auto_gain_ = auto_gain; }
+  void set_volume_multiplier(float volume_multiplier) { this->volume_multiplier_ = volume_multiplier; }
+#ifdef USE_MICRO_WAKE_WORD
+  void set_micro_wake_word(micro_wake_word::MicroWakeWord *mww) { this->micro_wake_word_ = mww; }
+#endif
+#ifdef USE_MEDIA_PLAYER
+  void set_media_player(media_player::MediaPlayer *media_player) { this->media_player_ = media_player; }
+#endif
 #ifdef USE_SPEAKER
   void set_speaker(speaker::Speaker *speaker) { this->speaker_ = speaker; }
 #endif
@@ -68,6 +94,7 @@ class OpenAIAssistant : public Component {
 
   Trigger<> *get_listening_trigger() { return &this->listening_trigger_; }
   Trigger<> *get_start_trigger() { return &this->start_trigger_; }
+  Trigger<> *get_wake_word_detected_trigger() { return &this->wake_word_detected_trigger_; }
   Trigger<> *get_stt_vad_start_trigger() { return &this->stt_vad_start_trigger_; }
   Trigger<> *get_stt_vad_end_trigger() { return &this->stt_vad_end_trigger_; }
   Trigger<std::string> *get_stt_end_trigger() { return &this->stt_end_trigger_; }
@@ -80,6 +107,12 @@ class OpenAIAssistant : public Component {
   Trigger<> *get_idle_trigger() { return &this->idle_trigger_; }
   Trigger<> *get_client_connected_trigger() { return &this->client_connected_trigger_; }
   Trigger<> *get_client_disconnected_trigger() { return &this->client_disconnected_trigger_; }
+  Trigger<Timer> *get_timer_started_trigger() { return &this->timer_started_trigger_; }
+  Trigger<Timer> *get_timer_updated_trigger() { return &this->timer_updated_trigger_; }
+  Trigger<Timer> *get_timer_cancelled_trigger() { return &this->timer_cancelled_trigger_; }
+  Trigger<Timer> *get_timer_finished_trigger() { return &this->timer_finished_trigger_; }
+  Trigger<const std::vector<Timer> &> *get_timer_tick_trigger() { return &this->timer_tick_trigger_; }
+  const std::vector<Timer> &get_timers() const { return this->timers_; }
 
  protected:
   bool allocate_buffers_();
@@ -103,6 +136,12 @@ class OpenAIAssistant : public Component {
   microphone::MicrophoneSource *mic_source_{nullptr};
   std::unique_ptr<ring_buffer::RingBuffer> ring_buffer_;
 
+#ifdef USE_MICRO_WAKE_WORD
+  micro_wake_word::MicroWakeWord *micro_wake_word_{nullptr};
+#endif
+#ifdef USE_MEDIA_PLAYER
+  media_player::MediaPlayer *media_player_{nullptr};
+#endif
 #ifdef USE_SPEAKER
   speaker::Speaker *speaker_{nullptr};
   uint8_t *speaker_buffer_{nullptr};
@@ -120,6 +159,7 @@ class OpenAIAssistant : public Component {
   std::string api_key_;
   std::string model_;
   std::string system_prompt_;
+  std::string wake_word_;
   std::string rx_message_;
   std::string request_text_;
   std::string response_text_;
@@ -129,12 +169,18 @@ class OpenAIAssistant : public Component {
   bool continuous_{false};
   bool silence_detection_{true};
   bool use_wake_word_{false};
+  uint8_t noise_suppression_level_{0};
+  uint8_t auto_gain_{0};
+  float volume_multiplier_{1.0f};
   bool tts_streaming_{false};
   bool response_text_active_{false};
   State state_{State::IDLE};
 
+  std::vector<Timer> timers_;
+
   Trigger<> listening_trigger_;
   Trigger<> start_trigger_;
+  Trigger<> wake_word_detected_trigger_;
   Trigger<> stt_vad_start_trigger_;
   Trigger<> stt_vad_end_trigger_;
   Trigger<std::string> stt_end_trigger_;
@@ -147,11 +193,21 @@ class OpenAIAssistant : public Component {
   Trigger<> idle_trigger_;
   Trigger<> client_connected_trigger_;
   Trigger<> client_disconnected_trigger_;
+  Trigger<Timer> timer_started_trigger_;
+  Trigger<Timer> timer_finished_trigger_;
+  Trigger<Timer> timer_updated_trigger_;
+  Trigger<Timer> timer_cancelled_trigger_;
+  Trigger<const std::vector<Timer> &> timer_tick_trigger_;
 };
 
 template<typename... Ts> class StartAction : public Action<Ts...>, public Parented<OpenAIAssistant> {
+  TEMPLATABLE_VALUE(std::string, wake_word)
+
  public:
-  void play(const Ts &...x) override { this->parent_->request_start(false, this->silence_detection_); }
+  void play(const Ts &...x) override {
+    this->parent_->set_wake_word(this->wake_word_.value(x...));
+    this->parent_->request_start(false, this->silence_detection_);
+  }
   void set_silence_detection(bool silence_detection) { this->silence_detection_ = silence_detection; }
 
  protected:

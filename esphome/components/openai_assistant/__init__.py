@@ -1,10 +1,18 @@
 from esphome import automation
 from esphome.automation import register_action, register_condition
 import esphome.codegen as cg
-from esphome.components import esp32, microphone, speaker, text_sensor
+from esphome.components import (
+    esp32,
+    media_player,
+    micro_wake_word,
+    microphone,
+    speaker,
+    text_sensor,
+)
 import esphome.config_validation as cv
 from esphome.const import (
     CONF_ID,
+    CONF_MEDIA_PLAYER,
     CONF_MICROPHONE,
     CONF_MODEL,
     CONF_ON_CLIENT_CONNECTED,
@@ -34,8 +42,19 @@ CONF_ON_TTS_END = "on_tts_end"
 CONF_ON_TTS_START = "on_tts_start"
 CONF_ON_TTS_STREAM_END = "on_tts_stream_end"
 CONF_ON_TTS_STREAM_START = "on_tts_stream_start"
+CONF_ON_WAKE_WORD_DETECTED = "on_wake_word_detected"
 CONF_USE_WAKE_WORD = "use_wake_word"
 CONF_SILENCE_DETECTION = "silence_detection"
+CONF_AUTO_GAIN = "auto_gain"
+CONF_MICRO_WAKE_WORD = "micro_wake_word"
+CONF_NOISE_SUPPRESSION_LEVEL = "noise_suppression_level"
+CONF_VOLUME_MULTIPLIER = "volume_multiplier"
+CONF_WAKE_WORD = "wake_word"
+CONF_ON_TIMER_STARTED = "on_timer_started"
+CONF_ON_TIMER_UPDATED = "on_timer_updated"
+CONF_ON_TIMER_CANCELLED = "on_timer_cancelled"
+CONF_ON_TIMER_FINISHED = "on_timer_finished"
+CONF_ON_TIMER_TICK = "on_timer_tick"
 
 openai_assistant_ns = cg.esphome_ns.namespace("openai_assistant")
 OpenAIAssistant = openai_assistant_ns.class_("OpenAIAssistant", cg.Component)
@@ -55,6 +74,7 @@ IsRunningCondition = openai_assistant_ns.class_(
 ConnectedCondition = openai_assistant_ns.class_(
     "ConnectedCondition", automation.Condition, cg.Parented.template(OpenAIAssistant)
 )
+Timer = openai_assistant_ns.struct("Timer")
 
 
 def _websocket_endpoint(value):
@@ -71,19 +91,36 @@ CONFIG_SCHEMA = cv.All(
             cv.Required(CONF_API_KEY): cv.string,
             cv.Required(CONF_MODEL): cv.string,
             cv.Required(CONF_ENDPOINT): _websocket_endpoint,
-            cv.Required(CONF_SYSTEM_PROMPT): cv.string,
+            cv.Optional(
+                CONF_SYSTEM_PROMPT, default="You are a helpful voice assistant."
+            ): cv.string,
             cv.Optional(CONF_MICROPHONE, default={}): microphone.microphone_source_schema(
                 min_bits_per_sample=16,
                 max_bits_per_sample=16,
                 min_channels=1,
                 max_channels=1,
             ),
-            cv.Optional(CONF_SPEAKER): cv.use_id(speaker.Speaker),
+            cv.Exclusive(CONF_MEDIA_PLAYER, "output"): cv.use_id(
+                media_player.MediaPlayer
+            ),
+            cv.Exclusive(CONF_SPEAKER, "output"): cv.use_id(speaker.Speaker),
             cv.Optional(CONF_TEXT_REQUEST): cv.use_id(text_sensor.TextSensor),
             cv.Optional(CONF_TEXT_RESPONSE): cv.use_id(text_sensor.TextSensor),
             cv.Optional(CONF_USE_WAKE_WORD, default=False): cv.boolean,
+            cv.Optional(CONF_MICRO_WAKE_WORD): cv.use_id(micro_wake_word.MicroWakeWord),
+            cv.Optional(CONF_NOISE_SUPPRESSION_LEVEL, default=0): cv.int_range(0, 4),
+            cv.Optional(CONF_AUTO_GAIN, default="0dBFS"): cv.All(
+                cv.float_with_unit("decibel full scale", "(dBFS|dbfs|DBFS)"),
+                cv.int_range(0, 31),
+            ),
+            cv.Optional(CONF_VOLUME_MULTIPLIER, default=1.0): cv.float_range(
+                min=0.0, min_included=False
+            ),
             cv.Optional(CONF_ON_LISTENING): automation.validate_automation(single=True),
             cv.Optional(CONF_ON_START): automation.validate_automation(single=True),
+            cv.Optional(CONF_ON_WAKE_WORD_DETECTED): automation.validate_automation(
+                single=True
+            ),
             cv.Optional(CONF_ON_STT_END): automation.validate_automation(single=True),
             cv.Optional(CONF_ON_STT_VAD_START): automation.validate_automation(single=True),
             cv.Optional(CONF_ON_STT_VAD_END): automation.validate_automation(single=True),
@@ -100,6 +137,19 @@ CONFIG_SCHEMA = cv.All(
             cv.Optional(CONF_ON_CLIENT_DISCONNECTED): automation.validate_automation(
                 single=True
             ),
+            cv.Optional(CONF_ON_TIMER_STARTED): automation.validate_automation(
+                single=True
+            ),
+            cv.Optional(CONF_ON_TIMER_UPDATED): automation.validate_automation(
+                single=True
+            ),
+            cv.Optional(CONF_ON_TIMER_CANCELLED): automation.validate_automation(
+                single=True
+            ),
+            cv.Optional(CONF_ON_TIMER_FINISHED): automation.validate_automation(
+                single=True
+            ),
+            cv.Optional(CONF_ON_TIMER_TICK): automation.validate_automation(single=True),
         }
     ).extend(cv.COMPONENT_SCHEMA),
     cv.only_on_esp32,
@@ -127,6 +177,14 @@ async def to_code(config):
         spkr = await cg.get_variable(spkr_id)
         cg.add(var.set_speaker(spkr))
 
+    if media_player_id := config.get(CONF_MEDIA_PLAYER):
+        mp = await cg.get_variable(media_player_id)
+        cg.add(var.set_media_player(mp))
+
+    if mww_id := config.get(CONF_MICRO_WAKE_WORD):
+        mww = await cg.get_variable(mww_id)
+        cg.add(var.set_micro_wake_word(mww))
+
     if text_request_id := config.get(CONF_TEXT_REQUEST):
         sens = await cg.get_variable(text_request_id)
         cg.add(var.set_text_request_sensor(sens))
@@ -140,6 +198,9 @@ async def to_code(config):
     cg.add(var.set_endpoint(config[CONF_ENDPOINT]))
     cg.add(var.set_system_prompt(config[CONF_SYSTEM_PROMPT]))
     cg.add(var.set_use_wake_word(config[CONF_USE_WAKE_WORD]))
+    cg.add(var.set_noise_suppression_level(config[CONF_NOISE_SUPPRESSION_LEVEL]))
+    cg.add(var.set_auto_gain(config[CONF_AUTO_GAIN]))
+    cg.add(var.set_volume_multiplier(config[CONF_VOLUME_MULTIPLIER]))
 
     if CONF_ON_LISTENING in config:
         await automation.build_automation(
@@ -147,6 +208,10 @@ async def to_code(config):
         )
     if CONF_ON_START in config:
         await automation.build_automation(var.get_start_trigger(), [], config[CONF_ON_START])
+    if CONF_ON_WAKE_WORD_DETECTED in config:
+        await automation.build_automation(
+            var.get_wake_word_detected_trigger(), [], config[CONF_ON_WAKE_WORD_DETECTED]
+        )
     if CONF_ON_STT_END in config:
         await automation.build_automation(
             var.get_stt_end_trigger(), [(cg.std_string, "x")], config[CONF_ON_STT_END]
@@ -195,6 +260,28 @@ async def to_code(config):
         await automation.build_automation(
             var.get_client_disconnected_trigger(), [], config[CONF_ON_CLIENT_DISCONNECTED]
         )
+    if on_timer_started := config.get(CONF_ON_TIMER_STARTED):
+        await automation.build_automation(
+            var.get_timer_started_trigger(), [(Timer, "timer")], on_timer_started
+        )
+    if on_timer_updated := config.get(CONF_ON_TIMER_UPDATED):
+        await automation.build_automation(
+            var.get_timer_updated_trigger(), [(Timer, "timer")], on_timer_updated
+        )
+    if on_timer_cancelled := config.get(CONF_ON_TIMER_CANCELLED):
+        await automation.build_automation(
+            var.get_timer_cancelled_trigger(), [(Timer, "timer")], on_timer_cancelled
+        )
+    if on_timer_finished := config.get(CONF_ON_TIMER_FINISHED):
+        await automation.build_automation(
+            var.get_timer_finished_trigger(), [(Timer, "timer")], on_timer_finished
+        )
+    if on_timer_tick := config.get(CONF_ON_TIMER_TICK):
+        await automation.build_automation(
+            var.get_timer_tick_trigger(),
+            [(cg.std_vector.template(Timer).operator("const").operator("ref"), "timers")],
+            on_timer_tick,
+        )
 
     cg.add_define("USE_OPENAI_ASSISTANT")
     esp32.add_idf_component(name="espressif/esp_websocket_client", ref="1.4.0")
@@ -215,7 +302,10 @@ OPENAI_ASSISTANT_ACTION_SCHEMA = cv.Schema(
     "openai_assistant.start",
     StartAction,
     OPENAI_ASSISTANT_ACTION_SCHEMA.extend(
-        {cv.Optional(CONF_SILENCE_DETECTION, default=True): cv.boolean}
+        {
+            cv.Optional(CONF_SILENCE_DETECTION, default=True): cv.boolean,
+            cv.Optional(CONF_WAKE_WORD): cv.templatable(cv.string),
+        }
     ),
     synchronous=True,
 )
@@ -224,6 +314,9 @@ async def openai_assistant_start_to_code(config, action_id, template_arg, args):
     await cg.register_parented(var, config[CONF_ID])
     if CONF_SILENCE_DETECTION in config:
         cg.add(var.set_silence_detection(config[CONF_SILENCE_DETECTION]))
+    if wake_word := config.get(CONF_WAKE_WORD):
+        templ = await cg.templatable(wake_word, args, cg.std_string)
+        cg.add(var.set_wake_word(templ))
     return var
 
 

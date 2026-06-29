@@ -160,6 +160,9 @@ void OpenAIAssistant::request_start(bool continuous, bool silence_detection) {
     return;
   }
   this->clear_buffers_();
+  if (!this->wake_word_.empty()) {
+    this->wake_word_detected_trigger_.trigger();
+  }
   this->set_state_(State::CONNECTING);
   if (!this->connect_()) {
     this->error_trigger_.trigger("connection-failed", "Could not connect to realtime endpoint");
