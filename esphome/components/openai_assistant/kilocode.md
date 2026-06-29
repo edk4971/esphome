@@ -140,14 +140,71 @@ This first pass avoids unbounded buffering. If response audio arrives faster tha
 
 I avoided tests in this pass because this workspace does not contain the normal ESPHome `tests/` fixture tree, and the user indicated they will test in Docker.
 
+## Post-Compile Update
+
+The component compiled cleanly in the user's Docker environment after fixing the destructor declaration. The original header declared `~OpenAIAssistant() override`, but the ESPHome `Component` base in this build does not provide a destructor signature that can be overridden. The fix was to keep the destructor but remove `override`.
+
+After the first YAML validation pass, I added compatibility for the ESPHome Box voice assistant package shape:
+
+- `openai_assistant.start` accepts templated `wake_word`, matching `voice_assistant.start`.
+- `system_prompt` is optional with a default of `You are a helpful voice assistant.`
+- `media_player`, `micro_wake_word`, `noise_suppression_level`, `auto_gain`, and `volume_multiplier` are accepted by the schema.
+- `on_wake_word_detected` is accepted and triggered when `openai_assistant.start` receives a non-empty wake word.
+- Timer triggers and `openai_assistant::Timer`/`get_timers()` exist as a compatibility surface for the ESPHome Box display lambdas.
+
+## What Is Still A Shell
+
+`media_player` is accepted and stored, but it is not used for response output.
+
+The current runtime path decodes Realtime API `response.audio.delta` PCM16 chunks and sends them to `speaker::Speaker`. That is the right primitive for streaming raw PCM from a websocket. `media_player` is a higher-level entity better suited to URLs, files, announcements, and pipeline-managed playback. Implementing true `media_player` output would either require buffering response audio into a media pipeline format or creating a custom stream source that the media player pipeline can consume. That is extra complexity with little benefit for the direct Realtime audio path. My recommendation is to keep actual assistant response output speaker-based and use `media_player` only for independent announcements/timer sounds in the ESPHome Box package.
+
+To make the current package behavior line up with the implementation, the YAML should ideally pass `speaker: box_speaker` to `openai_assistant` instead of only `media_player: speaker_media_player`. Keeping `media_player` accepted is useful for drop-in validation compatibility, but it should not be the primary response output path unless we intentionally build a media pipeline integration.
+
+`micro_wake_word` is accepted and stored, but ownership coordination is minimal.
+
+On-device wake word already works through the YAML-level `micro_wake_word.on_wake_word_detected -> openai_assistant.start` handoff. That is the cleanest integration because `micro_wake_word` owns wake-word listening, then `openai_assistant` owns the conversation once started. The stored `micro_wake_word` pointer is currently compatibility-only. A deeper integration could let `openai_assistant` directly start/stop mWW, but the existing scripts already manage that and avoid hidden microphone ownership conflicts.
+
+`use_wake_word` / `start_continuous` is only a compatibility mode, not true streaming wake word detection.
+
+The built-in `voice_assistant` can delegate continuous wake-word handling to Home Assistant. This component does not have a Home Assistant pipeline, so `start_continuous` currently starts the direct Realtime microphone stream rather than implementing a separate wake-word detector. For this project, on-device `micro_wake_word` should be the preferred wake-word mode.
+
+Timer support is a shell.
+
+The `Timer` struct, timer triggers, and `get_timers()` exist so the ESPHome Box display/timer lambdas can compile. The OpenAI Realtime API does not provide the same Home Assistant timer event stream that ESPHome `voice_assistant` receives over the native API. Implementing timers would require a local timer manager or tool/function-call handling from the model, plus event generation for `on_timer_started`, `on_timer_updated`, `on_timer_cancelled`, `on_timer_finished`, and `on_timer_tick`. Until that exists, timer UI code can compile but no assistant-created timers will appear.
+
+`noise_suppression_level`, `auto_gain`, and `volume_multiplier` are stored but not applied.
+
+`MicrophoneSource` already supports gain factor at source creation time, but these voice-assistant compatibility options are not mapped into active DSP. True noise suppression would need an audio preprocessing implementation. `volume_multiplier` should be applied when decoding output PCM before writing to the speaker, with clipping, if runtime testing shows output level needs component-side control.
+
+Audio buffering is functional but basic.
+
+The speaker side currently uses a fixed-size buffer and drops an incoming audio chunk if the buffer is full. This avoids unbounded heap growth and fragmentation, but it is not ideal under bursty network conditions. A better implementation would use a ring buffer or backpressure strategy.
+
+Audio format handling is basic.
+
+The component assumes 16 kHz mono PCM16 input and configures Realtime output as PCM16. The ESPHome Box speaker in the current YAML is configured at 48 kHz, while `OpenAIAssistant::setup()` sets the speaker stream info to 16 kHz. If the speaker driver/pipeline does not resample for this direct `speaker::Speaker` path, output quality or playback speed may need a resampler or a 24 kHz/48 kHz endpoint configuration.
+
+## Current Recommendation
+
+Use `speaker` for assistant response audio.
+
+Keep `media_player` accepted for package compatibility and for unrelated announcements/timer sounds, but do not implement Realtime response output through `media_player` unless there is a clear requirement. The direct Realtime API gives us raw PCM chunks, and `speaker` is the natural ESPHome sink for that.
+
+Use YAML-level `micro_wake_word` handoff for wake word support.
+
+The best short-term behavior is `micro_wake_word` detects locally, stops itself through the existing scripts, then calls `openai_assistant.start` with `wake_word`. Direct `micro_wake_word` ownership inside `openai_assistant` can wait until the conversation path is stable.
+
+Leave timers as a compatibility shell for now.
+
+Timers are not part of the basic Realtime voice loop. They should be implemented later as local tool/function-call behavior if timer support is actually needed.
+
 ## Known Follow-Ups
 
-- Compile in the Docker ESPHome environment and fix any `esp_websocket_client` API/version mismatches.
-- Confirm whether `espressif/esp_websocket_client` version `1.4.0` is available and appropriate for the target ESP-IDF version.
 - Verify the exact Realtime API event names against the target endpoint, especially OpenAI GA vs beta and LocalAI compatibility.
-- Add direct `micro_wake_word` support.
-- Decide whether to support `media_player` or keep the component speaker-only for output.
-- Add proper audio resampling if target endpoints require 24 kHz input/output instead of 16 kHz PCM16.
+- Update the YAML to provide `speaker: box_speaker` for assistant response output if runtime testing confirms `media_player` alone produces no audio.
+- Add local timer/tool-call support only if timer behavior is required.
+- Decide whether `volume_multiplier` should be applied to decoded PCM output.
+- Add proper audio resampling if direct speaker playback requires 48 kHz or if the endpoint requires 24 kHz input/output instead of 16 kHz PCM16.
 - Improve audio output buffering to avoid drops under network burst conditions.
 - Consider using stack-first JSON serialization helpers more consistently to reduce heap churn.
 - Add component validation YAML once a complete test fixture environment is available.
