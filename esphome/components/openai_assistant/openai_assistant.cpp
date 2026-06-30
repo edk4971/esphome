@@ -10,7 +10,9 @@
 #include "esphome/core/log.h"
 
 #include <ArduinoJson.h>
+#include <esp_err.h>
 #include <cstring>
+#include <cinttypes>
 
 namespace esphome::openai_assistant {
 
@@ -21,6 +23,31 @@ static const size_t RING_BUFFER_SIZE = RING_BUFFER_SAMPLES * sizeof(int16_t);
 static const size_t SEND_BUFFER_SAMPLES = 32 * SAMPLE_RATE_HZ / 1000;
 static const size_t SEND_BUFFER_SIZE = SEND_BUFFER_SAMPLES * sizeof(int16_t);
 static const size_t SPEAKER_BUFFER_SIZE = 4096;
+static const uint32_t CONNECT_TIMEOUT_MS = 15000;
+
+static const char *state_to_string(State state) {
+  switch (state) {
+    case State::IDLE:
+      return "IDLE";
+    case State::CONNECTING:
+      return "CONNECTING";
+    case State::START_MICROPHONE:
+      return "START_MICROPHONE";
+    case State::STARTING_MICROPHONE:
+      return "STARTING_MICROPHONE";
+    case State::STREAMING_MICROPHONE:
+      return "STREAMING_MICROPHONE";
+    case State::STOP_MICROPHONE:
+      return "STOP_MICROPHONE";
+    case State::STOPPING_MICROPHONE:
+      return "STOPPING_MICROPHONE";
+    case State::AWAITING_RESPONSE:
+      return "AWAITING_RESPONSE";
+    case State::STREAMING_RESPONSE:
+      return "STREAMING_RESPONSE";
+  }
+  return "UNKNOWN";
+}
 
 OpenAIAssistant::OpenAIAssistant() = default;
 
@@ -29,6 +56,7 @@ OpenAIAssistant::~OpenAIAssistant() { this->disconnect_(); }
 void OpenAIAssistant::setup() {
   this->mic_source_->add_data_callback([this](const std::vector<uint8_t> &data) {
     if (this->ring_buffer_ != nullptr) {
+      this->mic_bytes_received_ += data.size();
       this->ring_buffer_->write(data.data(), data.size());
     }
   });
@@ -82,6 +110,11 @@ void OpenAIAssistant::clear_buffers_() {
 
 void OpenAIAssistant::deallocate_buffers_() {
   this->ring_buffer_.reset();
+  this->mic_bytes_received_ = 0;
+  this->audio_bytes_sent_ = 0;
+  this->audio_chunks_sent_ = 0;
+  this->websocket_send_failures_ = 0;
+  this->last_audio_log_time_ = 0;
 #ifdef USE_SPEAKER
   if (this->speaker_buffer_ != nullptr) {
     RAMAllocator<uint8_t> allocator;
@@ -94,6 +127,7 @@ void OpenAIAssistant::deallocate_buffers_() {
 
 bool OpenAIAssistant::connect_() {
   if (this->websocket_ != nullptr) {
+    ESP_LOGD(TAG, "Realtime websocket client already exists");
     return true;
   }
 
@@ -109,6 +143,9 @@ bool OpenAIAssistant::connect_() {
   }
   this->headers_ += "OpenAI-Beta: realtime=v1\r\n";
 
+  ESP_LOGI(TAG, "Opening realtime websocket: %s", this->endpoint_with_model_.c_str());
+  ESP_LOGD(TAG, "Realtime websocket auth header present: %s", YESNO(!this->api_key_.empty()));
+
   esp_websocket_client_config_t config = {};
   config.uri = this->endpoint_with_model_.c_str();
   config.headers = this->headers_.c_str();
@@ -121,11 +158,13 @@ bool OpenAIAssistant::connect_() {
     return false;
   }
   esp_websocket_register_events(this->websocket_, WEBSOCKET_EVENT_ANY, OpenAIAssistant::websocket_event_handler_, this);
-  if (esp_websocket_client_start(this->websocket_) != ESP_OK) {
-    ESP_LOGE(TAG, "Could not start websocket client");
+  esp_err_t err = esp_websocket_client_start(this->websocket_);
+  if (err != ESP_OK) {
+    ESP_LOGE(TAG, "Could not start websocket client: %s", esp_err_to_name(err));
     this->disconnect_();
     return false;
   }
+  ESP_LOGI(TAG, "Realtime websocket client start requested");
   return true;
 }
 
@@ -146,6 +185,7 @@ void OpenAIAssistant::set_state_(State state) {
   if (this->state_ == state) {
     return;
   }
+  ESP_LOGD(TAG, "State changed from %s to %s", state_to_string(this->state_), state_to_string(state));
   this->state_ = state;
 }
 
@@ -167,10 +207,12 @@ void OpenAIAssistant::request_start(bool continuous, bool silence_detection) {
     this->wake_word_detected_trigger_.trigger();
   }
   this->set_state_(State::CONNECTING);
+  this->connection_start_time_ = millis();
   if (!this->connect_()) {
     this->error_trigger_.trigger("connection-failed", "Could not connect to realtime endpoint");
     this->set_state_(State::IDLE);
     this->continuous_ = false;
+    this->idle_trigger_.trigger();
   }
 }
 
@@ -197,6 +239,8 @@ void OpenAIAssistant::request_stop() {
 }
 
 void OpenAIAssistant::loop() {
+  this->process_pending_websocket_events_();
+
   switch (this->state_) {
     case State::IDLE:
       if (!this->continuous_) {
@@ -206,6 +250,13 @@ void OpenAIAssistant::loop() {
     case State::CONNECTING:
       if (this->connected_ && this->session_configured_) {
         this->set_state_(State::START_MICROPHONE);
+      } else if (millis() - this->connection_start_time_ > CONNECT_TIMEOUT_MS) {
+        ESP_LOGW(TAG, "Realtime websocket did not connect within %ums", CONNECT_TIMEOUT_MS);
+        this->error_trigger_.trigger("connection-timeout", "Realtime websocket connection timed out");
+        this->disconnect_();
+        this->continuous_ = false;
+        this->set_state_(State::IDLE);
+        this->idle_trigger_.trigger();
       }
       break;
     case State::START_MICROPHONE:
@@ -225,12 +276,23 @@ void OpenAIAssistant::loop() {
         break;
       }
       uint8_t buffer[SEND_BUFFER_SIZE];
-      while (this->ring_buffer_->available() >= SEND_BUFFER_SIZE) {
+      uint8_t chunks_sent_this_loop = 0;
+      while (this->ring_buffer_->available() >= SEND_BUFFER_SIZE && chunks_sent_this_loop < 4) {
         size_t read = this->ring_buffer_->read(buffer, SEND_BUFFER_SIZE);
         if (read == 0) {
           break;
         }
         this->send_audio_append_(buffer, read);
+        chunks_sent_this_loop++;
+      }
+      const uint32_t now = millis();
+      if (now - this->last_audio_log_time_ > 5000) {
+        this->last_audio_log_time_ = now;
+        ESP_LOGD(TAG,
+                 "Audio stream stats: mic_rx=%" PRIu32 " bytes, sent=%" PRIu32 " bytes in %" PRIu32
+                 " chunks, send_failures=%" PRIu32 ", ring_available=%u",
+                 this->mic_bytes_received_, this->audio_bytes_sent_, this->audio_chunks_sent_,
+                 this->websocket_send_failures_, static_cast<unsigned>(this->ring_buffer_->available()));
       }
       break;
     }
@@ -278,7 +340,12 @@ void OpenAIAssistant::send_session_update_() {
   session["input_audio_format"] = "pcm16";
   session["output_audio_format"] = "pcm16";
   JsonObject turn_detection = session["turn_detection"].to<JsonObject>();
-  turn_detection["type"] = this->silence_detection_ ? "server_vad" : "none";
+  if (this->silence_detection_) {
+    turn_detection["type"] = "server_vad";
+    turn_detection["create_response"] = true;
+  } else {
+    turn_detection["type"] = "none";
+  }
   std::string msg;
   serializeJson(doc, msg);
   this->send_text_(msg);
@@ -292,22 +359,109 @@ void OpenAIAssistant::send_audio_append_(const uint8_t *data, size_t len) {
   root["audio"] = encoded;
   std::string msg;
   serializeJson(doc, msg);
-  this->send_text_(msg);
+  if (this->send_text_(msg)) {
+    this->audio_bytes_sent_ += len;
+    this->audio_chunks_sent_++;
+  }
 }
 
-void OpenAIAssistant::send_text_(const std::string &text) {
+bool OpenAIAssistant::send_text_(const std::string &text) {
   if (this->websocket_ == nullptr || !this->connected_) {
-    return;
+    this->websocket_send_failures_++;
+    return false;
   }
-  esp_websocket_client_send_text(this->websocket_, text.c_str(), text.size(), 0);
+  const int sent = esp_websocket_client_send_text(this->websocket_, text.c_str(), text.size(), 50);
+  if (sent < 0) {
+    this->websocket_send_failures_++;
+    ESP_LOGW(TAG, "Realtime websocket send failed for %u byte text frame", static_cast<unsigned>(text.size()));
+    return false;
+  }
+  return true;
 }
 
 void OpenAIAssistant::signal_stop_() {
   if (!this->connected_) {
     return;
   }
+  ESP_LOGD(TAG, "Committing input audio buffer and requesting response");
   this->send_text_("{\"type\":\"input_audio_buffer.commit\"}");
   this->send_text_("{\"type\":\"response.create\",\"response\":{\"modalities\":[\"text\",\"audio\"]}}");
+}
+
+void OpenAIAssistant::finish_response_() {
+  if (this->tts_streaming_) {
+    this->tts_streaming_ = false;
+    this->tts_stream_end_trigger_.trigger();
+#ifdef USE_SPEAKER
+    if (this->speaker_ != nullptr) {
+      this->speaker_->finish();
+    }
+#endif
+  }
+  this->response_text_active_ = false;
+  this->end_trigger_.trigger();
+  if (this->continuous_) {
+    this->idle_trigger_.trigger();
+    this->set_state_(State::START_MICROPHONE);
+  } else {
+    this->set_state_(State::IDLE);
+    this->idle_trigger_.trigger();
+  }
+}
+
+void OpenAIAssistant::queue_json_message_(const uint8_t *data, size_t len) {
+  {
+    LockGuard lock(this->pending_json_messages_lock_);
+    if (this->pending_json_messages_.size() >= 8) {
+      ESP_LOGW(TAG, "Dropping realtime JSON message because pending queue is full");
+      return;
+    }
+    this->pending_json_messages_.emplace_back(reinterpret_cast<const char *>(data), len);
+  }
+  App.wake_loop_threadsafe();
+}
+
+void OpenAIAssistant::process_pending_websocket_events_() {
+  bool client_connected = false;
+  bool client_disconnected = false;
+  bool websocket_error = false;
+  bool session_update = false;
+  {
+    LockGuard lock(this->pending_websocket_events_lock_);
+    client_connected = this->pending_client_connected_;
+    client_disconnected = this->pending_client_disconnected_;
+    websocket_error = this->pending_websocket_error_;
+    session_update = this->pending_session_update_;
+    this->pending_client_connected_ = false;
+    this->pending_client_disconnected_ = false;
+    this->pending_websocket_error_ = false;
+    this->pending_session_update_ = false;
+  }
+
+  if (client_connected) {
+    this->client_connected_trigger_.trigger();
+  }
+  if (session_update && this->connected_) {
+    this->send_session_update_();
+  }
+  if (client_disconnected) {
+    this->client_disconnected_trigger_.trigger();
+    if (this->state_ != State::IDLE) {
+      this->set_state_(State::STOP_MICROPHONE);
+    }
+  }
+  if (websocket_error) {
+    this->error_trigger_.trigger("websocket-error", "Realtime websocket error");
+  }
+
+  std::vector<std::string> messages;
+  {
+    LockGuard lock(this->pending_json_messages_lock_);
+    messages.swap(this->pending_json_messages_);
+  }
+  for (const auto &message : messages) {
+    this->handle_json_message_(reinterpret_cast<const uint8_t *>(message.data()), message.size());
+  }
 }
 
 void OpenAIAssistant::websocket_event_handler_(void *handler_args, esp_event_base_t base, int32_t event_id,
@@ -319,26 +473,34 @@ void OpenAIAssistant::websocket_event_handler_(void *handler_args, esp_event_bas
 
 void OpenAIAssistant::handle_websocket_event_(esp_websocket_event_id_t event_id,
                                               esp_websocket_event_data_t *event_data) {
+  ESP_LOGV(TAG, "Realtime websocket event: id=%d op=%d payload_len=%d data_len=%d offset=%d", static_cast<int>(event_id),
+           event_data == nullptr ? -1 : event_data->op_code, event_data == nullptr ? -1 : event_data->payload_len,
+           event_data == nullptr ? -1 : event_data->data_len, event_data == nullptr ? -1 : event_data->payload_offset);
   switch (event_id) {
     case WEBSOCKET_EVENT_CONNECTED:
       ESP_LOGD(TAG, "Realtime websocket connected");
       this->connected_ = true;
-      this->client_connected_trigger_.trigger();
-      this->send_session_update_();
+      {
+        LockGuard lock(this->pending_websocket_events_lock_);
+        this->pending_client_connected_ = true;
+        this->pending_session_update_ = true;
+      }
+      App.wake_loop_threadsafe();
       break;
     case WEBSOCKET_EVENT_DISCONNECTED:
       ESP_LOGD(TAG, "Realtime websocket disconnected");
       this->connected_ = false;
       this->session_configured_ = false;
-      this->client_disconnected_trigger_.trigger();
-      if (this->state_ != State::IDLE) {
-        this->set_state_(State::STOP_MICROPHONE);
+      {
+        LockGuard lock(this->pending_websocket_events_lock_);
+        this->pending_client_disconnected_ = true;
       }
+      App.wake_loop_threadsafe();
       break;
     case WEBSOCKET_EVENT_DATA:
       if (event_data->op_code == 0x1) {
         if (event_data->payload_offset == 0 && event_data->payload_len == event_data->data_len) {
-          this->handle_json_message_(reinterpret_cast<const uint8_t *>(event_data->data_ptr), event_data->data_len);
+          this->queue_json_message_(reinterpret_cast<const uint8_t *>(event_data->data_ptr), event_data->data_len);
         } else {
           if (event_data->payload_offset == 0) {
             this->rx_message_.clear();
@@ -346,8 +508,7 @@ void OpenAIAssistant::handle_websocket_event_(esp_websocket_event_id_t event_id,
           }
           this->rx_message_.append(event_data->data_ptr, event_data->data_len);
           if (this->rx_message_.size() >= event_data->payload_len) {
-            this->handle_json_message_(reinterpret_cast<const uint8_t *>(this->rx_message_.data()),
-                                       this->rx_message_.size());
+            this->queue_json_message_(reinterpret_cast<const uint8_t *>(this->rx_message_.data()), this->rx_message_.size());
             this->rx_message_.clear();
           }
         }
@@ -355,7 +516,11 @@ void OpenAIAssistant::handle_websocket_event_(esp_websocket_event_id_t event_id,
       break;
     case WEBSOCKET_EVENT_ERROR:
       ESP_LOGW(TAG, "Realtime websocket error");
-      this->error_trigger_.trigger("websocket-error", "Realtime websocket error");
+      {
+        LockGuard lock(this->pending_websocket_events_lock_);
+        this->pending_websocket_error_ = true;
+      }
+      App.wake_loop_threadsafe();
       break;
     default:
       break;
@@ -366,9 +531,11 @@ void OpenAIAssistant::handle_json_message_(const uint8_t *data, size_t len) {
   JsonDocument doc = json::parse_json(data, len);
   JsonObject root = doc.as<JsonObject>();
   if (root.isNull()) {
+    ESP_LOGW(TAG, "Could not parse realtime JSON message of length %u", static_cast<unsigned>(len));
     return;
   }
   const char *type = root["type"] | "";
+  ESP_LOGV(TAG, "Realtime event type: %s", type);
 
   if (strcmp(type, "session.created") == 0 || strcmp(type, "session.updated") == 0) {
     this->session_configured_ = true;
@@ -378,7 +545,6 @@ void OpenAIAssistant::handle_json_message_(const uint8_t *data, size_t len) {
     this->stt_vad_end_trigger_.trigger();
     if (this->silence_detection_) {
       this->set_state_(State::STOP_MICROPHONE);
-      this->signal_stop_();
     }
   } else if (strcmp(type, "conversation.item.input_audio_transcription.delta") == 0) {
     this->request_text_ += root["delta"] | "";
@@ -407,7 +573,7 @@ void OpenAIAssistant::handle_json_message_(const uint8_t *data, size_t len) {
   } else if (strcmp(type, "response.audio.delta") == 0 || strcmp(type, "response.output_audio.delta") == 0) {
     const char *delta = root["delta"] | "";
     this->handle_audio_delta_(delta, strlen(delta));
-  } else if (strcmp(type, "response.done") == 0) {
+  } else if (strcmp(type, "response.audio.done") == 0 || strcmp(type, "response.output_audio.done") == 0) {
     if (this->tts_streaming_) {
       this->tts_streaming_ = false;
       this->tts_stream_end_trigger_.trigger();
@@ -417,18 +583,16 @@ void OpenAIAssistant::handle_json_message_(const uint8_t *data, size_t len) {
       }
 #endif
     }
-    this->response_text_active_ = false;
-    this->end_trigger_.trigger();
-    if (this->continuous_) {
-      this->idle_trigger_.trigger();
-      this->set_state_(State::START_MICROPHONE);
-    } else {
-      this->set_state_(State::IDLE);
-    }
+  } else if (strcmp(type, "response.output_item.done") == 0) {
+    this->finish_response_();
+  } else if (strcmp(type, "response.done") == 0) {
+    this->finish_response_();
   } else if (strcmp(type, "error") == 0) {
     JsonObject error = root["error"];
     const char *code = error["code"] | "error";
     const char *message = error["message"] | "Realtime API error";
+    const char *param = error["param"] | "";
+    ESP_LOGW(TAG, "Realtime API error: code='%s' message='%s' param='%s'", code, message, param);
     this->error_trigger_.trigger(code, message);
   }
 }

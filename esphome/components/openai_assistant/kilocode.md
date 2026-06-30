@@ -172,6 +172,47 @@ Follow-up observation: the device still booted normally but did not show the pac
 
 This is intentionally diagnostic and somewhat heavy-handed. If it proves that mWW starts and wake-word detection works, the final cleanup should move this back into one clean lifecycle path and remove duplicated startup logic.
 
+Next observation: this confirmed that `micro_wake_word` does start and detect. `Hey Mycroft` produced a mWW detection event and called `OpenAIAssistant::request_start()`, but there was still no evidence of traffic reaching the Realtime endpoint. That narrows the problem to the websocket connection path after `request_start()`. I added:
+
+- explicit logs before opening the websocket, including the full generated endpoint URL with the `model` query parameter;
+- a log after `esp_websocket_client_start()` succeeds;
+- verbose logs for every websocket event;
+- state transition logs;
+- a 15 second connection timeout that reports `connection-timeout`, disconnects the client, returns to `IDLE`, and triggers `on_idle`;
+- an `openai_assistant.on_idle` YAML hook to restart wake-word detection after connection timeout/failure;
+- explicit mWW model IDs and startup-time enable calls for all three models, because mWW model enabled/disabled state is persisted in flash and can override the simple model ordering assumption.
+
+The fact that only `Hey Mycroft` worked even after reordering models is likely explained by persisted mWW model state. Enabling all three configured model IDs in `start_wake_word` should remove that ambiguity for the next run.
+
+Follow-up: after fixing a VLAN/firewall issue, the websocket connection succeeded and the endpoint loaded `gpt-realtime`. The ESP received `session.created` and `session.updated`, then started the microphone and entered `STREAMING_MICROPHONE`. No speech/VAD/response events followed, and ESP-IDF later logged `websocket_client: Could not lock ws-client within 0 timeout`. This strongly suggests the next problem is in the microphone audio send path rather than network reachability. I added audio-stream diagnostics:
+
+- microphone callback byte counter;
+- successfully sent PCM byte and chunk counters;
+- websocket send failure counter;
+- ring-buffer availability in a 5 second periodic log while streaming;
+- warning logs for failed websocket sends;
+- a small per-loop cap of four audio chunks to avoid one loop pass monopolizing websocket sends;
+- changed websocket send timeout from `0` to `50` so transient websocket-client lock contention is visible and less likely to drop every frame immediately.
+
+The next useful runtime log is `Audio stream stats: ...`. If `mic_rx` increases but `sent` remains zero or `send_failures` rises, the websocket send path is failing. If both `mic_rx` and `sent` increase but the server never reports speech/VAD events, the likely issue is audio format/session configuration or server-side VAD expectations.
+
+Next observation: audio streaming works. The ESP logged microphone bytes and successful websocket audio sends, then received `input_audio_buffer.speech_started` and `input_audio_buffer.speech_stopped`. The endpoint also generated a response transcript (`I'm ready.`). Two implementation issues were identified:
+
+- The YAML was still passing `media_player: speaker_media_player` into `openai_assistant`, but the runtime response path only plays raw Realtime PCM through `speaker::Speaker`. Because no raw `speaker` was configured on `openai_assistant`, audio deltas could not be played. The package now uses `speaker: box_speaker` for `openai_assistant`; the top-level `speaker_media_player` remains available for announcement sounds and other package media use.
+- On `input_audio_buffer.speech_stopped`, the component called `signal_stop_()`, which manually sent `input_audio_buffer.commit` and `response.create`. The Realtime server was already creating a response from server VAD, so these manual events likely caused the `error` events seen immediately after speech stopped. The session update now explicitly sets `turn_detection.create_response = true`, and the speech-stopped handler only stops the local microphone instead of sending duplicate commit/create events.
+
+I also added logging of Realtime API error details (`code`, `message`, and `param`) and added handling for `response.audio.done`, `response.output_audio.done`, and `response.output_item.done` so the component can finish a response and return to idle even if the endpoint does not emit exactly `response.done`.
+
+Next observation: STT, server VAD, TTS, and the LLM all triggered on the endpoint. The ESP received transcription and the first response transcript delta (`The`) but then appeared hung. The logs showed a critical architectural problem: Realtime websocket data was being processed directly on ESP-IDF's `websocket_task`, and that processing triggered ESPHome automations, text sensor publishes, and display redraws. Display redraws took ~150 ms and were visible in logs as running on `websocket_task`. This can starve or block the websocket client task and explains the `Could not lock ws-client within 50 timeout` send failures and the stalled response stream.
+
+To fix this, websocket event handling was split:
+
+- The ESP-IDF websocket task now only records lightweight flags or copies complete JSON text frames into a small pending queue, then calls `App.wake_loop_threadsafe()`.
+- `OpenAIAssistant::loop()` now drains pending websocket events/messages and runs `handle_json_message_()` from the normal ESPHome loop context.
+- `on_client_connected`, `on_client_disconnected`, `on_error`, text sensor publishes, display-triggering automations, STT/TTS triggers, and response completion handling no longer run directly on `websocket_task`.
+
+This should prevent display/text automation work from blocking the websocket receive task. It should also stop the race where `input_audio_buffer.speech_stopped` arrives on `websocket_task` while the main loop is still sending queued microphone audio frames; the speech-stopped event is now processed before the loop state machine continues, so the state can move to `STOP_MICROPHONE` before more audio append frames are sent.
+
 ## What Is Still A Shell
 
 `media_player` is accepted and stored, but it is not used for response output.

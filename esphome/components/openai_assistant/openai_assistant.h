@@ -6,6 +6,7 @@
 
 #include "esphome/core/automation.h"
 #include "esphome/core/component.h"
+#include "esphome/core/helpers.h"
 
 #include "esphome/components/microphone/microphone_source.h"
 #include "esphome/components/ring_buffer/ring_buffer.h"
@@ -123,8 +124,11 @@ class OpenAIAssistant : public Component {
   void set_state_(State state);
   void send_session_update_();
   void send_audio_append_(const uint8_t *data, size_t len);
-  void send_text_(const std::string &text);
+  bool send_text_(const std::string &text);
   void signal_stop_();
+  void finish_response_();
+  void queue_json_message_(const uint8_t *data, size_t len);
+  void process_pending_websocket_events_();
   void handle_websocket_event_(esp_websocket_event_id_t event_id, esp_websocket_event_data_t *event_data);
   void handle_json_message_(const uint8_t *data, size_t len);
   void handle_audio_delta_(const char *delta, size_t len);
@@ -163,6 +167,9 @@ class OpenAIAssistant : public Component {
   std::string rx_message_;
   std::string request_text_;
   std::string response_text_;
+  std::vector<std::string> pending_json_messages_;
+  Mutex pending_json_messages_lock_;
+  Mutex pending_websocket_events_lock_;
 
   bool connected_{false};
   bool session_configured_{false};
@@ -175,6 +182,16 @@ class OpenAIAssistant : public Component {
   bool tts_streaming_{false};
   bool response_text_active_{false};
   State state_{State::IDLE};
+  uint32_t connection_start_time_{0};
+  uint32_t last_audio_log_time_{0};
+  uint32_t mic_bytes_received_{0};
+  uint32_t audio_bytes_sent_{0};
+  uint32_t audio_chunks_sent_{0};
+  uint32_t websocket_send_failures_{0};
+  bool pending_client_connected_{false};
+  bool pending_client_disconnected_{false};
+  bool pending_websocket_error_{false};
+  bool pending_session_update_{false};
 
   std::vector<Timer> timers_;
 

@@ -59,7 +59,7 @@ packages:
   #- !include esp32-s3-box-3.yaml
   - !include esp32-openai.yaml
   #- !include sen66.yaml
-  - !include debug.yaml
+  #- !include debug.yaml
   #- !include media_buttons.yaml 
   #- !include alarm.yaml
   #- !include clock.yaml
