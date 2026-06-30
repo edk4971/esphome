@@ -150,7 +150,10 @@ void OpenAIAssistant::set_state_(State state) {
 }
 
 void OpenAIAssistant::request_start(bool continuous, bool silence_detection) {
+  ESP_LOGD(TAG, "Requesting start: continuous=%s, silence_detection=%s, wake_word='%s'", YESNO(continuous),
+           YESNO(silence_detection), this->wake_word_.c_str());
   if (this->state_ != State::IDLE) {
+    ESP_LOGW(TAG, "Ignoring start request because assistant is not idle");
     return;
   }
   this->continuous_ = continuous;
@@ -172,6 +175,7 @@ void OpenAIAssistant::request_start(bool continuous, bool silence_detection) {
 }
 
 void OpenAIAssistant::request_stop() {
+  ESP_LOGD(TAG, "Requesting stop");
   this->continuous_ = false;
   switch (this->state_) {
     case State::IDLE:

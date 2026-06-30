@@ -8,9 +8,30 @@ esphome:
   name: ${name}
   name_add_mac_suffix: false
   friendly_name: ${friendly_name}
+  on_boot: #debug
+    priority: -100 #debug
+    then: #debug
+      - delay: 5s #debug
+      - logger.log: "openai.yaml boot diagnostic: force-starting local micro_wake_word" #debug
+      - lambda: |- #debug
+          id(init_in_progress) = false; //debug
+          id(va).set_use_wake_word(false); //debug
+      - microphone.unmute: #debug
+      - micro_wake_word.start: #debug
+      - script.execute: set_idle_or_mute_phase #debug
+      - script.execute: draw_display #debug
 api:
   encryption:
     key: !secret jarviskey
+  on_client_connected: #debug
+    - logger.log: "openai.yaml api diagnostic: native API client connected" #debug
+    - lambda: |- #debug
+        id(init_in_progress) = false; //debug
+        id(va).set_use_wake_word(false); //debug
+    - microphone.unmute: #debug
+    - micro_wake_word.start: #debug
+    - script.execute: set_idle_or_mute_phase #debug
+    - script.execute: draw_display #debug
 wifi:
   ssid: !secret wifi_ssid
   password: !secret wifi_password
@@ -26,6 +47,7 @@ esp32:
       CONFIG_SPIRAM_FETCH_INSTRUCTIONS: "y"
 
 logger:
+  level: VERBOSE #debug
 
 external_components:
   - source: 
@@ -37,7 +59,7 @@ packages:
   #- !include esp32-s3-box-3.yaml
   - !include esp32-openai.yaml
   #- !include sen66.yaml
-  #- !include debug.yaml
+  - !include debug.yaml
   #- !include media_buttons.yaml 
   #- !include alarm.yaml
   #- !include clock.yaml

@@ -50,6 +50,8 @@ esphome:
             lambda: return id(init_in_progress);
           then:
             - lambda: id(init_in_progress) = false;
+            - script.execute: start_wake_word
+            - script.execute: set_idle_or_mute_phase
             - script.execute: draw_display
 
 esp32:
@@ -69,6 +71,9 @@ psram:
 
 api:
   on_client_connected:
+    - lambda: id(init_in_progress) = false;
+    - script.execute: start_wake_word
+    - script.execute: set_idle_or_mute_phase
     - script.execute: draw_display
   on_client_disconnected:
     - script.execute: draw_display
@@ -226,21 +231,26 @@ media_player:
 micro_wake_word:
   id: mww
   models:
+    - hey_jarvis
     - okay_nabu
     - hey_mycroft
-    - hey_jarvis
   on_wake_word_detected:
+    - logger.log:
+        format: "micro_wake_word detected: %s"
+        args: ["wake_word.c_str()"]
     - openai_assistant.start:
         wake_word: !lambda return wake_word;
 
 openai_assistant:
   id: va
-  model: gemma-4-12b-it-GGUF
+  model: gpt-realtime
   endpoint: "ws://vulkan.home.iamelliott.com:8080/v1/realtime"
-  api_key: "api-key"
+  api_key: ""
   microphone: box_mic
+  system_prompt: "You are a realtime voice assistant. Use any MCP tools you have access to. If you are given instructions to control devices in a house use the `homeassistant` MCP tools, execute the command, and respond quickly. If you are asked a general knowledge question, use the `openzim` MCP tools to research the answer, think, and respond with a concise summary. Only ask follow-up questions if you are not sure what to do. Limit your tool calls to a maximum of three per conversation"
   media_player: speaker_media_player
   micro_wake_word: mww
+  use_wake_word: true
   noise_suppression_level: 2
   auto_gain: 31dBFS
   volume_multiplier: 2.0
@@ -313,13 +323,13 @@ openai_assistant:
                 - lambda: id(voice_assistant_phase) = ${voice_assist_muted_phase_id};
           - script.execute: draw_display
   on_client_connected:
-    - lambda: id(init_in_progress) = false;
-    - script.execute: start_wake_word
-    - script.execute: set_idle_or_mute_phase
+    # This is the OpenAI Realtime websocket connection, not the ESPHome native API connection.
+    # Wake word startup is handled by api.on_client_connected and the boot fallback above.
     - script.execute: draw_display
   on_client_disconnected:
-    - script.execute: stop_wake_word
-    - lambda: id(voice_assistant_phase) = ${voice_assist_not_ready_phase_id};
+    # This is the OpenAI Realtime websocket connection, not the ESPHome native API connection.
+    # Do not stop micro_wake_word here or local wake word detection can remain disabled after a transient
+    # OpenAI websocket disconnect.
     - script.execute: draw_display
   on_timer_started:
     - script.execute: draw_display
@@ -487,6 +497,7 @@ script:
   # Starts either mWW or the streaming wake word, depending on the configured location
   - id: start_wake_word
     then:
+      - logger.log: "start_wake_word script invoked"
       - if:
           condition:
             and:
@@ -494,6 +505,7 @@ script:
                   - openai_assistant.is_running:
               - lambda: return id(wake_word_engine_location).current_option() == "On device";
           then:
+            - logger.log: "start_wake_word: starting micro_wake_word"
             - lambda: id(va).set_use_wake_word(false);
             - micro_wake_word.start:
       - if:
@@ -503,21 +515,25 @@ script:
                   - openai_assistant.is_running:
               - lambda: return id(wake_word_engine_location).current_option() == "In Home Assistant";
           then:
+            - logger.log: "start_wake_word: starting openai_assistant continuous mode"
             - lambda: id(va).set_use_wake_word(true);
             - openai_assistant.start_continuous:
   # Stops either mWW or the streaming wake word, depending on the configured location
   - id: stop_wake_word
     then:
+      - logger.log: "stop_wake_word script invoked"
       - if:
           condition:
             lambda: return id(wake_word_engine_location).current_option() == "In Home Assistant";
           then:
+            - logger.log: "stop_wake_word: stopping openai_assistant continuous mode"
             - lambda: id(va).set_use_wake_word(false);
             - openai_assistant.stop:
       - if:
           condition:
             lambda: return id(wake_word_engine_location).current_option() == "On device";
           then:
+            - logger.log: "stop_wake_word: stopping micro_wake_word"
             - micro_wake_word.stop:
   # Set the voice assistant phase to idle or muted, depending on if the software mute switch is activated
   - id: set_idle_or_mute_phase
@@ -547,10 +563,12 @@ switch:
     restore_mode: RESTORE_DEFAULT_OFF
     entity_category: config
     on_turn_off:
+      - logger.log: "Mute switch turned off; microphone unmuted"
       - microphone.unmute:
       - lambda: id(voice_assistant_phase) = ${voice_assist_idle_phase_id};
       - script.execute: draw_display
     on_turn_on:
+      - logger.log: "Mute switch turned on; microphone muted"
       - microphone.mute:
       - lambda: id(voice_assistant_phase) = ${voice_assist_muted_phase_id};
       - script.execute: draw_display

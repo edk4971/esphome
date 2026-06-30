@@ -152,6 +152,26 @@ After the first YAML validation pass, I added compatibility for the ESPHome Box 
 - `on_wake_word_detected` is accepted and triggered when `openai_assistant.start` receives a non-empty wake word.
 - Timer triggers and `openai_assistant::Timer`/`get_timers()` exist as a compatibility surface for the ESPHome Box display lambdas.
 
+## Wake Word Startup Fix
+
+After the first successful install, the device booted and dumped both `micro_wake_word` and `openai_assistant` configuration, but saying the configured wake words caused no logs and no Realtime API connection attempts. The key diagnosis was that the ESPHome Box package had been copied from `voice_assistant`, where `on_client_connected` means the ESPHome native API/Home Assistant client connected. In `openai_assistant`, `on_client_connected` means the OpenAI Realtime websocket connected. That websocket only connects after `openai_assistant.start` runs, so using `openai_assistant.on_client_connected` to start `micro_wake_word` created a circular startup dependency.
+
+The YAML lifecycle was changed so wake-word startup happens from paths that actually occur at boot/runtime:
+
+- `api.on_client_connected` now clears `init_in_progress`, starts wake-word detection, sets the display phase, and redraws.
+- The boot fallback after the initialization delay now also starts wake-word detection if initialization is still in progress.
+- `openai_assistant.on_client_connected`/`on_client_disconnected` no longer start or stop `micro_wake_word`; those are OpenAI websocket events, not Home Assistant/API readiness events.
+- `hey_jarvis` was moved to the first `micro_wake_word.models` entry because ESPHome `micro_wake_word` enables only the first configured wake-word model by default.
+- Temporary `logger.log` diagnostics were added to the wake-word start/stop scripts, mWW detection callback, and mute switch handlers so the next installed build shows whether wake-word detection is being started and whether the mute button automations are firing.
+
+Follow-up observation: the device still booted normally but did not show the package-level diagnostic logs. That suggests the package-level script triggers may still not be reached in the user's actual `/config/openai.yaml` build, or the native API connection path may differ from the assumptions. To remove package/callback ambiguity, I added top-level diagnostics directly in `openai.yaml`:
+
+- `logger.level: VERBOSE`
+- `esphome.on_boot` at priority `-100` that waits 5 seconds, clears `init_in_progress`, forces `use_wake_word` false, unmutes the microphone, starts `micro_wake_word`, then redraws the display.
+- `api.on_client_connected` with the same force-start sequence.
+
+This is intentionally diagnostic and somewhat heavy-handed. If it proves that mWW starts and wake-word detection works, the final cleanup should move this back into one clean lifecycle path and remove duplicated startup logic.
+
 ## What Is Still A Shell
 
 `media_player` is accepted and stored, but it is not used for response output.
