@@ -126,6 +126,7 @@ class OpenAIAssistant : public Component {
   void send_session_update_();
   void send_audio_append_(const uint8_t *data, size_t len);
   bool send_text_(const std::string &text);
+  void send_response_create_();
   void signal_stop_();
   void finish_response_();
   void queue_json_message_(const uint8_t *data, size_t len);
@@ -167,6 +168,9 @@ class OpenAIAssistant : public Component {
   std::string system_prompt_;
   std::string wake_word_;
   std::string rx_message_;
+  std::string rx_oversized_type_;
+  size_t rx_oversized_payload_len_{0};
+  bool rx_drop_oversized_payload_{false};
   std::string request_text_;
   std::string response_text_;
   std::vector<std::string> pending_json_messages_;
@@ -183,6 +187,7 @@ class OpenAIAssistant : public Component {
   float volume_multiplier_{1.0f};
   bool tts_streaming_{false};
   bool response_text_active_{false};
+  bool response_requested_{false};
   State state_{State::IDLE};
   uint32_t connection_start_time_{0};
   uint32_t last_audio_log_time_{0};

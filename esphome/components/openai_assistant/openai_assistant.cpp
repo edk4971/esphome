@@ -14,11 +14,13 @@
 #include <algorithm>
 #include <cstring>
 #include <cinttypes>
+#include <string_view>
 
 namespace esphome::openai_assistant {
 
 static const char *const TAG = "openai_assistant";
 static const size_t SAMPLE_RATE_HZ = 16000;
+static const size_t OUTPUT_SAMPLE_RATE_HZ = 24000;
 static const size_t RING_BUFFER_SAMPLES = 512 * SAMPLE_RATE_HZ / 1000;
 static const size_t RING_BUFFER_SIZE = RING_BUFFER_SAMPLES * sizeof(int16_t);
 static const size_t SEND_BUFFER_SAMPLES = 32 * SAMPLE_RATE_HZ / 1000;
@@ -28,6 +30,28 @@ static const uint32_t CONNECT_TIMEOUT_MS = 15000;
 static const uint32_t RESPONSE_INACTIVITY_TIMEOUT_MS = 15000;
 static const uint32_t RESPONSE_TEXT_PUBLISH_INTERVAL_MS = 250;
 static const uint32_t NO_SPEECH_TIMEOUT_MS = 5000;
+static const size_t MAX_JSON_MESSAGE_SIZE = 8192;
+
+static std::string extract_json_type_(const char *data, size_t len) {
+  const std::string_view view(data, len);
+  size_t type_pos = view.find("\"type\"");
+  if (type_pos == std::string_view::npos) {
+    return "";
+  }
+  size_t colon_pos = view.find(':', type_pos + 6);
+  if (colon_pos == std::string_view::npos) {
+    return "";
+  }
+  size_t quote_start = view.find('"', colon_pos + 1);
+  if (quote_start == std::string_view::npos) {
+    return "";
+  }
+  size_t quote_end = view.find('"', quote_start + 1);
+  if (quote_end == std::string_view::npos) {
+    return "";
+  }
+  return std::string(view.substr(quote_start + 1, quote_end - quote_start - 1));
+}
 
 static const char *state_to_string(State state) {
   switch (state) {
@@ -67,7 +91,7 @@ void OpenAIAssistant::setup() {
 
 #ifdef USE_SPEAKER
   if (this->speaker_ != nullptr) {
-    this->speaker_->set_audio_stream_info(audio::AudioStreamInfo(16, 1, SAMPLE_RATE_HZ));
+    this->speaker_->set_audio_stream_info(audio::AudioStreamInfo(16, 1, OUTPUT_SAMPLE_RATE_HZ));
   }
 #endif
 }
@@ -205,6 +229,7 @@ void OpenAIAssistant::request_start(bool continuous, bool silence_detection) {
   }
   this->continuous_ = continuous;
   this->silence_detection_ = silence_detection;
+  this->response_requested_ = false;
   if (!this->allocate_buffers_()) {
     this->error_trigger_.trigger("buffer-allocation-failed", "Could not allocate audio buffers");
     return;
@@ -375,20 +400,32 @@ void OpenAIAssistant::send_session_update_() {
   JsonObject root = doc.to<JsonObject>();
   root["type"] = "session.update";
   JsonObject session = root["session"].to<JsonObject>();
+  session["type"] = "realtime";
   session["instructions"] = this->system_prompt_;
-  session["voice"] = this->voice_;
-  JsonArray modalities = session["modalities"].to<JsonArray>();
-  modalities.add("text");
-  modalities.add("audio");
-  session["input_audio_format"] = "pcm16";
-  session["output_audio_format"] = "pcm16";
-  JsonObject turn_detection = session["turn_detection"].to<JsonObject>();
+  JsonArray output_modalities = session["output_modalities"].to<JsonArray>();
+  output_modalities.add("audio");
+
+  JsonObject audio = session["audio"].to<JsonObject>();
+  JsonObject input = audio["input"].to<JsonObject>();
+  JsonObject input_format = input["format"].to<JsonObject>();
+  input_format["type"] = "audio/pcm";
+  // The OpenAPI schema documents 24 kHz PCM, but this component currently streams the configured 16 kHz
+  // MicrophoneSource directly. Report the actual input rate until input resampling is added.
+  input_format["rate"] = SAMPLE_RATE_HZ;
+  JsonObject turn_detection = input["turn_detection"].to<JsonObject>();
   if (this->silence_detection_) {
     turn_detection["type"] = "server_vad";
-    turn_detection["create_response"] = true;
+    // Let server VAD commit the input buffer, but create the response ourselves so we can explicitly request audio.
+    turn_detection["create_response"] = false;
   } else {
-    turn_detection["type"] = "none";
+    input["turn_detection"] = nullptr;
   }
+
+  JsonObject output = audio["output"].to<JsonObject>();
+  JsonObject output_format = output["format"].to<JsonObject>();
+  output_format["type"] = "audio/pcm";
+  output_format["rate"] = OUTPUT_SAMPLE_RATE_HZ;
+  output["voice"] = this->voice_;
   std::string msg;
   serializeJson(doc, msg);
   this->send_text_(msg);
@@ -422,13 +459,38 @@ bool OpenAIAssistant::send_text_(const std::string &text) {
   return true;
 }
 
+void OpenAIAssistant::send_response_create_() {
+  if (this->response_requested_) {
+    return;
+  }
+  JsonDocument doc;
+  JsonObject root = doc.to<JsonObject>();
+  root["type"] = "response.create";
+  JsonObject response = root["response"].to<JsonObject>();
+  JsonArray output_modalities = response["output_modalities"].to<JsonArray>();
+  output_modalities.add("audio");
+  JsonObject audio = response["audio"].to<JsonObject>();
+  JsonObject output = audio["output"].to<JsonObject>();
+  JsonObject format = output["format"].to<JsonObject>();
+  format["type"] = "audio/pcm";
+  format["rate"] = OUTPUT_SAMPLE_RATE_HZ;
+  output["voice"] = this->voice_;
+
+  std::string msg;
+  serializeJson(doc, msg);
+  ESP_LOGD(TAG, "Requesting realtime response with audio output");
+  if (this->send_text_(msg)) {
+    this->response_requested_ = true;
+  }
+}
+
 void OpenAIAssistant::signal_stop_() {
   if (!this->connected_) {
     return;
   }
   ESP_LOGD(TAG, "Committing input audio buffer and requesting response");
   this->send_text_("{\"type\":\"input_audio_buffer.commit\"}");
-  this->send_text_("{\"type\":\"response.create\",\"response\":{\"modalities\":[\"text\",\"audio\"]}}");
+  this->send_response_create_();
 }
 
 void OpenAIAssistant::finish_response_() {
@@ -554,11 +616,41 @@ void OpenAIAssistant::handle_websocket_event_(esp_websocket_event_id_t event_id,
     case WEBSOCKET_EVENT_DATA:
       if (event_data->op_code == 0x1) {
         if (event_data->payload_offset == 0 && event_data->payload_len == event_data->data_len) {
-          this->queue_json_message_(reinterpret_cast<const uint8_t *>(event_data->data_ptr), event_data->data_len);
+          if (event_data->payload_len > MAX_JSON_MESSAGE_SIZE) {
+            std::string type = extract_json_type_(event_data->data_ptr, event_data->data_len);
+            ESP_LOGW(TAG, "Dropping oversized realtime JSON message: %d bytes, type='%s'", event_data->payload_len,
+                     type.c_str());
+            if (type == "response.audio.delta" || type == "response.output_audio.delta") {
+              ESP_LOGW(TAG, "Dropped oversized realtime audio delta; configure endpoint to send smaller audio chunks");
+            }
+          } else {
+            this->queue_json_message_(reinterpret_cast<const uint8_t *>(event_data->data_ptr), event_data->data_len);
+          }
         } else {
           if (event_data->payload_offset == 0) {
             this->rx_message_.clear();
-            this->rx_message_.reserve(event_data->payload_len);
+            this->rx_drop_oversized_payload_ = event_data->payload_len > MAX_JSON_MESSAGE_SIZE;
+            this->rx_oversized_payload_len_ = this->rx_drop_oversized_payload_ ? event_data->payload_len : 0;
+            this->rx_oversized_type_.clear();
+            if (!this->rx_drop_oversized_payload_) {
+              this->rx_message_.reserve(event_data->payload_len);
+            } else {
+              this->rx_oversized_type_ = extract_json_type_(event_data->data_ptr, event_data->data_len);
+            }
+          }
+          if (this->rx_drop_oversized_payload_) {
+            if (event_data->payload_offset + event_data->data_len >= event_data->payload_len) {
+              ESP_LOGW(TAG, "Dropping oversized fragmented realtime JSON message: %u bytes, type='%s'",
+                       static_cast<unsigned>(this->rx_oversized_payload_len_), this->rx_oversized_type_.c_str());
+              if (this->rx_oversized_type_ == "response.audio.delta" ||
+                  this->rx_oversized_type_ == "response.output_audio.delta") {
+                ESP_LOGW(TAG, "Dropped oversized realtime audio delta; configure endpoint to send smaller audio chunks");
+              }
+              this->rx_drop_oversized_payload_ = false;
+              this->rx_oversized_payload_len_ = 0;
+              this->rx_oversized_type_.clear();
+            }
+            break;
           }
           if (this->rx_message_.size() < static_cast<size_t>(event_data->payload_offset)) {
             this->rx_message_.resize(event_data->payload_offset);
@@ -607,6 +699,8 @@ void OpenAIAssistant::handle_json_message_(const uint8_t *data, size_t len) {
     if (this->silence_detection_) {
       this->set_state_(State::STOP_MICROPHONE);
     }
+  } else if (strcmp(type, "input_audio_buffer.committed") == 0) {
+    this->send_response_create_();
   } else if (strcmp(type, "conversation.item.input_audio_transcription.delta") == 0) {
     this->request_text_ += root["delta"] | "";
     this->publish_request_text_(this->request_text_.c_str());

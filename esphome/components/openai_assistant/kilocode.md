@@ -255,6 +255,48 @@ Latest observation: `Response finished: response_audio=0 bytes in 0 chunks` conf
 
 I also changed `finish_response_()` to publish the accumulated response transcript before finishing, so even if the endpoint never sends a final transcript/done event the display should not remain stuck on just the first throttled token. If the next run still prints `response_audio=0`, the endpoint/session is still transcript-only from the ESP's perspective and needs endpoint-side audio delta configuration or a different Realtime event format mapping.
 
+Crash/oversized payload note: the ESP crashed once in `std::string::reserve()` while handling a fragmented websocket payload around 65 KB. ArduinoJson also failed to deserialize a similarly large message (`Can not allocate more memory for deserialization`). These large Realtime JSON messages are too big for the current ESP parser path and are not needed for the control flow we use. I added a defensive `MAX_JSON_MESSAGE_SIZE` of 8192 bytes. Complete or fragmented text frames larger than that are now dropped without allocation and logged as oversized, avoiding websocket-task heap allocation crashes. If a future endpoint sends actual audio deltas as very large JSON frames, the endpoint should be configured to use smaller delta chunks, or the component will need a streaming extractor for `type`/`delta` instead of full JSON deserialization.
+
+Follow-up: oversized frames are still appearing, now around 72 KB, and response audio remains zero. I added lightweight type extraction from the first fragment of oversized JSON messages. Oversized-drop logs now include `type='<event type>'`. If the type is `response.audio.delta` or `response.output_audio.delta`, the component logs an additional warning that an oversized audio delta was dropped and the endpoint should be configured to send smaller audio chunks. If the type is something like `conversation.item.added`, then it is just large bookkeeping/user-audio history and not the missing playback audio.
+
+Latest observation: the oversized frame type showed as `input_audio`, so it is input-audio conversation/history data, not output audio. `response_audio=0` still means no playable audio delta reached the ESP. To make the response request explicit, I changed server VAD config from `create_response: true` to `create_response: false`. Server VAD should still detect speech and commit the input buffer; after the ESP receives `input_audio_buffer.committed`, it now sends its own `response.create` with:
+
+```json
+{
+  "type": "response.create",
+  "response": {
+    "modalities": ["audio", "text"],
+    "voice": "<configured voice>",
+    "output_audio_format": "pcm16"
+  }
+}
+```
+
+This avoids relying on the endpoint's default auto-created response behavior, which appears to produce transcript text but no audio deltas for this endpoint. Manual stop still commits the buffer and calls the same explicit response-create helper.
+
+Correction after checking `openapi.yaml` lines 59333-59449 and `RealtimeResponseCreateParams`: the initial explicit `response.create` body still used beta/old fields (`modalities`, top-level `voice`, and `output_audio_format`). The GA schema uses `output_modalities`, and audio output configuration is nested under `audio.output`. It also states that audio output automatically includes a transcript, and `text` output disables audio, so the correct response request should ask only for `output_modalities: ["audio"]`.
+
+The component now sends:
+
+```json
+{
+  "type": "response.create",
+  "response": {
+    "output_modalities": ["audio"],
+    "audio": {
+      "output": {
+        "format": {"type": "audio/pcm", "rate": 24000},
+        "voice": "<configured voice>"
+      }
+    }
+  }
+}
+```
+
+The speaker stream info was also changed from 16 kHz to 24 kHz to match the OpenAPI `audio/pcm` output format, which only supports 24 kHz PCM.
+
+Important input-audio note: STT and VAD were already working with the existing 16 kHz `i2s_audio` microphone stream, so input capture should not be changed casually. The component now reports the actual input rate in the GA-shaped `session.update` (`audio.input.format = {type: "audio/pcm", rate: 16000}`) but does not change the microphone component sample rate. A brief experiment adding explicit `audio.input.transcription.model = "whisper-1"` was removed to avoid changing a path that was already working. If we later want fully schema-matching 24 kHz input, `i2s_audio` can do it, but local `micro_wake_word` expects 16 kHz, so that likely requires either resampling or separate mic-source handling between mWW and OpenAI capture.
+
 ## What Is Still A Shell
 
 `media_player` is accepted and stored, but it is not used for response output.
