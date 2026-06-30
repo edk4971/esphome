@@ -64,6 +64,7 @@ class OpenAIAssistant : public Component {
   void set_microphone_source(microphone::MicrophoneSource *mic_source) { this->mic_source_ = mic_source; }
   void set_api_key(const std::string &api_key) { this->api_key_ = api_key; }
   void set_model(const std::string &model) { this->model_ = model; }
+  void set_voice(const std::string &voice) { this->voice_ = voice; }
   void set_endpoint(const std::string &endpoint) { this->endpoint_ = endpoint; }
   void set_system_prompt(const std::string &system_prompt) { this->system_prompt_ = system_prompt; }
   void set_use_wake_word(bool use_wake_word) { this->use_wake_word_ = use_wake_word; }
@@ -162,6 +163,7 @@ class OpenAIAssistant : public Component {
   std::string headers_;
   std::string api_key_;
   std::string model_;
+  std::string voice_;
   std::string system_prompt_;
   std::string wake_word_;
   std::string rx_message_;
@@ -187,7 +189,14 @@ class OpenAIAssistant : public Component {
   uint32_t mic_bytes_received_{0};
   uint32_t audio_bytes_sent_{0};
   uint32_t audio_chunks_sent_{0};
+  uint32_t response_audio_bytes_received_{0};
+  uint32_t response_audio_chunks_received_{0};
   uint32_t websocket_send_failures_{0};
+  uint32_t last_response_event_time_{0};
+  uint32_t last_response_publish_time_{0};
+  uint32_t listening_start_time_{0};
+  bool speech_started_{false};
+  bool no_speech_timeout_{false};
   bool pending_client_connected_{false};
   bool pending_client_disconnected_{false};
   bool pending_websocket_error_{false};

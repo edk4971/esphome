@@ -11,6 +11,7 @@
 
 #include <ArduinoJson.h>
 #include <esp_err.h>
+#include <algorithm>
 #include <cstring>
 #include <cinttypes>
 
@@ -24,6 +25,9 @@ static const size_t SEND_BUFFER_SAMPLES = 32 * SAMPLE_RATE_HZ / 1000;
 static const size_t SEND_BUFFER_SIZE = SEND_BUFFER_SAMPLES * sizeof(int16_t);
 static const size_t SPEAKER_BUFFER_SIZE = 4096;
 static const uint32_t CONNECT_TIMEOUT_MS = 15000;
+static const uint32_t RESPONSE_INACTIVITY_TIMEOUT_MS = 15000;
+static const uint32_t RESPONSE_TEXT_PUBLISH_INTERVAL_MS = 250;
+static const uint32_t NO_SPEECH_TIMEOUT_MS = 5000;
 
 static const char *state_to_string(State state) {
   switch (state) {
@@ -74,6 +78,7 @@ void OpenAIAssistant::dump_config() {
   ESP_LOGCONFIG(TAG, "OpenAI Assistant:");
   ESP_LOGCONFIG(TAG, "  Endpoint: %s", this->endpoint_.c_str());
   ESP_LOGCONFIG(TAG, "  Model: %s", this->model_.c_str());
+  ESP_LOGCONFIG(TAG, "  Voice: %s", this->voice_.c_str());
   ESP_LOGCONFIG(TAG, "  Wake Word: %s", YESNO(this->use_wake_word_));
 }
 
@@ -113,6 +118,8 @@ void OpenAIAssistant::deallocate_buffers_() {
   this->mic_bytes_received_ = 0;
   this->audio_bytes_sent_ = 0;
   this->audio_chunks_sent_ = 0;
+  this->response_audio_bytes_received_ = 0;
+  this->response_audio_chunks_received_ = 0;
   this->websocket_send_failures_ = 0;
   this->last_audio_log_time_ = 0;
 #ifdef USE_SPEAKER
@@ -208,6 +215,11 @@ void OpenAIAssistant::request_start(bool continuous, bool silence_detection) {
   }
   this->set_state_(State::CONNECTING);
   this->connection_start_time_ = millis();
+  this->last_response_event_time_ = 0;
+  this->last_response_publish_time_ = 0;
+  this->listening_start_time_ = 0;
+  this->speech_started_ = false;
+  this->no_speech_timeout_ = false;
   if (!this->connect_()) {
     this->error_trigger_.trigger("connection-failed", "Could not connect to realtime endpoint");
     this->set_state_(State::IDLE);
@@ -268,6 +280,8 @@ void OpenAIAssistant::loop() {
       if (this->mic_source_->is_running()) {
         this->start_trigger_.trigger();
         this->listening_trigger_.trigger();
+        this->listening_start_time_ = millis();
+        this->speech_started_ = false;
         this->set_state_(State::STREAMING_MICROPHONE);
       }
       break;
@@ -294,24 +308,47 @@ void OpenAIAssistant::loop() {
                  this->mic_bytes_received_, this->audio_bytes_sent_, this->audio_chunks_sent_,
                  this->websocket_send_failures_, static_cast<unsigned>(this->ring_buffer_->available()));
       }
+      if (this->silence_detection_ && !this->speech_started_ && this->listening_start_time_ != 0 &&
+          now - this->listening_start_time_ > NO_SPEECH_TIMEOUT_MS) {
+        ESP_LOGW(TAG, "No speech detected within %ums; returning to idle", NO_SPEECH_TIMEOUT_MS);
+        this->no_speech_timeout_ = true;
+        this->continuous_ = false;
+        this->set_state_(State::STOP_MICROPHONE);
+      }
       break;
     }
     case State::STOP_MICROPHONE:
       if (this->mic_source_->is_running()) {
         this->mic_source_->stop();
         this->set_state_(State::STOPPING_MICROPHONE);
+      } else if (this->no_speech_timeout_) {
+        this->no_speech_timeout_ = false;
+        this->set_state_(State::IDLE);
+        this->idle_trigger_.trigger();
+        this->disconnect_();
       } else {
         this->set_state_(State::AWAITING_RESPONSE);
       }
       break;
     case State::STOPPING_MICROPHONE:
       if (this->mic_source_->is_stopped()) {
-        this->set_state_(State::AWAITING_RESPONSE);
+        if (this->no_speech_timeout_) {
+          this->no_speech_timeout_ = false;
+          this->set_state_(State::IDLE);
+          this->idle_trigger_.trigger();
+          this->disconnect_();
+        } else {
+          this->set_state_(State::AWAITING_RESPONSE);
+        }
       }
       break;
     case State::AWAITING_RESPONSE:
       if (!this->connected_) {
         this->set_state_(State::IDLE);
+      } else if (this->last_response_event_time_ != 0 &&
+                 millis() - this->last_response_event_time_ > RESPONSE_INACTIVITY_TIMEOUT_MS) {
+        ESP_LOGW(TAG, "Realtime response inactive for %ums; finishing response", RESPONSE_INACTIVITY_TIMEOUT_MS);
+        this->finish_response_();
       }
       break;
     case State::STREAMING_RESPONSE:
@@ -324,6 +361,11 @@ void OpenAIAssistant::loop() {
         }
       }
 #endif
+      if (this->last_response_event_time_ != 0 &&
+          millis() - this->last_response_event_time_ > RESPONSE_INACTIVITY_TIMEOUT_MS) {
+        ESP_LOGW(TAG, "Realtime response inactive for %ums; finishing response", RESPONSE_INACTIVITY_TIMEOUT_MS);
+        this->finish_response_();
+      }
       break;
   }
 }
@@ -334,6 +376,7 @@ void OpenAIAssistant::send_session_update_() {
   root["type"] = "session.update";
   JsonObject session = root["session"].to<JsonObject>();
   session["instructions"] = this->system_prompt_;
+  session["voice"] = this->voice_;
   JsonArray modalities = session["modalities"].to<JsonArray>();
   modalities.add("text");
   modalities.add("audio");
@@ -399,12 +442,23 @@ void OpenAIAssistant::finish_response_() {
 #endif
   }
   this->response_text_active_ = false;
+  this->last_response_event_time_ = 0;
+  this->last_response_publish_time_ = 0;
+  if (!this->response_text_.empty()) {
+    this->publish_response_text_(this->response_text_.c_str());
+  }
+  ESP_LOGI(TAG, "Response finished: response_audio=%" PRIu32 " bytes in %" PRIu32 " chunks", this->response_audio_bytes_received_,
+           this->response_audio_chunks_received_);
+  if (this->response_audio_bytes_received_ == 0) {
+    ESP_LOGW(TAG, "Realtime response contained transcript text but no audio deltas; check endpoint voice/audio output config");
+  }
   this->end_trigger_.trigger();
   if (this->continuous_) {
     this->idle_trigger_.trigger();
     this->set_state_(State::START_MICROPHONE);
   } else {
     this->set_state_(State::IDLE);
+    this->disconnect_();
     this->idle_trigger_.trigger();
   }
 }
@@ -412,7 +466,7 @@ void OpenAIAssistant::finish_response_() {
 void OpenAIAssistant::queue_json_message_(const uint8_t *data, size_t len) {
   {
     LockGuard lock(this->pending_json_messages_lock_);
-    if (this->pending_json_messages_.size() >= 8) {
+    if (this->pending_json_messages_.size() >= 64) {
       ESP_LOGW(TAG, "Dropping realtime JSON message because pending queue is full");
       return;
     }
@@ -506,8 +560,11 @@ void OpenAIAssistant::handle_websocket_event_(esp_websocket_event_id_t event_id,
             this->rx_message_.clear();
             this->rx_message_.reserve(event_data->payload_len);
           }
+          if (this->rx_message_.size() < static_cast<size_t>(event_data->payload_offset)) {
+            this->rx_message_.resize(event_data->payload_offset);
+          }
           this->rx_message_.append(event_data->data_ptr, event_data->data_len);
-          if (this->rx_message_.size() >= event_data->payload_len) {
+          if (event_data->payload_offset + event_data->data_len >= event_data->payload_len) {
             this->queue_json_message_(reinterpret_cast<const uint8_t *>(this->rx_message_.data()), this->rx_message_.size());
             this->rx_message_.clear();
           }
@@ -536,10 +593,14 @@ void OpenAIAssistant::handle_json_message_(const uint8_t *data, size_t len) {
   }
   const char *type = root["type"] | "";
   ESP_LOGV(TAG, "Realtime event type: %s", type);
+  if (strncmp(type, "response.", 9) == 0) {
+    this->last_response_event_time_ = millis();
+  }
 
   if (strcmp(type, "session.created") == 0 || strcmp(type, "session.updated") == 0) {
     this->session_configured_ = true;
   } else if (strcmp(type, "input_audio_buffer.speech_started") == 0) {
+    this->speech_started_ = true;
     this->stt_vad_start_trigger_.trigger();
   } else if (strcmp(type, "input_audio_buffer.speech_stopped") == 0) {
     this->stt_vad_end_trigger_.trigger();
@@ -560,10 +621,14 @@ void OpenAIAssistant::handle_json_message_(const uint8_t *data, size_t len) {
     if (!this->response_text_active_) {
       this->response_text_active_ = true;
       this->response_text_.clear();
+      this->set_state_(State::STREAMING_RESPONSE);
       this->tts_start_trigger_.trigger(delta);
     }
     this->response_text_ += delta;
-    this->publish_response_text_(this->response_text_.c_str());
+    if (millis() - this->last_response_publish_time_ > RESPONSE_TEXT_PUBLISH_INTERVAL_MS) {
+      this->last_response_publish_time_ = millis();
+      this->publish_response_text_(this->response_text_.c_str());
+    }
   } else if (strcmp(type, "response.audio_transcript.done") == 0 ||
              strcmp(type, "response.output_audio_transcript.done") == 0) {
     const char *transcript = root["transcript"] | "";
@@ -600,6 +665,7 @@ void OpenAIAssistant::handle_json_message_(const uint8_t *data, size_t len) {
 void OpenAIAssistant::handle_audio_delta_(const char *delta, size_t len) {
 #ifdef USE_SPEAKER
   if (this->speaker_ == nullptr || this->speaker_buffer_ == nullptr) {
+    ESP_LOGW(TAG, "Received realtime audio delta but no speaker is configured");
     return;
   }
   if (!this->tts_streaming_) {
@@ -608,15 +674,46 @@ void OpenAIAssistant::handle_audio_delta_(const char *delta, size_t len) {
     this->speaker_->start();
     this->tts_stream_start_trigger_.trigger();
   }
-  size_t available = SPEAKER_BUFFER_SIZE - this->speaker_buffer_size_;
-  const size_t maximum_decoded_size = (len / 4) * 3;
-  if (maximum_decoded_size > available) {
-    ESP_LOGW(TAG, "Speaker buffer full, dropping realtime audio chunk");
-    return;
+
+  size_t offset = 0;
+  while (offset < len) {
+    if (this->speaker_buffer_size_ == SPEAKER_BUFFER_SIZE) {
+      size_t written = this->speaker_->play(this->speaker_buffer_, this->speaker_buffer_size_);
+      if (written == 0) {
+        ESP_LOGW(TAG, "Speaker buffer full, dropping remainder of realtime audio chunk");
+        return;
+      }
+      memmove(this->speaker_buffer_, this->speaker_buffer_ + written, this->speaker_buffer_size_ - written);
+      this->speaker_buffer_size_ -= written;
+    }
+
+    const size_t available = SPEAKER_BUFFER_SIZE - this->speaker_buffer_size_;
+    size_t chars_to_decode = std::min(len - offset, (available / 3) * 4);
+    chars_to_decode -= chars_to_decode % 4;
+    if (chars_to_decode == 0) {
+      size_t written = this->speaker_->play(this->speaker_buffer_, this->speaker_buffer_size_);
+      if (written == 0) {
+        ESP_LOGW(TAG, "Speaker could not accept realtime audio; dropping remainder of chunk");
+        return;
+      }
+      memmove(this->speaker_buffer_, this->speaker_buffer_ + written, this->speaker_buffer_size_ - written);
+      this->speaker_buffer_size_ -= written;
+      continue;
+    }
+
+    size_t decoded = base64_decode(reinterpret_cast<const uint8_t *>(delta + offset), chars_to_decode,
+                                   this->speaker_buffer_ + this->speaker_buffer_size_, available);
+    auto *samples = reinterpret_cast<int16_t *>(this->speaker_buffer_ + this->speaker_buffer_size_);
+    for (size_t i = 0; i < decoded / sizeof(int16_t); i++) {
+      samples[i] = clamp<int32_t>(static_cast<int32_t>(samples[i] * this->volume_multiplier_), INT16_MIN, INT16_MAX);
+    }
+    this->speaker_buffer_size_ += decoded;
+    this->response_audio_bytes_received_ += decoded;
+    offset += chars_to_decode;
   }
-  size_t decoded = base64_decode(reinterpret_cast<const uint8_t *>(delta), len,
-                                 this->speaker_buffer_ + this->speaker_buffer_size_, available);
-  this->speaker_buffer_size_ += decoded;
+  this->response_audio_chunks_received_++;
+  ESP_LOGD(TAG, "Received realtime audio: %" PRIu32 " bytes in %" PRIu32 " chunks", this->response_audio_bytes_received_,
+           this->response_audio_chunks_received_);
 #endif
 }
 

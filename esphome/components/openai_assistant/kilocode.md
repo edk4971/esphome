@@ -213,6 +213,48 @@ To fix this, websocket event handling was split:
 
 This should prevent display/text automation work from blocking the websocket receive task. It should also stop the race where `input_audio_buffer.speech_stopped` arrives on `websocket_task` while the main loop is still sending queued microphone audio frames; the speech-stopped event is now processed before the loop state machine continues, so the state can move to `STOP_MICROPHONE` before more audio append frames are sent.
 
+Follow-up: after moving processing to the main loop, the ESP still stalled after the first response transcript token (`The`). The logs showed three relevant behaviors:
+
+- response transcript deltas can arrive in a burst, and publishing every tiny delta can still cause lots of UI/text work;
+- a large fragmented websocket text payload was seen (`payload_len=63934`) before response creation/output events;
+- if the endpoint sends transcript deltas but does not send a final `response.done`/`response.output_item.done`, the component remains in `AWAITING_RESPONSE` or `STREAMING_RESPONSE` forever.
+
+I added another robustness pass:
+
+- pending JSON queue capacity increased from 8 to 64 messages;
+- fragmented websocket completion now uses `payload_offset + data_len >= payload_len`, not only accumulated string size, and pads to the reported offset if necessary;
+- response activity timestamp is updated for every `response.*` event;
+- `AWAITING_RESPONSE` and `STREAMING_RESPONSE` now finish the response after 15 seconds of response inactivity, which restarts wake-word detection instead of hanging forever;
+- transcript-only responses now move the state to `STREAMING_RESPONSE` even if no audio delta is received;
+- response text sensor updates are throttled to at most once every 250 ms during transcript deltas, with final transcript events still publishing immediately;
+- large audio deltas are decoded in chunks into the fixed speaker buffer instead of being dropped outright when the decoded payload is larger than remaining buffer space.
+
+If the endpoint still only sends `response.output_audio_transcript.delta` and never sends `response.output_audio.delta`, the ESP will display text but will not play audio. The new `Received realtime audio delta but no speaker is configured` and speaker-buffer warnings help distinguish missing audio deltas from playback-buffer issues.
+
+Follow-up: the response no longer hangs; after 15 seconds of response inactivity the component returns to `IDLE` and restarts mWW. The remaining observations were: no audible output, ongoing websocket ping logs after returning to idle, and full display redraws taking ~130-180 ms. I changed:
+
+- non-continuous responses now disconnect/destroy the Realtime websocket after `finish_response_()` returns to `IDLE`, so idle devices should not keep logging websocket ping frames forever;
+- decoded response PCM is now scaled by `volume_multiplier` before being written to the speaker buffer;
+- response audio diagnostics now log `Received realtime audio: <bytes> bytes in <chunks> chunks` whenever `response.audio.delta` or `response.output_audio.delta` is actually received.
+
+If that audio diagnostic never appears, the endpoint is only sending transcript deltas (`response.output_audio_transcript.delta`) and not audio deltas, regardless of the endpoint-side TTS log. In that case the next fix is session/endpoint configuration for audio output, not speaker volume. If the diagnostic appears but no sound is heard, focus on speaker sample rate/resampling, DAC volume, and PCM scaling.
+
+Display redraws are still expensive because this package uses full-screen MIPI SPI updates. Partial display invalidation is not currently handled in this component; the practical workaround is to reduce how often assistant events call `draw_display` or avoid redrawing for every transcript/token update.
+
+Admin cleanup and no-speech handling:
+
+- Removed the temporary top-level `openai.yaml` force-start diagnostics that were marked with `#debug` / `//debug`, including the extra `esphome.on_boot`, extra `api.on_client_connected`, and `logger.level: VERBOSE` entries. Wake-word startup should now rely on the cleaner package lifecycle in `esp32-openai.yaml`.
+- Added a no-speech timeout for the failure mode where local mWW wakes the assistant, the Realtime websocket connects, and the ESP streams microphone audio, but server VAD never emits `input_audio_buffer.speech_started` because the user spoke too early/quietly or not at all.
+- The timeout starts when the microphone reaches `STREAMING_MICROPHONE`. If no `input_audio_buffer.speech_started` event is processed within 5 seconds, the component logs `No speech detected within 5000ms; returning to idle`, stops the microphone, returns to `IDLE`, triggers `on_idle`, and disconnects the non-continuous Realtime websocket. This restarts local mWW through the YAML `on_idle` path instead of streaming silence indefinitely.
+
+Follow-up from a later run: VAD did detect speech, so the no-speech timeout was correctly not used. The assistant entered `STREAMING_RESPONSE`, then finished via the 15 second response inactivity timeout. There were still no `Received realtime audio: ...` logs, which means the endpoint is emitting transcript events but not audio delta events to the ESP. I added a response-finished summary log with response audio byte/chunk counts. If it prints `response_audio=0 bytes in 0 chunks`, the next fix needs to be on the Realtime session/endpoint side so the server sends `response.output_audio.delta` / `response.audio.delta`, not just `response.output_audio_transcript.delta`.
+
+I also moved non-continuous websocket disconnect before `on_idle` trigger execution in `finish_response_()`. The previous order could make the `openai_assistant` loop include both idle automations and websocket teardown in one long operation; disconnecting before `on_idle` should reduce the long idle transition and prevents wake-word restart from racing with websocket teardown.
+
+Latest observation: `Response finished: response_audio=0 bytes in 0 chunks` confirms the ESP is not receiving playable `response.audio.delta` / `response.output_audio.delta` events. It is only receiving transcript deltas. I added an explicit Realtime `voice` config option, defaulting to `alloy`, and included it in `session.update` as `session.voice`. The ESPHome package now sets `voice: alloy` beside `model: gpt-realtime`.
+
+I also changed `finish_response_()` to publish the accumulated response transcript before finishing, so even if the endpoint never sends a final transcript/done event the display should not remain stuck on just the first throttled token. If the next run still prints `response_audio=0`, the endpoint/session is still transcript-only from the ESP's perspective and needs endpoint-side audio delta configuration or a different Realtime event format mapping.
+
 ## What Is Still A Shell
 
 `media_player` is accepted and stored, but it is not used for response output.

@@ -247,6 +247,7 @@ micro_wake_word:
 openai_assistant:
   id: va
   model: gpt-realtime
+  voice: alloy
   endpoint: "ws://vulkan.home.iamelliott.com:8080/v1/realtime"
   api_key: ""
   microphone: box_mic
