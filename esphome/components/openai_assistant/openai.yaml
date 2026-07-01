@@ -25,7 +25,8 @@ esp32:
       CONFIG_SPIRAM_RODATA: "y"
       CONFIG_SPIRAM_FETCH_INSTRUCTIONS: "y"
 
-logger:
+logger: 
+  level: VERBOSE
 
 external_components:
   - source: 

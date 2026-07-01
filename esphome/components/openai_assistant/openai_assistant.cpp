@@ -30,6 +30,7 @@ static const uint32_t CONNECT_TIMEOUT_MS = 15000;
 static const uint32_t RESPONSE_INACTIVITY_TIMEOUT_MS = 15000;
 static const uint32_t RESPONSE_TEXT_PUBLISH_INTERVAL_MS = 250;
 static const uint32_t NO_SPEECH_TIMEOUT_MS = 5000;
+static const uint32_t RESPONSE_CREATE_AFTER_COMMIT_TIMEOUT_MS = 3000;
 static const size_t MAX_JSON_MESSAGE_SIZE = 8192;
 
 static std::string extract_json_type_(const char *data, size_t len) {
@@ -230,6 +231,9 @@ void OpenAIAssistant::request_start(bool continuous, bool silence_detection) {
   this->continuous_ = continuous;
   this->silence_detection_ = silence_detection;
   this->response_requested_ = false;
+  this->input_committed_ = false;
+  this->transcription_completed_ = false;
+  this->input_committed_time_ = 0;
   if (!this->allocate_buffers_()) {
     this->error_trigger_.trigger("buffer-allocation-failed", "Could not allocate audio buffers");
     return;
@@ -370,6 +374,11 @@ void OpenAIAssistant::loop() {
     case State::AWAITING_RESPONSE:
       if (!this->connected_) {
         this->set_state_(State::IDLE);
+      } else if (this->input_committed_ && !this->response_requested_ && this->input_committed_time_ != 0 &&
+                 millis() - this->input_committed_time_ > RESPONSE_CREATE_AFTER_COMMIT_TIMEOUT_MS) {
+        ESP_LOGW(TAG, "Input transcription did not complete within %ums; requesting response anyway",
+                 RESPONSE_CREATE_AFTER_COMMIT_TIMEOUT_MS);
+        this->send_response_create_();
       } else if (this->last_response_event_time_ != 0 &&
                  millis() - this->last_response_event_time_ > RESPONSE_INACTIVITY_TIMEOUT_MS) {
         ESP_LOGW(TAG, "Realtime response inactive for %ums; finishing response", RESPONSE_INACTIVITY_TIMEOUT_MS);
@@ -400,32 +409,21 @@ void OpenAIAssistant::send_session_update_() {
   JsonObject root = doc.to<JsonObject>();
   root["type"] = "session.update";
   JsonObject session = root["session"].to<JsonObject>();
-  session["type"] = "realtime";
   session["instructions"] = this->system_prompt_;
-  JsonArray output_modalities = session["output_modalities"].to<JsonArray>();
-  output_modalities.add("audio");
-
-  JsonObject audio = session["audio"].to<JsonObject>();
-  JsonObject input = audio["input"].to<JsonObject>();
-  JsonObject input_format = input["format"].to<JsonObject>();
-  input_format["type"] = "audio/pcm";
-  // The OpenAPI schema documents 24 kHz PCM, but this component currently streams the configured 16 kHz
-  // MicrophoneSource directly. Report the actual input rate until input resampling is added.
-  input_format["rate"] = SAMPLE_RATE_HZ;
-  JsonObject turn_detection = input["turn_detection"].to<JsonObject>();
+  session["voice"] = this->voice_;
+  JsonArray modalities = session["modalities"].to<JsonArray>();
+  modalities.add("text");
+  modalities.add("audio");
+  session["input_audio_format"] = "pcm16";
+  session["output_audio_format"] = "pcm16";
+  JsonObject turn_detection = session["turn_detection"].to<JsonObject>();
   if (this->silence_detection_) {
     turn_detection["type"] = "server_vad";
     // Let server VAD commit the input buffer, but create the response ourselves so we can explicitly request audio.
     turn_detection["create_response"] = false;
   } else {
-    input["turn_detection"] = nullptr;
+    turn_detection["type"] = "none";
   }
-
-  JsonObject output = audio["output"].to<JsonObject>();
-  JsonObject output_format = output["format"].to<JsonObject>();
-  output_format["type"] = "audio/pcm";
-  output_format["rate"] = OUTPUT_SAMPLE_RATE_HZ;
-  output["voice"] = this->voice_;
   std::string msg;
   serializeJson(doc, msg);
   this->send_text_(msg);
@@ -700,7 +698,8 @@ void OpenAIAssistant::handle_json_message_(const uint8_t *data, size_t len) {
       this->set_state_(State::STOP_MICROPHONE);
     }
   } else if (strcmp(type, "input_audio_buffer.committed") == 0) {
-    this->send_response_create_();
+    this->input_committed_ = true;
+    this->input_committed_time_ = millis();
   } else if (strcmp(type, "conversation.item.input_audio_transcription.delta") == 0) {
     this->request_text_ += root["delta"] | "";
     this->publish_request_text_(this->request_text_.c_str());
@@ -709,6 +708,12 @@ void OpenAIAssistant::handle_json_message_(const uint8_t *data, size_t len) {
     this->request_text_ = transcript;
     this->publish_request_text_(transcript);
     this->stt_end_trigger_.trigger(transcript);
+    this->transcription_completed_ = true;
+    if (this->input_committed_ && !this->response_requested_) {
+      this->send_response_create_();
+    }
+  } else if (strcmp(type, "conversation.item.input_audio_transcription.failed") == 0) {
+    ESP_LOGW(TAG, "Input audio transcription failed; waiting briefly before requesting response");
   } else if (strcmp(type, "response.audio_transcript.delta") == 0 ||
              strcmp(type, "response.output_audio_transcript.delta") == 0) {
     const char *delta = root["delta"] | "";
@@ -745,6 +750,7 @@ void OpenAIAssistant::handle_json_message_(const uint8_t *data, size_t len) {
   } else if (strcmp(type, "response.output_item.done") == 0) {
     this->finish_response_();
   } else if (strcmp(type, "response.done") == 0) {
+    this->log_response_status_(root);
     this->finish_response_();
   } else if (strcmp(type, "error") == 0) {
     JsonObject error = root["error"];
@@ -753,6 +759,50 @@ void OpenAIAssistant::handle_json_message_(const uint8_t *data, size_t len) {
     const char *param = error["param"] | "";
     ESP_LOGW(TAG, "Realtime API error: code='%s' message='%s' param='%s'", code, message, param);
     this->error_trigger_.trigger(code, message);
+  }
+}
+
+void OpenAIAssistant::log_response_status_(JsonObject root) {
+  JsonObject response = root["response"];
+  if (response.isNull()) {
+    ESP_LOGW(TAG, "response.done did not include a response object");
+    return;
+  }
+
+  const char *status = response["status"] | "";
+  JsonObject status_details = response["status_details"];
+  const char *detail_type = status_details["type"] | "";
+  const char *reason = status_details["reason"] | "";
+  JsonObject error = status_details["error"];
+  const char *error_type = error["type"] | "";
+  const char *error_code = error["code"] | "";
+
+  JsonArray output_modalities = response["output_modalities"].as<JsonArray>();
+  std::string modalities;
+  for (const char *modality : output_modalities) {
+    if (!modalities.empty()) {
+      modalities += ",";
+    }
+    modalities += modality;
+  }
+
+  ESP_LOGI(TAG, "Realtime response done: status='%s' detail_type='%s' reason='%s' error_type='%s' error_code='%s' "
+                "output_modalities='%s' output_items=%u",
+           status, detail_type, reason, error_type, error_code, modalities.c_str(),
+           static_cast<unsigned>(response["output"].size()));
+
+  JsonArray output = response["output"].as<JsonArray>();
+  for (JsonObject item : output) {
+    JsonArray content = item["content"].as<JsonArray>();
+    for (JsonObject part : content) {
+      const char *part_type = part["type"] | "";
+      const char *transcript = part["transcript"] | "";
+      if (transcript[0] != '\0') {
+        ESP_LOGI(TAG, "Realtime response output part: type='%s' transcript='%s'", part_type, transcript);
+        this->response_text_ = transcript;
+        this->publish_response_text_(this->response_text_.c_str());
+      }
+    }
   }
 }
 

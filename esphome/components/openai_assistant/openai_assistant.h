@@ -134,6 +134,7 @@ class OpenAIAssistant : public Component {
   void handle_websocket_event_(esp_websocket_event_id_t event_id, esp_websocket_event_data_t *event_data);
   void handle_json_message_(const uint8_t *data, size_t len);
   void handle_audio_delta_(const char *delta, size_t len);
+  void log_response_status_(JsonObject root);
   void publish_request_text_(const char *text);
   void publish_response_text_(const char *text);
 
@@ -188,8 +189,11 @@ class OpenAIAssistant : public Component {
   bool tts_streaming_{false};
   bool response_text_active_{false};
   bool response_requested_{false};
+  bool input_committed_{false};
+  bool transcription_completed_{false};
   State state_{State::IDLE};
   uint32_t connection_start_time_{0};
+  uint32_t input_committed_time_{0};
   uint32_t last_audio_log_time_{0};
   uint32_t mic_bytes_received_{0};
   uint32_t audio_bytes_sent_{0};
