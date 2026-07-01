@@ -305,6 +305,8 @@ Latest regression: sending manual `response.create` immediately on `input_audio_
 
 Next observation: VAD, STT, and LLM ingestion worked, then `response.created` was followed almost immediately by `response.done` with no audio deltas. Per the OpenAPI schema, `response.done` includes a full `response` object with `status`, `status_details`, `output_modalities`, and output items. I added `log_response_status_()` to log those fields on every `response.done`, including any status detail error/reason and any transcript present in `response.output[*].content[*].transcript`. This should reveal whether the server is completing successfully with no audio, failing/cancelling, or returning a final transcript only.
 
+STT language note: the endpoint auto-detected French (`fr`) for an English query. The OpenAPI schema includes `language` under `AudioTranscription` with ISO-639-1 examples such as `en`. I added an `openai_assistant.language` config option, exposed in `esp32-openai.yaml` as `language: en`, and include it in the working beta-style session update as `session.input_audio_transcription.language`. This is intentionally minimal: it does not set or change the transcription model, because the current STT path is otherwise working.
+
 ## What Is Still A Shell
 
 `media_player` is accepted and stored, but it is not used for response output.

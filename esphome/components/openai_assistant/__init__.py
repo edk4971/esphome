@@ -34,6 +34,7 @@ CONF_SYSTEM_PROMPT = "system_prompt"
 CONF_TEXT_REQUEST = "text_request"
 CONF_TEXT_RESPONSE = "text_response"
 CONF_VOICE = "voice"
+CONF_LANGUAGE = "language"
 CONF_ON_END = "on_end"
 CONF_ON_LISTENING = "on_listening"
 CONF_ON_STT_END = "on_stt_end"
@@ -92,6 +93,7 @@ CONFIG_SCHEMA = cv.All(
             cv.Required(CONF_API_KEY): cv.string,
             cv.Required(CONF_MODEL): cv.string,
             cv.Optional(CONF_VOICE, default="alloy"): cv.string,
+            cv.Optional(CONF_LANGUAGE): cv.All(cv.string, cv.Length(min=2, max=8)),
             cv.Required(CONF_ENDPOINT): _websocket_endpoint,
             cv.Optional(
                 CONF_SYSTEM_PROMPT, default="You are a helpful voice assistant."
@@ -198,6 +200,8 @@ async def to_code(config):
     cg.add(var.set_api_key(config[CONF_API_KEY]))
     cg.add(var.set_model(config[CONF_MODEL]))
     cg.add(var.set_voice(config[CONF_VOICE]))
+    if language := config.get(CONF_LANGUAGE):
+        cg.add(var.set_language(language))
     cg.add(var.set_endpoint(config[CONF_ENDPOINT]))
     cg.add(var.set_system_prompt(config[CONF_SYSTEM_PROMPT]))
     cg.add(var.set_use_wake_word(config[CONF_USE_WAKE_WORD]))

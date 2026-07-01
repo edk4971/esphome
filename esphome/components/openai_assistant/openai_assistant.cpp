@@ -104,6 +104,7 @@ void OpenAIAssistant::dump_config() {
   ESP_LOGCONFIG(TAG, "  Endpoint: %s", this->endpoint_.c_str());
   ESP_LOGCONFIG(TAG, "  Model: %s", this->model_.c_str());
   ESP_LOGCONFIG(TAG, "  Voice: %s", this->voice_.c_str());
+  ESP_LOGCONFIG(TAG, "  Language: %s", this->language_.empty() ? "auto" : this->language_.c_str());
   ESP_LOGCONFIG(TAG, "  Wake Word: %s", YESNO(this->use_wake_word_));
 }
 
@@ -416,6 +417,10 @@ void OpenAIAssistant::send_session_update_() {
   modalities.add("audio");
   session["input_audio_format"] = "pcm16";
   session["output_audio_format"] = "pcm16";
+  if (!this->language_.empty()) {
+    JsonObject input_audio_transcription = session["input_audio_transcription"].to<JsonObject>();
+    input_audio_transcription["language"] = this->language_;
+  }
   JsonObject turn_detection = session["turn_detection"].to<JsonObject>();
   if (this->silence_detection_) {
     turn_detection["type"] = "server_vad";

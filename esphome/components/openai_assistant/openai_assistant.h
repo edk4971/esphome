@@ -65,6 +65,7 @@ class OpenAIAssistant : public Component {
   void set_api_key(const std::string &api_key) { this->api_key_ = api_key; }
   void set_model(const std::string &model) { this->model_ = model; }
   void set_voice(const std::string &voice) { this->voice_ = voice; }
+  void set_language(const std::string &language) { this->language_ = language; }
   void set_endpoint(const std::string &endpoint) { this->endpoint_ = endpoint; }
   void set_system_prompt(const std::string &system_prompt) { this->system_prompt_ = system_prompt; }
   void set_use_wake_word(bool use_wake_word) { this->use_wake_word_ = use_wake_word; }
@@ -166,6 +167,7 @@ class OpenAIAssistant : public Component {
   std::string api_key_;
   std::string model_;
   std::string voice_;
+  std::string language_;
   std::string system_prompt_;
   std::string wake_word_;
   std::string rx_message_;
