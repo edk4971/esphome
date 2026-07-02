@@ -307,6 +307,25 @@ Next observation: VAD, STT, and LLM ingestion worked, then `response.created` wa
 
 STT language note: the endpoint auto-detected French (`fr`) for an English query. The OpenAPI schema includes `language` under `AudioTranscription` with ISO-639-1 examples such as `en`. I added an `openai_assistant.language` config option, exposed in `esp32-openai.yaml` as `language: en`, and include it in the working beta-style session update as `session.input_audio_transcription.language`. This is intentionally minimal: it does not set or change the transcription model, because the current STT path is otherwise working.
 
+Response-create dialect correction: after the race fix, the GA-shaped `response.create` (`output_modalities` + nested `audio.output`) was accepted syntactically by the endpoint but immediately produced `response.done` with `status='cancelled'`, no output modalities, and zero output items. Because the endpoint is demonstrably using/accepting the beta-style session dialect (`modalities`, `input_audio_format`, `output_audio_format`, root `turn_detection`), I switched manual `response.create` back to the matching beta-style response dialect, but kept the important timing fix: it is sent only after transcription completion. The current request is:
+
+```json
+{
+  "type": "response.create",
+  "response": {
+    "modalities": ["text", "audio"],
+    "voice": "voice-en_US-joe-medium",
+    "output_audio_format": "pcm16"
+  }
+}
+```
+
+This re-tests the endpoint's native response dialect without reintroducing the earlier STT cancellation race.
+
+Endpoint concurrency observation: with LLM streaming off, TTS audio streaming on, partial transcription off, and clause splitting off, the endpoint still showed duplicate LLM/task behavior. Logs indicated the endpoint started an LLM run before the ESP's manual `response.create`, then the manual create caused `prediction_failed` / `context canceled` and a second response. This means the endpoint appears to auto-create/schedule a response despite receiving `create_response: false`, or otherwise treats manual `response.create` as competing with its internal pipeline.
+
+I added `response_mode` with values `auto` and `manual`, defaulting the package to `response_mode: auto`. In auto mode, `session.turn_detection.create_response` is true and the ESP does not send manual `response.create` after commit/transcription. Manual mode preserves the explicit response-create behavior for future A/B tests. This should stop the duplicate-response cancellation loop and let the endpoint's native auto-response path run with its configured audio streaming options.
+
 ## What Is Still A Shell
 
 `media_player` is accepted and stored, but it is not used for response output.

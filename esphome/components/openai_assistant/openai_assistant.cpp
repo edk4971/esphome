@@ -26,8 +26,8 @@ static const size_t RING_BUFFER_SIZE = RING_BUFFER_SAMPLES * sizeof(int16_t);
 static const size_t SEND_BUFFER_SAMPLES = 32 * SAMPLE_RATE_HZ / 1000;
 static const size_t SEND_BUFFER_SIZE = SEND_BUFFER_SAMPLES * sizeof(int16_t);
 static const size_t SPEAKER_BUFFER_SIZE = 4096;
-static const uint32_t CONNECT_TIMEOUT_MS = 15000;
-static const uint32_t RESPONSE_INACTIVITY_TIMEOUT_MS = 15000;
+static const uint32_t CONNECT_TIMEOUT_MS = 25000;
+static const uint32_t RESPONSE_INACTIVITY_TIMEOUT_MS = 25000;
 static const uint32_t RESPONSE_TEXT_PUBLISH_INTERVAL_MS = 250;
 static const uint32_t NO_SPEECH_TIMEOUT_MS = 5000;
 static const uint32_t RESPONSE_CREATE_AFTER_COMMIT_TIMEOUT_MS = 3000;
@@ -105,6 +105,7 @@ void OpenAIAssistant::dump_config() {
   ESP_LOGCONFIG(TAG, "  Model: %s", this->model_.c_str());
   ESP_LOGCONFIG(TAG, "  Voice: %s", this->voice_.c_str());
   ESP_LOGCONFIG(TAG, "  Language: %s", this->language_.empty() ? "auto" : this->language_.c_str());
+  ESP_LOGCONFIG(TAG, "  Response Mode: %s", this->manual_response_mode_ ? "manual" : "auto");
   ESP_LOGCONFIG(TAG, "  Wake Word: %s", YESNO(this->use_wake_word_));
 }
 
@@ -375,7 +376,8 @@ void OpenAIAssistant::loop() {
     case State::AWAITING_RESPONSE:
       if (!this->connected_) {
         this->set_state_(State::IDLE);
-      } else if (this->input_committed_ && !this->response_requested_ && this->input_committed_time_ != 0 &&
+      } else if (this->manual_response_mode_ && this->input_committed_ && !this->response_requested_ &&
+                 this->input_committed_time_ != 0 &&
                  millis() - this->input_committed_time_ > RESPONSE_CREATE_AFTER_COMMIT_TIMEOUT_MS) {
         ESP_LOGW(TAG, "Input transcription did not complete within %ums; requesting response anyway",
                  RESPONSE_CREATE_AFTER_COMMIT_TIMEOUT_MS);
@@ -424,8 +426,7 @@ void OpenAIAssistant::send_session_update_() {
   JsonObject turn_detection = session["turn_detection"].to<JsonObject>();
   if (this->silence_detection_) {
     turn_detection["type"] = "server_vad";
-    // Let server VAD commit the input buffer, but create the response ourselves so we can explicitly request audio.
-    turn_detection["create_response"] = false;
+    turn_detection["create_response"] = !this->manual_response_mode_;
   } else {
     turn_detection["type"] = "none";
   }
@@ -470,18 +471,15 @@ void OpenAIAssistant::send_response_create_() {
   JsonObject root = doc.to<JsonObject>();
   root["type"] = "response.create";
   JsonObject response = root["response"].to<JsonObject>();
-  JsonArray output_modalities = response["output_modalities"].to<JsonArray>();
-  output_modalities.add("audio");
-  JsonObject audio = response["audio"].to<JsonObject>();
-  JsonObject output = audio["output"].to<JsonObject>();
-  JsonObject format = output["format"].to<JsonObject>();
-  format["type"] = "audio/pcm";
-  format["rate"] = OUTPUT_SAMPLE_RATE_HZ;
-  output["voice"] = this->voice_;
+  JsonArray modalities = response["modalities"].to<JsonArray>();
+  modalities.add("text");
+  modalities.add("audio");
+  response["voice"] = this->voice_;
+  response["output_audio_format"] = "pcm16";
 
   std::string msg;
   serializeJson(doc, msg);
-  ESP_LOGD(TAG, "Requesting realtime response with audio output");
+  ESP_LOGD(TAG, "Requesting realtime response with beta-compatible audio output");
   if (this->send_text_(msg)) {
     this->response_requested_ = true;
   }
@@ -493,7 +491,9 @@ void OpenAIAssistant::signal_stop_() {
   }
   ESP_LOGD(TAG, "Committing input audio buffer and requesting response");
   this->send_text_("{\"type\":\"input_audio_buffer.commit\"}");
-  this->send_response_create_();
+  if (this->manual_response_mode_) {
+    this->send_response_create_();
+  }
 }
 
 void OpenAIAssistant::finish_response_() {
@@ -714,7 +714,7 @@ void OpenAIAssistant::handle_json_message_(const uint8_t *data, size_t len) {
     this->publish_request_text_(transcript);
     this->stt_end_trigger_.trigger(transcript);
     this->transcription_completed_ = true;
-    if (this->input_committed_ && !this->response_requested_) {
+    if (this->manual_response_mode_ && this->input_committed_ && !this->response_requested_) {
       this->send_response_create_();
     }
   } else if (strcmp(type, "conversation.item.input_audio_transcription.failed") == 0) {

@@ -66,6 +66,7 @@ class OpenAIAssistant : public Component {
   void set_model(const std::string &model) { this->model_ = model; }
   void set_voice(const std::string &voice) { this->voice_ = voice; }
   void set_language(const std::string &language) { this->language_ = language; }
+  void set_response_mode(bool manual_response_mode) { this->manual_response_mode_ = manual_response_mode; }
   void set_endpoint(const std::string &endpoint) { this->endpoint_ = endpoint; }
   void set_system_prompt(const std::string &system_prompt) { this->system_prompt_ = system_prompt; }
   void set_use_wake_word(bool use_wake_word) { this->use_wake_word_ = use_wake_word; }
@@ -190,6 +191,7 @@ class OpenAIAssistant : public Component {
   float volume_multiplier_{1.0f};
   bool tts_streaming_{false};
   bool response_text_active_{false};
+  bool manual_response_mode_{false};
   bool response_requested_{false};
   bool input_committed_{false};
   bool transcription_completed_{false};
