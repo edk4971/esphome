@@ -1,9 +1,9 @@
-﻿# Kilo (local AI tool config/plans -- not for upstream)
-.kilo/
+﻿# Ignore all dotfiles/dot-directories (upstream ESPHome config we don't need)
+.*
+# ...but keep .gitignore itself
+!.gitignore
 
 # Build artifacts
-.build/
-.pio/
 *.elf
 *.bin
 
