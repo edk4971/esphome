@@ -1,4 +1,19 @@
-# ESPHome OpenAI Assistant
+# openai_realtime — INCOMPLETE / NONFUNCTIONAL
+
+> **⚠️ This component is a non-functional work in progress.**
+>
+> It is kept in this repo only in case someone wants to continue the effort.
+> Development was abandoned because the Realtime API is still too new and
+> isn't uniformly supported across different OpenAI-compatible endpoints.
+>
+> **For a working voice assistant, use
+> [`openai_conversations`](../openai_conversations/) instead** — it uses the
+> Chat Completions + Audio HTTP APIs and works with any OpenAI-compatible
+> server.
+
+---
+
+# ESPHome OpenAI Assistant (Realtime API)
 
 An ESPHome component that connects an ESP32 device directly to an OpenAI-compatible Realtime API WebSocket endpoint for voice conversations.
 
