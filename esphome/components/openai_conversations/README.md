@@ -1,53 +1,149 @@
 # openai_conversations
 
-A voice assistant component for ESPHome that talks to an
-OpenAI-compatible server over the **Chat Completions** + **Audio** HTTP APIs
-(request-based, *not* the Realtime WebSocket API).
+A voice assistant component for ESPHome that connects to any
+OpenAI-compatible server (LLM, STT, TTS) over the standard **Chat
+Completions** and **Audio** HTTP APIs. Designed for the ESP32-S3-Box-3 with
+full support for `micro_wake_word`, PSRAM, and client-side MCP tool
+execution.
 
-Designed for the ESP32-S3-Box-3 (PSRAM, microphone, speaker, and
-`micro_wake_word`).
+Inspired by ESPHome's built-in `voice_assistant`, but written to be
+backend-agnostic: it talks to any OpenAI-compatible endpoint and interfaces
+with Home Assistant primarily through MCP tool servers rather than the HA
+WebSocket API. It can even be used without Home Assistant entirely — any
+MCP-compatible tool server works.
 
-## Why Chat Completions instead of Realtime
+## Features
 
-The Realtime API requires the server to support `type:"mcp"` tools in the
-Realtime session, which many local OpenAI-compatible servers do not. Chat
-Completions handles tools client-side — when the LLM returns
-`finish_reason: "tool_calls"`, the component executes the tools via MCP
-servers, injects the results, and re-queries the LLM.
+- **Wake-word activated** — integrates with `micro_wake_word`; the component
+  owns the MWW lifecycle (stop on start, restart after each turn)
+- **Two audio pipelines** — multimodal (send audio directly to the LLM) or
+  STT + LLM (transcribe first, then chat)
+- **Client-side MCP tools** — when the LLM requests tool calls, the component
+  executes them via MCP servers and re-queries the LLM with the results
+  (up to 5 rounds per turn)
+- **Streaming chat** — SSE delta streaming for lower latency
+- **TTS playback** — fetches audio from `/v1/audio/speech` and plays it
+  through the i2s speaker
+- **Home Assistant integration** — text sensors for transcript/response,
+  HA-exposed mute switch, media_player announcement pipeline, and the
+  `HassBroadcast` MCP tool
+- **PSRAM-optimized** — all audio buffers, HTTP request bodies, and JSON
+  documents live in PSRAM to preserve internal heap
+- **Local VAD** — energy-based voice activity detection with configurable
+  threshold, onset, and silence duration
 
-| Aspect | Realtime API | Chat Completions (this component) |
-|--------|-------------|-----------------------------------|
-| Connection | Persistent WebSocket | HTTP POST (stateless) |
-| Tools | Server must support `type:"mcp"` | Client-side MCP tool execution |
-| VAD | Server-side | Client-side (local energy-based) |
-| Audio input | Raw PCM16 streamed continuously | Base64-encoded WAV in request body |
-| Audio output | Base64 PCM16 deltas via events | Separate `/v1/audio/speech` call |
-| Latency | ~1-2s (streaming) | ~3-5s (request/response) |
+## Installation
+
+This is an external ESPHome component. Add it to your project via the
+`external_components` source:
+
+```yaml
+external_components:
+  - source:
+      type: git
+      ref: main
+      url: https://github.com/edk4971/esphome
+    components: [ openai_conversations ]
+```
+
+If you already have an `external_components` block, just add the
+`openai_conversations` entry to it.
 
 ## Requirements
 
-- ESP32 (ESP-IDF framework only)
-- PSRAM **required** (all audio/HTTP buffers live in external RAM)
-- `microphone`, `micro_wake_word`, `network`, `psram` components
+- **ESP32** with **PSRAM** (ESP-IDF framework only; all buffers use external
+  RAM). Tested on the ESP32-S3-Box-3.
+- An **OpenAI-compatible server** reachable over HTTP(S) that supports:
+  - `POST /v1/chat/completions` (with `stream: true` / SSE)
+  - `POST /v1/audio/speech` (TTS)
+  - `POST /v1/audio/transcriptions` (STT — only if using Mode 2)
+- ESPHome components: `microphone`, `speaker`, `micro_wake_word`, `psram`,
+  `network`
 
-## Two modes
+> **Tested with:** ESP32-S3-Box-3 hardware and [LocalAI](https://localai.io/)
+> as the backend server. Other ESP32 variants with PSRAM and other
+> OpenAI-compatible servers (e.g. llama.cpp, Ollama, vLLM) should work but
+> are untested.
 
-The component selects a pipeline based on whether `stt_model` is set:
+## Quick start
 
-### Mode 1: Multimodal (default, preferred)
+A complete example config for the ESP32-S3-Box-3 is in
+[`esp32-openai.yaml`](./esp32-openai.yaml). The minimal component block:
+
+```yaml
+openai_conversations:
+  id: openai
+  endpoint_base: "http://my-server:8080"
+  api_key: ""                      # empty if server doesn't require auth
+
+  # Models
+  chat_model: "gemma-4-12b-it-GGUF-mcp"
+  # stt_model: "whisper-large-turbo"  # omit for multimodal mode (default)
+  tts_model: "voice-en-US-joe-medium"
+  tts_voice: "joe"
+  tts_sample_rate: 22050
+
+  system_prompt: "You are a helpful voice assistant."
+
+  # Hardware
+  microphone: box_mic
+  speaker: box_speaker
+  micro_wake_word: mww
+
+  # Audio / VAD
+  volume_multiplier: 2.5
+  silence_threshold: 0.002
+  silence_duration_ms: 700ms
+  max_recording_ms: 30000ms
+
+  # Text sensors (visible in Home Assistant)
+  text_request: request_text
+  text_response: response_text
+```
+
+Wire the wake word to start a conversation:
+
+```yaml
+micro_wake_word:
+  # ... microphone, models ...
+  on_wake_word_detected:
+    - openai_conversations.start:
+        id: openai
+```
+
+## How it works
+
+A conversation turn flows through these stages:
+
+```
+Wake word → stop MWW → start mic → listen (VAD) → record speech →
+  stop mic → build request → send to server →
+  [STT (Mode 2 only) →] chat completions (streamed) →
+  [tool calls → MCP servers → re-query LLM →] →
+  TTS → play audio → restart MWW → idle
+```
+
+The component owns the `micro_wake_word` lifecycle: it stops MWW when a turn
+starts (to get exclusive mic access) and restarts it after the speaker stops
+(the i2s bus is shared between mic and speaker on the S3-Box-3).
+
+### Two audio modes
+
+**Mode 1: Multimodal** (default — omit `stt_model`)
 
 Sends the recorded WAV directly to a multimodal chat model via an `audio_url`
-data URL. No separate STT step — the LLM transcribes and reasons in one call.
+data URL. The LLM transcribes and reasons in a single call — no separate STT
+step, lower latency.
 
 ```
 User speaks → mic → WAV → POST /v1/chat/completions (audio_url) →
   LLM + tools → text → POST /v1/audio/speech → WAV → speaker
 ```
 
-### Mode 2: STT + LLM
+**Mode 2: STT + LLM** (set `stt_model`)
 
-Runs STT first, then sends the transcript text to the chat model. Use this
-for non-multimodal models.
+Transcribes first, then sends the text transcript to the chat model. Use this
+for non-multimodal models or when you want a separate STT stage.
 
 ```
 User speaks → mic → WAV → POST /v1/audio/transcriptions → text →
@@ -55,36 +151,30 @@ User speaks → mic → WAV → POST /v1/audio/transcriptions → text →
   POST /v1/audio/speech → WAV → speaker
 ```
 
-## MCP Tool Execution
+### MCP tool execution
 
-When `mcp_servers` is configured, the component executes tool calls
-client-side:
+When `mcp_servers` is configured, the component handles tool calls
+client-side — no server-side MCP support required:
 
-1. The LLM's response streams via SSE. If `finish_reason: "tool_calls"` is
+1. The chat response streams via SSE. If `finish_reason: "tool_calls"` is
    received, the component does **not** TTS the response.
 2. The component calls `tools/call` (JSON-RPC) on the appropriate MCP server,
    passing the tool name and arguments from the LLM's response.
-3. The tool result is injected as a `role: "tool"` message in the conversation
-   history.
+3. The tool result is injected as a `role: "tool"` message in the
+   conversation history.
 4. The LLM is re-queried with the tool results. It may call more tools (up to
-   `MAX_TOOL_ROUNDS = 5`) or produce a final text response, which is TTS'd.
+   5 rounds) or produce a final text response, which is TTS'd.
 
-### MCP session management
-
+**Session management:**
 - On first use, each MCP server is queried with `tools/list` to build a
-  tool-name → server routing map. This map is cached (see `tools_cache_ttl`).
-- Stateless servers (no `Mcp-Session-Id` in the `initialize` response) skip
-  the handshake entirely on subsequent calls.
-- Stateful servers (e.g. openzim-mcp) use the `initialize` →
-  `notifications/initialized` → `tools/list` handshake. If a session expires
-  (HTTP 400 on a tool call), the component automatically re-initializes and
-  retries.
+  tool-name → server routing map (cached via `tools_cache_ttl`).
+- Stateless servers skip the handshake on subsequent calls.
+- Stateful servers use the full `initialize` → `notifications/initialized`
+  → `tools/list` handshake. If a session expires (HTTP 400), the component
+  automatically re-initializes and retries.
 
-### Boot pre-warming
-
-Call `prefetch_tools()` and `prewarm_models()` from `wifi.on_connect` to
-pre-warm the tools cache and load models into memory before the first
-wake-word turn:
+**Boot pre-warming** — call from `wifi.on_connect` to warm the tools cache
+and load models before the first wake-word turn:
 
 ```yaml
 wifi:
@@ -94,11 +184,21 @@ wifi:
     - lambda: id(openai).prewarm_models();
 ```
 
-## HA Broadcast (media_player)
+### Home Assistant broadcast
 
-To receive Home Assistant broadcasts (via the `HassBroadcast` MCP tool), add a
-`speaker` media_player to the YAML. This wraps the i2s speaker as a
-`media_player` entity that HA can target for announcements.
+Broadcasts involve two separate mechanisms:
+
+1. **Initiating** — when a user says "broadcast dinner is ready", the LLM
+   calls the `HassBroadcast` MCP tool, which tells HA to send a TTS
+   announcement to all `media_player` entities.
+2. **Receiving** — HA sends the announcement to each ESP's `media_player`
+   via the ESPHome **API** (not MCP). The `media_player` announcement
+   pipeline plays it through the speaker.
+
+To support broadcasts, add a `speaker` media_player that wraps the i2s
+speaker. The media_player and the component share the same speaker — the
+component stops MWW when an announcement starts (to free the i2s bus) and
+restarts it when the announcement ends:
 
 ```yaml
 media_player:
@@ -106,109 +206,41 @@ media_player:
     id: box_media_player
     name: "${friendly_name} Speaker"
     announcement_pipeline:
-      speaker: box_speaker       # same speaker used by openai_conversations
+      speaker: box_speaker
       format: wav
       sample_rate: 22050
       num_channels: 1
     volume_initial: 0.65
+    on_announcement:
+      - micro_wake_word.stop:
+          id: mww
+    on_idle:
+      - if:
+          condition:
+            lambda: 'return !id(openai).is_running();'
+          then:
+            - micro_wake_word.start:
+                id: mww
 ```
 
-### i2s bus coexistence
+A wake-word guard prevents starting a conversation during an announcement:
 
-The `media_player` announcement pipeline and `openai_conversations` TTS both
-use the same i2s speaker. They never overlap because:
-
-1. A **wake-word guard** prevents starting a conversation while the
-   media_player is announcing:
-   ```yaml
-   micro_wake_word:
-     on_wake_word_detected:
-       - if:
-           condition:
-             lambda: |-
-               return id(box_media_player).state !=
-                   media_player::MediaPlayerState::MEDIA_PLAYER_STATE_ANNOUNCING;
-           then:
-             - openai_conversations.start:
-                 wake_word: !lambda return wake_word;
-   ```
-2. If the media_player starts an announcement while a conversation is in
-   progress, the i2s speaker's state machine (`STATE_RUNNING`) prevents the
-   announcement pipeline from starting until TTS finishes.
-
-### Broadcast flow
-
-1. User says "broadcast dinner is ready" to one ESP.
-2. The LLM calls `HassBroadcast` via MCP.
-3. HA generates TTS audio and sends the URL to all `media_player` entities.
-4. Each ESP's `media_player` fetches the URL and plays it through the speaker.
-5. The originating ESP speaks "Done." (or the LLM's confirmation) via TTS.
-
-If the LLM returns an empty response after a broadcast (no confirmation text),
-the component uses "Done." as a default acknowledgment instead of erroring.
+```yaml
+micro_wake_word:
+  on_wake_word_detected:
+    - if:
+        condition:
+          lambda: |-
+            return id(box_media_player).state !=
+                media_player::MediaPlayerState::MEDIA_PLAYER_STATE_ANNOUNCING;
+        then:
+          - openai_conversations.start:
+              wake_word: !lambda return wake_word;
+```
 
 ## Configuration
 
-```yaml
-openai_conversations:
-  id: openai
-  endpoint_base: "http://my-server:8080"
-  api_key: ""  # can be empty if the server doesn't require auth
-
-  # Models
-  chat_model: "gemma-4-12b-it-GGUF-mcp"
-  # stt_model: "whisper-large-turbo"  # omit for multimodal mode
-  tts_model: "voice-en_US-joe-medium"
-  tts_voice: "joe"
-  tts_sample_rate: 22050  # sample rate of the TTS WAV output
-
-  system_prompt: "You are Jeeves, a voice assistant..."
-
-  # Hardware
-  microphone: box_mic
-  speaker: box_speaker
-  micro_wake_word: mww
-
-  # Audio / VAD settings
-  volume_multiplier: 2.5
-  silence_threshold: 0.002  # RMS (0..1) below this = silence
-  silence_duration_ms: 700ms  # ms of silence before considering speech ended
-  max_recording_ms: 30000ms  # safety cap on recording length
-
-  # Tools (optional). A pre-formatted chat-completions tools JSON array.
-  # Used as a fallback when MCP servers are unreachable.
-  tools_file: tools.json
-
-  # MCP tools cache: how long (ms) the live tools/list cache is valid.
-  tools_cache_ttl: 24h
-
-  # MCP servers (for client-side tool execution)
-  mcp_servers:
-    - name: ha
-      url: !secret ha_url
-      api_key: !secret ha_token
-    - name: openzim
-      url: !secret openzim_url
-      api_key: !secret openzim_token
-
-  # Text sensors for the transcript / response
-  text_request: request_text
-  text_response: response_text
-
-  # Automations
-  on_listening: ...
-  on_start: ...
-  on_stt_end: ...
-  on_tts_start: ...
-  on_tts_end: ...
-  on_tts_stream_start: ...
-  on_tts_stream_end: ...
-  on_end: ...
-  on_error: ...
-  on_idle: ...
-```
-
-## Configuration variables
+### Core settings
 
 - **endpoint_base** (*Required*, string): Base URL of the OpenAI-compatible
   server, e.g. `http://host:8080`. Must start with `http://` or `https://`.
@@ -234,6 +266,11 @@ openai_conversations:
 - **micro_wake_word** (*Required*): A `micro_wake_word` instance. The component
   stops it on start and restarts it after each turn (once the speaker stops,
   to avoid i2s bus contention).
+
+### Audio / VAD
+
+- **volume_multiplier** (*Optional*, float, default `1.0`): Multiplier applied
+  to TTS PCM samples before playback.
 - **silence_threshold** (*Optional*, float, default `0.01`): RMS amplitude
   (0.0–1.0, relative to full-scale int16) below which audio is considered
   silence. On the S3-Box-3 with the ES7210 at default gain, idle noise reads
@@ -245,8 +282,9 @@ openai_conversations:
   recording length. If no speech is detected within this time in LISTENING,
   the component returns to idle silently (treated as a user cancel, not an
   error).
-- **volume_multiplier** (*Optional*, float, default `1.0`): Multiplier applied
-  to TTS PCM samples before playback.
+
+### MCP tools
+
 - **tools_file** (*Optional*, file): Path to a JSON file containing a
   pre-formatted chat-completions `tools` array. The file is embedded in the
   firmware as a generated header. Used as a fallback when MCP servers are
@@ -254,8 +292,7 @@ openai_conversations:
   the tools list is fetched live from the MCP servers.
 - **tools_cache_ttl** (*Optional*, time, default `24h`): How long the live
   MCP tools cache (fetched via `tools/list`) is valid before a refresh is
-  needed. The component fetches `tools/list` from each MCP server when the
-  cache is stale. Set to `0s` to refresh every turn. Only effective when
+  needed. Set to `0s` to refresh every turn. Only effective when
   `mcp_servers` is configured.
 - **mcp_servers** (*Optional*, list): MCP servers for client-side tool
   execution. When the LLM returns `finish_reason: "tool_calls"`, the component
@@ -267,6 +304,9 @@ openai_conversations:
   - **api_key** (*Optional*, string, default `""`): Bearer token sent as
     `Authorization: Bearer <key>`. Leave empty if the server doesn't require
     auth.
+
+### Sensors
+
 - **text_request** (*Optional*): A text sensor to publish the transcribed user
   request (Mode 2 only; in multimodal mode there is no transcript).
 - **text_response** (*Optional*): A text sensor to publish the chat response
@@ -314,7 +354,7 @@ All triggers are single-automation. They use the callback-manager pattern
 ## State machine
 
 ```
-IDLE → STARTING_MICROPHONE → LISTENING (mic on, VAD running) →
+IDLE → STARTING_TURN → STARTING_MICROPHONE → LISTENING (mic on, VAD) →
   RECORDING (speech detected) → STOPPING_MICROPHONE →
   BUILDING_REQUEST → SENDING_REQUEST →
     READING_CHAT (multimodal) or READING_STT (Mode 2) →
@@ -325,16 +365,11 @@ IDLE → STARTING_MICROPHONE → LISTENING (mic on, VAD running) →
 ```
 
 When MCP tools are configured and the cache is stale, `FETCHING_TOOLS` is
-inserted before `STARTING_MICROPHONE`:
+inserted before `STARTING_TURN`:
 
 ```
-IDLE → FETCHING_TOOLS (tools/list on each MCP server) → STARTING_MICROPHONE → ...
+IDLE → FETCHING_TOOLS (tools/list on each MCP server) → STARTING_TURN → ...
 ```
-
-The component owns the `micro_wake_word` lifecycle: it stops MWW on start
-(wake word detection stops the mic; the assistant needs exclusive mic access)
-and restarts it after each turn once the speaker has fully stopped (the i2s
-bus is shared between mic and speaker).
 
 ## Memory
 
@@ -348,9 +383,9 @@ All audio and HTTP buffers live in PSRAM:
 - Retained base64 audio (for tool round 2+ multimodal): sized to the b64 payload
 - MCP tools cache (`cached_tools_json_`): sized to the tools/list response
 
-All buffers are allocated on entry to the states that need them and freed on
-every transition to IDLE (success or error). The tools cache and MCP server
-session state persist across turns (refreshed on a TTL basis).
+Fixed buffers are allocated once at setup and reused across turns. Variable-size
+buffers (request body, retained audio) are freed per turn. The tools cache and
+MCP server session state persist across turns (refreshed on a TTL basis).
 
 ## Notes
 
@@ -358,14 +393,10 @@ session state persist across turns (refreshed on a TTL basis).
   system prompt and the current user utterance. Tool rounds within a turn
   accumulate messages (assistant + tool results) for multi-round tool use,
   but the history is cleared when the turn ends.
-- Tools are executed **client-side** via MCP servers. When the LLM returns
-  `finish_reason: "tool_calls"`, the component parses `delta.tool_calls`,
-  calls the appropriate MCP server's `tools/call`, and re-queries the LLM with
-  the results. Up to 5 rounds of tool calls are allowed per turn.
 - The `delta.reasoning` field (from reasoning models via llama.cpp/GGUF) is
   accumulated separately and is **never** spoken via TTS. It is only used as a
   fallback response if no `delta.content` was received and `finish_reason` is
-  `stop` or null (for servers that route visible output via `reasoning`).
+  `stop` or null.
 - When the LLM returns an empty response (no content, no reasoning) with
   `finish_reason: "stop"`, the component uses "Done." as a default
   acknowledgment instead of erroring. This handles broadcast/tool scenarios
@@ -374,5 +405,22 @@ session state persist across turns (refreshed on a TTL basis).
   speaker. Set `tts_sample_rate` to match your TTS server's output.
 - All chat requests use `stream: true` (SSE) to reduce latency.
 - The `tools_file` JSON is used as a fallback when MCP servers are
-  unreachable. When `mcp_servers` is configured, the tools list is fetched
-  live from the servers and takes precedence over `tools_file`.
+  unreachable. When `mcp_servers` is configured, the live tools list takes
+  precedence.
+
+## Chat Completions vs Realtime API
+
+This component uses the Chat Completions + Audio HTTP APIs (request-based),
+not the Realtime WebSocket API. The Realtime API requires server-side
+`type:"mcp"` tool support, which many local OpenAI-compatible servers lack.
+Chat Completions handles tools client-side, making it compatible with any
+OpenAI-compatible endpoint.
+
+| Aspect | Realtime API | Chat Completions (this component) |
+|--------|-------------|-----------------------------------|
+| Connection | Persistent WebSocket | HTTP POST (stateless) |
+| Tools | Server must support `type:"mcp"` | Client-side MCP tool execution |
+| VAD | Server-side | Client-side (local energy-based) |
+| Audio input | Raw PCM16 streamed continuously | Base64-encoded WAV in request body |
+| Audio output | Base64 PCM16 deltas via events | Separate `/v1/audio/speech` call |
+| Latency | ~1-2s (streaming) | ~3-5s (request/response) |
