@@ -153,6 +153,7 @@ class OpenAIConversations : public Component {
     // stt_model_ means Mode 1 (multimodal audio sent straight to chat).
     this->multimodal_ = v.empty();
   }
+  void set_stt_language(const std::string &v) { this->stt_language_ = v; }
   void set_tts_model(const std::string &v) { this->tts_model_ = v; }
   void set_tts_voice(const std::string &v) { this->tts_voice_ = v; }
   void set_tts_sample_rate(uint32_t v) { this->tts_sample_rate_ = v; }
@@ -344,6 +345,7 @@ class OpenAIConversations : public Component {
   std::string api_key_;
   std::string chat_model_;
   std::string stt_model_;
+  std::string stt_language_{"en"};
   std::string tts_model_;
   std::string tts_voice_;
   std::string system_prompt_;

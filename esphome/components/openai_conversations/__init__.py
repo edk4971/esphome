@@ -54,6 +54,7 @@ CONF_API_KEY = "api_key"
 CONF_ENDPOINT_BASE = "endpoint_base"
 CONF_CHAT_MODEL = "chat_model"
 CONF_STT_MODEL = "stt_model"
+CONF_STT_LANGUAGE = "stt_language"
 CONF_TTS_MODEL = "tts_model"
 CONF_TTS_VOICE = "tts_voice"
 CONF_TTS_SAMPLE_RATE = "tts_sample_rate"
@@ -146,6 +147,10 @@ CONFIG_SCHEMA = cv.All(
             # omitted, multimodal mode (Mode 1) is used and the WAV is sent
             # directly to the chat model.
             cv.Optional(CONF_STT_MODEL): cv.string,
+            # ISO 639-1 language code (e.g. "en", "fr", "de") sent as the
+            # ``language`` form field in the STT multipart request. Helps the
+            # transcription model; set to "" to omit (auto-detect).
+            cv.Optional(CONF_STT_LANGUAGE, default="en"): cv.string,
             cv.Required(CONF_TTS_MODEL): cv.string,
             cv.Optional(CONF_TTS_VOICE, default=""): cv.string,
             cv.Optional(CONF_TTS_SAMPLE_RATE, default=24000): cv.positive_int,
@@ -257,6 +262,7 @@ async def to_code(config):
     cg.add(var.set_chat_model(config[CONF_CHAT_MODEL]))
     if (stt_model := config.get(CONF_STT_MODEL)) is not None:
         cg.add(var.set_stt_model(stt_model))
+    cg.add(var.set_stt_language(config[CONF_STT_LANGUAGE]))
     cg.add(var.set_tts_model(config[CONF_TTS_MODEL]))
     cg.add(var.set_tts_voice(config[CONF_TTS_VOICE]))
     cg.add(var.set_tts_sample_rate(config[CONF_TTS_SAMPLE_RATE]))

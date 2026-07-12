@@ -252,6 +252,10 @@ micro_wake_word:
 - **chat_model** (*Required*, string): Chat model name.
 - **stt_model** (*Optional*, string): Transcription model for Mode 2. Omit for
   multimodal mode (Mode 1).
+- **stt_language** (*Optional*, string, default `"en"`): ISO 639-1 language
+  code (e.g. `"en"`, `"fr"`, `"de"`) sent as the `language` form field in
+  the STT request. Helps the transcription model. Set to `""` to omit
+  (auto-detect). Only used in Mode 2.
 - **tts_model** (*Required*, string): TTS model name.
 - **tts_voice** (*Optional*, string, default `""`): TTS voice name.
 - **tts_sample_rate** (*Optional*, int, default `24000`): Sample rate of the

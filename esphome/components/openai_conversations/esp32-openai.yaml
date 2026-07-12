@@ -7,8 +7,7 @@
 #
 # The hardware section below (esp32, psram, i2c, i2s_audio, audio_adc/dac,
 # microphone, speaker, micro_wake_word, display) is taken directly from the
-# openai_realtime example, which is known-good on the S3-Box-3. Only the
-# assistant component block and the wake-word wiring differ.
+# voice_assistant example, which is known-good on the S3-Box-3. 
 # =============================================================================
 
 # --- Substitutions -----------------------------------------------------------
@@ -26,7 +25,7 @@ substitutions:
 
   # Multimodal chat model: accepts audio input directly (no separate STT step).
   # For a non-multimodal model, set stt_model below to run in STT+LLM mode.
-  openai_chat_model: "gemma-4-12b-it-GGUF-mcp"
+  openai_chat_model: "gemma-4-26b-a4b-it-qat"
 
   # TTS model + voice. The user's server runs piper (kokoro-compatible).
   openai_tts_model: "voice-en_US-joe-medium"
@@ -344,7 +343,8 @@ openai_conversations:
   chat_model: ${openai_chat_model}
   # Omit stt_model to run in multimodal mode (audio sent directly to the chat
   # model). To use STT+LLM mode instead, uncomment and set a transcription model:
-  stt_model: "whisper-large-turbo"
+  stt_model: "parakeet-cpp-tdt_ctc-1.1b"
+  stt_language: "en"  # ISO 639-1 code; "" = auto-detect
   tts_model: ${openai_tts_model}
   tts_voice: ${openai_tts_voice}
   # Sample rate of the WAV returned by the TTS server. The speaker's stream

@@ -1558,12 +1558,17 @@ void OpenAIConversations::build_stt_multipart_body_() {
   const char *boundary = "----esphome_openai_conv";
   std::string part_model = std::string("--") + boundary +
                            "\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\n" + this->stt_model_ + "\r\n";
+  std::string part_language;
+  if (!this->stt_language_.empty()) {
+    part_language = std::string("--") + boundary +
+                    "\r\nContent-Disposition: form-data; name=\"language\"\r\n\r\n" + this->stt_language_ + "\r\n";
+  }
   std::string part_file_head = std::string("--") + boundary +
                                "\r\nContent-Disposition: form-data; name=\"file\"; filename=\"audio.wav\"\r\n"
                                "Content-Type: audio/wav\r\n\r\n";
   std::string closing = std::string("\r\n--") + boundary + "--\r\n";
 
-  size_t total = part_model.size() + part_file_head.size() + wav_len + closing.size();
+  size_t total = part_model.size() + part_language.size() + part_file_head.size() + wav_len + closing.size();
 
   ExternalRAMAllocator<uint8_t> ext(ExternalRAMAllocator<uint8_t>::ALLOC_EXTERNAL);
   if (this->request_body_ != nullptr) {
@@ -1578,6 +1583,10 @@ void OpenAIConversations::build_stt_multipart_body_() {
   size_t off = 0;
   memcpy(this->request_body_ + off, part_model.data(), part_model.size());
   off += part_model.size();
+  if (!part_language.empty()) {
+    memcpy(this->request_body_ + off, part_language.data(), part_language.size());
+    off += part_language.size();
+  }
   memcpy(this->request_body_ + off, part_file_head.data(), part_file_head.size());
   off += part_file_head.size();
   memcpy(this->request_body_ + off, this->recording_buffer_, wav_len);
