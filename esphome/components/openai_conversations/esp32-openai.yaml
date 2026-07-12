@@ -143,12 +143,20 @@ api:
         id(display_spi).update();
     # Set a comfortable default speaker volume on boot.
     - lambda: id(box_speaker).set_volume(0.65);
-    # Enable the hey_jarvis model and start listening for the wake word.
+    # Enable the hey_jarvis model.
     - micro_wake_word.enable_model: hey_jarvis_model
-    - micro_wake_word.start:
-        id: mww
-    # Start the watchdog/heartbeat script (see script: section below).
-    - script.execute: mww_heartbeat
+    # Start MWW + heartbeat only if openai_conversations is idle. If a turn
+    # is in progress (e.g. HA reconnects mid-TTS), the component's
+    # teardown_to_idle_() will start MWW after the turn ends. Starting MWW
+    # here while the speaker is using the i2s bus causes "Parent bus is busy"
+    # errors.
+    - if:
+        condition:
+          lambda: 'return !id(openai).is_running();'
+        then:
+          - micro_wake_word.start:
+              id: mww
+          - script.execute: mww_heartbeat
     # Boot complete: allow display updates from automations (e.g. mute switch).
     - lambda: id(init_in_progress) = false;
 
@@ -577,11 +585,9 @@ display:
           it.printf(it.get_width() / 2, it.get_height() / 2, id(font_text), Color::WHITE, TextAlign::CENTER, "Listening...");
       - id: thinking_page
         lambda: |-
-          it.fill(Color::WHITE);
-          it.image((it.get_width() / 2), (it.get_height() / 2), id(casita_thinking), ImageAlign::CENTER);
-          it.filled_rectangle(20, 20, 280, 30, Color::WHITE);
-          it.rectangle(20, 20, 280, 30, Color::BLACK);
-          it.printf(30, 25, id(font_text), Color::BLACK, "%.60s", id(request_text).state.c_str());
+          it.fill(Color::BLACK);
+          it.printf(it.get_width() / 2, 30, id(font_text), Color::WHITE, TextAlign::TOP_CENTER, "Thinking...");
+          it.printf(30, 60, id(font_text), Color::WHITE, "%.60s", id(request_text).state.c_str());
       - id: replying_page
         lambda: |-
           it.fill(Color::WHITE);
