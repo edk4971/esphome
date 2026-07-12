@@ -3,6 +3,7 @@
 
 # Build artifacts
 .build/
+.pio/
 *.elf
 *.bin
 
