@@ -1,0 +1,12 @@
+﻿# Kilo (local AI tool config/plans -- not for upstream)
+.kilo/
+
+# Build artifacts
+.build/
+*.elf
+*.bin
+
+# ESPHome
+/config/
+__pycache__/
+*.pyc

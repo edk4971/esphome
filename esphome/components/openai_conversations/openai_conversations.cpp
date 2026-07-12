@@ -1,0 +1,2966 @@
+#include "openai_conversations.h"
+
+#ifdef USE_OPENAI_CONVERSATIONS
+
+#include "esphome/core/defines.h"
+#include "esphome/core/hal.h"
+#include "esphome/core/log.h"
+#include "esphome/core/util.h"
+
+#include "esphome/components/json/json_util.h"
+
+#ifdef USE_OPENAI_CONVERSATIONS_TOOLS
+#include "openai_conversations_tools.h"  // generated header with TOOLS_JSON (raw string literal)
+#endif
+#ifdef USE_OPENAI_CONVERSATIONS_MCP
+#include "mcp_client.h"
+#endif
+
+#include <esp_crt_bundle.h>
+
+#include <cmath>
+#include <cstdio>
+#include <cstring>
+
+namespace esphome::openai_conversations {
+
+static const char *const TAG = "openai_conversations";
+
+#ifdef USE_PSRAM
+// --- PSRAM-backed ArduinoJson allocator --------------------------------------
+// ArduinoJson's JsonDocument allocates its internal buffer via the Allocator
+// interface. The default SpiRamAllocator in json_util.h uses RAMAllocator with
+// no flags (ALLOC_INTERNAL | ALLOC_EXTERNAL), which prefers internal RAM.
+// We force ALLOC_EXTERNAL so the JSON document buffer lives in PSRAM, keeping
+// the internal heap free for the smaller allocations that can't use PSRAM
+// (FreeRTOS task stacks, lwIP socket buffers, etc.). This significantly
+// reduces internal heap fragmentation during MCP tool calls, where the
+// zim_query tool's deeply-nested schema can allocate 10KB+ of JSON document.
+struct PsRamJsonAllocator : ArduinoJson::Allocator {
+  void *allocate(size_t size) override {
+    esphome::RAMAllocator<uint8_t> allocator(esphome::RAMAllocator<uint8_t>::ALLOC_EXTERNAL);
+    return allocator.allocate(size);
+  }
+  void deallocate(void *ptr) override {
+    // ESP-IDF's free() tracks the heap region and routes to the correct pool.
+    free(ptr);  // NOLINT
+  }
+  void *reallocate(void *ptr, size_t new_size) override {
+    esphome::RAMAllocator<uint8_t> allocator(esphome::RAMAllocator<uint8_t>::ALLOC_EXTERNAL);
+    return allocator.reallocate(static_cast<uint8_t *>(ptr), new_size);
+  }
+};
+#endif
+
+// --- Constants -------------------------------------------------------------
+
+// Mic sample rate / format is fixed: 16 kHz, 16-bit, mono (validated by the
+// FINAL_VALIDATE_SCHEMA in Python). The WAV header written for the recording
+// uses these values.
+static constexpr uint32_t MIC_SAMPLE_RATE = 16000;
+static constexpr uint8_t MIC_BITS_PER_SAMPLE = 16;
+static constexpr uint8_t MIC_CHANNELS = 1;
+// 16 kHz * 2 bytes * 1 channel = 32 bytes per millisecond.
+static constexpr uint32_t MIC_BYTES_PER_MS = (MIC_SAMPLE_RATE * MIC_BITS_PER_SAMPLE * MIC_CHANNELS) / (8 * 1000);
+
+// HTTP read/write chunk sizes. Kept small so one loop() pass does a bounded
+// amount of work and never trips the main-loop watchdog.
+static constexpr size_t HTTP_WRITE_CHUNK = 4096;
+static constexpr size_t HTTP_READ_CHUNK = 2048;
+// A single SSE line buffer this large is more than enough for one delta chunk
+// (OpenAI caps SSE event lines well below this).
+static constexpr size_t SSE_LINE_MAX = 8192;
+
+// HTTP timeouts. LLM + tool execution can be slow, so be generous.
+static constexpr int HTTP_TIMEOUT_MS = 60000;
+
+// VAD is checked at most once per this interval to bound CPU in loop().
+static constexpr uint32_t VAD_CHECK_INTERVAL_MS = 50;
+// Speech must be sustained above the threshold for this long before we commit
+// to RECORDING (filters out transient clicks).
+static constexpr uint32_t SPEECH_ONSET_MS = 60;
+
+// --- Base64 (streaming, in-place into a caller buffer) --------------------
+
+/// Encode `len` bytes from `data` into base64, writing into `out` (capacity
+/// `out_cap`). Returns the number of base64 characters written (no NUL
+/// terminator), or 0 if the buffer is too small. Writes directly into a PSRAM
+/// buffer so we avoid the heap-allocating base64_encode() helper.
+static size_t base64_encode_to(const uint8_t *data, size_t len, char *out, size_t out_cap) {
+  static const char *const TABLE = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+  // 3 bytes -> 4 chars, rounded up.
+  size_t needed = ((len + 2) / 3) * 4;
+  if (needed > out_cap) {
+    return 0;
+  }
+  size_t j = 0;
+  size_t i = 0;
+  while (i + 3 <= len) {
+    uint32_t v = (uint32_t(data[i]) << 16) | (uint32_t(data[i + 1]) << 8) | uint32_t(data[i + 2]);
+    out[j++] = TABLE[(v >> 18) & 0x3f];
+    out[j++] = TABLE[(v >> 12) & 0x3f];
+    out[j++] = TABLE[(v >> 6) & 0x3f];
+    out[j++] = TABLE[v & 0x3f];
+    i += 3;
+  }
+  size_t rem = len - i;
+  if (rem == 1) {
+    uint32_t v = uint32_t(data[i]) << 16;
+    out[j++] = TABLE[(v >> 18) & 0x3f];
+    out[j++] = TABLE[(v >> 12) & 0x3f];
+    out[j++] = '=';
+    out[j++] = '=';
+  } else if (rem == 2) {
+    uint32_t v = (uint32_t(data[i]) << 16) | (uint32_t(data[i + 1]) << 8);
+    out[j++] = TABLE[(v >> 18) & 0x3f];
+    out[j++] = TABLE[(v >> 12) & 0x3f];
+    out[j++] = TABLE[(v >> 6) & 0x3f];
+    out[j++] = '=';
+  }
+  return j;
+}
+
+/// Escapes a string for inclusion in a JSON string value (surrounding quotes
+/// are NOT added). Drops control characters below 0x20.
+static std::string escape_json_string_(const std::string &input) {
+  std::string out;
+  out.reserve(input.size() + 16);
+  for (char c : input) {
+    if (c == '"' || c == '\\') {
+      out.push_back('\\');
+      out.push_back(c);
+    } else if (c == '\n') {
+      out.push_back('\\');
+      out.push_back('n');
+    } else if (c == '\r') {
+      out.push_back('\\');
+      out.push_back('r');
+    } else if (c == '\t') {
+      out.push_back('\\');
+      out.push_back('t');
+    } else if ((unsigned char) c < 0x20) {
+      continue;
+    } else {
+      out.push_back(c);
+    }
+  }
+  return out;
+}
+
+// --- Lifecycle -------------------------------------------------------------
+
+OpenAIConversations::OpenAIConversations() = default;
+
+OpenAIConversations::~OpenAIConversations() {
+  // Kill the HTTP task if still running and clean up its resources.
+  this->stop_http_task_();
+  this->deallocate_buffers_();
+  // Free the pre-allocated message buffer (only in full teardown, not per-turn).
+  if (this->http_msg_buffer_ != nullptr) {
+    vMessageBufferDelete(this->http_msg_buffer_);
+    this->http_msg_buffer_ = nullptr;
+  }
+}
+
+void OpenAIConversations::setup() {
+  // Register the microphone data callback. The MicrophoneSource calls this
+  // from the microphone's own task/thread, so we write into the ring buffer
+  // (thread-safe) and consume it from the main loop. This avoids any locking
+  // in the hot mic path and keeps the main loop the single owner of the
+  // recording buffer.
+  this->mic_source_->add_data_callback([this](const std::vector<uint8_t> &data) {
+    if (this->ring_buffer_ != nullptr &&
+        (this->state_ == State::LISTENING || this->state_ == State::RECORDING)) {
+      this->ring_buffer_->write(data.data(), data.size());
+    }
+  });
+
+  // Pre-allocate the fixed long-lived buffers (ring, recording, speaker, SSE)
+  // once at setup so we don't free ~1MB of PSRAM and reallocate it on every
+  // turn — that allocation churn was the main source of the main-loop
+  // watchdog warnings. allocate_buffers_() is idempotent (guards each alloc
+  // with if (nullptr)). Variable-size turn buffers (request_body_,
+  // retained_b64_audio_) are still allocated/freed per turn.
+  if (!this->allocate_buffers_()) {
+    this->mark_failed();
+    return;
+  }
+
+  // Pre-allocate the message buffer for HTTP task → loop communication. This
+  // stays resident for the component lifetime — creating/deleting 8KB of
+  // internal RAM every turn causes heap fragmentation. The buffer is reset
+  // (drained) at the start of each turn in start_http_task_().
+  this->http_msg_buffer_ = xMessageBufferCreate(HTTP_MSG_BUFFER_SIZE);
+  if (this->http_msg_buffer_ == nullptr) {
+    ESP_LOGE(TAG, "Failed to create message buffer at setup");
+    this->mark_failed();
+    return;
+  }
+}
+
+float OpenAIConversations::get_setup_priority() const { return setup_priority::AFTER_CONNECTION; }
+
+void OpenAIConversations::dump_config() {
+  ESP_LOGCONFIG(TAG, "OpenAI Conversations:");
+  ESP_LOGCONFIG(TAG, "  Endpoint: %s", this->endpoint_base_.c_str());
+  ESP_LOGCONFIG(TAG, "  Chat model: %s", this->chat_model_.c_str());
+  if (this->multimodal_) {
+    ESP_LOGCONFIG(TAG, "  Mode: multimodal (audio sent to chat model)");
+  } else {
+    ESP_LOGCONFIG(TAG, "  Mode: STT + LLM (stt_model=%s)", this->stt_model_.c_str());
+  }
+  ESP_LOGCONFIG(TAG, "  TTS model: %s voice=%s sample_rate=%" PRIu32,
+                this->tts_model_.c_str(), this->tts_voice_.c_str(), this->tts_sample_rate_);
+  ESP_LOGCONFIG(TAG, "  Silence threshold: %.4f duration_ms: %" PRIu32 " max_recording_ms: %" PRIu32,
+                this->silence_threshold_, this->silence_duration_ms_, this->max_recording_ms_);
+  ESP_LOGCONFIG(TAG, "  Volume multiplier: %.2f", this->volume_multiplier_);
+  ESP_LOGCONFIG(TAG, "  Tools: %s", this->has_tools_ ? "yes" : "no");
+#ifdef USE_OPENAI_CONVERSATIONS_MCP
+  ESP_LOGCONFIG(TAG, "  MCP servers: %u", (unsigned) this->mcp_servers_.size());
+  for (const auto &srv : this->mcp_servers_) {
+    ESP_LOGCONFIG(TAG, "    %s: %s", srv.name.c_str(), srv.url.c_str());
+  }
+  ESP_LOGCONFIG(TAG, "  Tools cache TTL: %" PRIu32 " ms", this->tools_cache_ttl_ms_);
+#endif
+}
+
+// --- Buffer allocation ------------------------------------------------------
+
+bool OpenAIConversations::allocate_buffers_() {
+  // All long-lived buffers live in PSRAM (the component requires psram). Each
+  // is allocated once and freed in deallocate_buffers_() on teardown. No heap
+  // allocation happens after setup() in steady state.
+  ExternalRAMAllocator<uint8_t> ext(ExternalRAMAllocator<uint8_t>::ALLOC_EXTERNAL);
+
+  if (this->ring_buffer_ == nullptr) {
+    this->ring_buffer_ = ring_buffer::RingBuffer::create(RING_BUFFER_SIZE);
+    if (this->ring_buffer_ == nullptr) {
+      ESP_LOGE(TAG, "Failed to allocate ring buffer (%d bytes)", RING_BUFFER_SIZE);
+      return false;
+    }
+  }
+
+  // Recording buffer: worst case max_recording_ms of audio. 16 kHz/16-bit/mono
+  // = 32 bytes/ms.
+  this->recording_capacity_ = this->max_recording_ms_ * MIC_BYTES_PER_MS;
+  if (this->recording_buffer_ == nullptr) {
+    this->recording_buffer_ = ext.allocate(this->recording_capacity_);
+    if (this->recording_buffer_ == nullptr) {
+      ESP_LOGE(TAG, "Failed to allocate recording buffer (%d bytes)", (int) this->recording_capacity_);
+      return false;
+    }
+  }
+  this->recording_size_ = 0;
+
+  if (this->speaker_buffer_ == nullptr) {
+    this->speaker_buffer_ = ext.allocate(SPEAKER_BUFFER_SIZE);
+    if (this->speaker_buffer_ == nullptr) {
+      ESP_LOGE(TAG, "Failed to allocate speaker buffer (%d bytes)", SPEAKER_BUFFER_SIZE);
+      return false;
+    }
+  }
+  this->speaker_buffer_index_ = 0;
+
+  if (this->sse_line_buffer_ == nullptr) {
+    this->sse_line_buffer_ = reinterpret_cast<char *>(ext.allocate(SSE_LINE_MAX));
+    if (this->sse_line_buffer_ == nullptr) {
+      ESP_LOGE(TAG, "Failed to allocate SSE line buffer (%d bytes)", SSE_LINE_MAX);
+      return false;
+    }
+  }
+  this->sse_line_len_ = 0;
+
+  return true;
+}
+
+void OpenAIConversations::deallocate_buffers_() {
+  ExternalRAMAllocator<uint8_t> ext(ExternalRAMAllocator<uint8_t>::ALLOC_EXTERNAL);
+
+  this->ring_buffer_.reset();
+
+  if (this->recording_buffer_ != nullptr) {
+    ext.deallocate(this->recording_buffer_, this->recording_capacity_);
+    this->recording_buffer_ = nullptr;
+  }
+  this->recording_capacity_ = 0;
+  this->recording_size_ = 0;
+
+  if (this->request_body_ != nullptr) {
+    ext.deallocate(this->request_body_, this->request_body_capacity_);
+    this->request_body_ = nullptr;
+  }
+  this->request_body_capacity_ = 0;
+  this->request_body_size_ = 0;
+  this->request_body_sent_ = 0;
+
+  if (this->sse_line_buffer_ != nullptr) {
+    ext.deallocate(reinterpret_cast<uint8_t *>(this->sse_line_buffer_), SSE_LINE_MAX);
+    this->sse_line_buffer_ = nullptr;
+  }
+  this->sse_line_len_ = 0;
+
+  if (this->speaker_buffer_ != nullptr) {
+    ext.deallocate(this->speaker_buffer_, SPEAKER_BUFFER_SIZE);
+    this->speaker_buffer_ = nullptr;
+  }
+  this->speaker_buffer_index_ = 0;
+
+  this->response_text_.clear();
+  this->response_text_.shrink_to_fit();
+  this->reasoning_text_.clear();
+  this->reasoning_text_.shrink_to_fit();
+  this->stt_response_text_.clear();
+  this->stt_response_text_.shrink_to_fit();
+#ifdef USE_OPENAI_CONVERSATIONS_MCP
+  ExternalRAMAllocator<char> ext_char(ExternalRAMAllocator<char>::ALLOC_EXTERNAL);
+  if (this->retained_b64_audio_ != nullptr) {
+    ext_char.deallocate(this->retained_b64_audio_, this->retained_b64_capacity_);
+    this->retained_b64_audio_ = nullptr;
+  }
+  this->retained_b64_len_ = 0;
+  this->retained_b64_capacity_ = 0;
+  this->turn_messages_.clear();
+  this->turn_messages_.shrink_to_fit();
+  this->mcp_response_text_.clear();
+  this->mcp_response_text_.shrink_to_fit();
+  this->user_text_.clear();
+  this->user_text_.shrink_to_fit();
+  this->raw_tools_per_server_.clear();
+  this->raw_tools_per_server_.shrink_to_fit();
+  this->reset_accumulated_tool_calls_();
+  this->finish_reason_.clear();
+  this->tool_round_ = 0;
+  this->current_tool_index_ = 0;
+  this->mcp_phase_ = McpPhase::IDLE;
+  this->current_mcp_call_type_ = McpCallType::INITIALIZE;
+  // Clear runtime MCP connection state (URL, auth token, session ID).
+  // These are set fresh before each MCP HTTP call.
+  this->current_mcp_url_.clear();
+  this->current_mcp_url_.shrink_to_fit();
+  this->current_mcp_auth_.clear();
+  this->current_mcp_auth_.shrink_to_fit();
+  this->current_mcp_session_id_.clear();
+  this->current_mcp_session_id_.shrink_to_fit();
+  // Reset FETCHING_TOOLS bookkeeping flags.
+  this->tools_prefetch_ = false;
+  this->tools_reinit_ = false;
+  this->reinit_server_index_ = 0;
+  this->mcp_route_server_index_ = 0;
+  this->round1_b64_offset_ = 0;
+  this->round1_b64_len_ = 0;
+  // cached_tools_json_, tool_routes_, tools_cache_timestamp_ms_, and
+  // mcp_servers_[].session_id/initialized/stateless persist across turns
+  // (the cache is refreshed on a TTL basis, not per-turn).
+#endif
+}
+
+void OpenAIConversations::reset_turn_state_() {
+  // Reset turn-scoped indices + free variable-size turn buffers WITHOUT
+  // touching the long-lived fixed buffers (ring/recording/speaker/sse),
+  // which stay allocated for the component lifetime (allocated once in
+  // setup()). This avoids ~1MB of PSRAM alloc/free churn per turn that was
+  // the primary cause of the main-loop watchdog warnings.
+
+  // Fixed buffers: reset indices only (do NOT free).
+  this->recording_size_ = 0;
+  this->sse_line_len_ = 0;
+  this->speaker_buffer_index_ = 0;
+  this->tts_header_skipped_ = false;
+  this->tts_stream_started_ = false;
+
+  // Variable-size turn buffers: free (these can be ~1MB+ for multimodal
+  // base64 and are rebuilt per turn anyway).
+  ExternalRAMAllocator<uint8_t> ext(ExternalRAMAllocator<uint8_t>::ALLOC_EXTERNAL);
+  if (this->request_body_ != nullptr) {
+    ext.deallocate(this->request_body_, this->request_body_capacity_);
+    this->request_body_ = nullptr;
+  }
+  this->request_body_capacity_ = 0;
+  this->request_body_size_ = 0;
+  this->request_body_sent_ = 0;
+
+  // Clear turn-scoped strings (release capacity back to the heap so it can
+  // be reused by other allocations — esp_http_client/lwIP churn the same
+  // pools, and shrinking lets those holes get recycled).
+  this->response_text_.clear();
+  this->response_text_.shrink_to_fit();
+  this->reasoning_text_.clear();
+  this->reasoning_text_.shrink_to_fit();
+  this->stt_response_text_.clear();
+  this->stt_response_text_.shrink_to_fit();
+#ifdef USE_OPENAI_CONVERSATIONS_MCP
+  ExternalRAMAllocator<char> ext_char(ExternalRAMAllocator<char>::ALLOC_EXTERNAL);
+  if (this->retained_b64_audio_ != nullptr) {
+    ext_char.deallocate(this->retained_b64_audio_, this->retained_b64_capacity_);
+    this->retained_b64_audio_ = nullptr;
+  }
+  this->retained_b64_len_ = 0;
+  this->retained_b64_capacity_ = 0;
+  this->turn_messages_.clear();
+  this->turn_messages_.shrink_to_fit();
+  this->mcp_response_text_.clear();
+  this->mcp_response_text_.shrink_to_fit();
+  this->user_text_.clear();
+  this->user_text_.shrink_to_fit();
+  this->raw_tools_per_server_.clear();
+  this->raw_tools_per_server_.shrink_to_fit();
+  this->reset_accumulated_tool_calls_();
+  this->finish_reason_.clear();
+  this->tool_round_ = 0;
+  this->current_tool_index_ = 0;
+  this->mcp_phase_ = McpPhase::IDLE;
+  this->current_mcp_call_type_ = McpCallType::INITIALIZE;
+  this->current_mcp_url_.clear();
+  this->current_mcp_url_.shrink_to_fit();
+  this->current_mcp_auth_.clear();
+  this->current_mcp_auth_.shrink_to_fit();
+  this->current_mcp_session_id_.clear();
+  this->current_mcp_session_id_.shrink_to_fit();
+  this->tools_prefetch_ = false;
+  this->tools_reinit_ = false;
+  this->reinit_server_index_ = 0;
+  this->mcp_route_server_index_ = 0;
+  this->round1_b64_offset_ = 0;
+  this->round1_b64_len_ = 0;
+  // cached_tools_json_, tool_routes_, tools_cache_timestamp_ms_, and
+  // mcp_servers_[].session_id/initialized/stateless persist across turns.
+#endif
+}
+
+// --- State / mic helpers ----------------------------------------------------
+
+void OpenAIConversations::set_state_(State s) {
+  if (this->state_ != s) {
+    ESP_LOGD(TAG, "State %u -> %u", (unsigned) this->state_, (unsigned) s);
+    this->state_ = s;
+  }
+}
+
+void OpenAIConversations::start_microphone_() {
+  if (this->mic_source_ != nullptr) {
+    this->mic_source_->start();
+  }
+}
+
+void OpenAIConversations::stop_microphone_() {
+  if (this->mic_source_ != nullptr) {
+    this->mic_source_->stop();
+  }
+}
+
+float OpenAIConversations::compute_rms_(const int16_t *samples, size_t count) {
+  if (count == 0) {
+    return 0.0f;
+  }
+  // Accumulate sum-of-squares in 64-bit to avoid overflow. Normalise to
+  // full-scale (1.0 = 32767) so the threshold is a fraction independent of
+  // the int16 range.
+  uint64_t sum_sq = 0;
+  for (size_t i = 0; i < count; i++) {
+    int32_t s = samples[i];
+    sum_sq += (uint64_t) s * (uint64_t) s;
+  }
+  // RMS = sqrt(mean(sample^2)); divide by 32767.0 to get a 0..1 fraction.
+  float rms = sqrtf((float) sum_sq / (float) count) / 32767.0f;
+  return rms;
+}
+
+void OpenAIConversations::drain_ring_buffer_to_recording_() {
+  if (this->ring_buffer_ == nullptr || this->recording_buffer_ == nullptr) {
+    return;
+  }
+  // Drain whatever the mic callback has written, in receive_acquire() chunks
+  // (zero-copy views into the ring buffer's storage), copying into the
+  // contiguous recording buffer. We process one acquired chunk per loop pass
+  // to bound work; remaining data stays in the ring buffer for next pass.
+  size_t length = 0;
+  void *item = this->ring_buffer_->receive_acquire(length, HTTP_READ_CHUNK);
+  if (item == nullptr || length == 0) {
+    return;
+  }
+  // Append to the recording buffer, clamping to capacity (shouldn't happen
+  // before max_recording_ms thanks to the timeout, but guard anyway).
+  size_t free = this->recording_capacity_ - this->recording_size_;
+  size_t to_copy = (length < free) ? length : free;
+  if (to_copy > 0) {
+    memcpy(this->recording_buffer_ + this->recording_size_, item, to_copy);
+    this->recording_size_ += to_copy;
+  }
+  this->ring_buffer_->receive_release(item);
+
+  // --- VAD: check RMS at most once per VAD_CHECK_INTERVAL_MS ---
+  uint32_t now = millis();
+  if (now - this->vad_last_check_ms_ < VAD_CHECK_INTERVAL_MS) {
+    return;
+  }
+  this->vad_last_check_ms_ = now;
+
+  // Compute RMS over the last ~20 ms of audio (320 samples at 16 kHz). We look
+  // at the tail of the recording buffer so the VAD reflects the most recent
+  // mic input.
+  const size_t samples_for_vad = 320;
+  size_t bytes_for_vad = samples_for_vad * sizeof(int16_t);
+  if (this->recording_size_ < bytes_for_vad) {
+    bytes_for_vad = this->recording_size_;
+  }
+  if (bytes_for_vad == 0) {
+    return;
+  }
+  const int16_t *vad_samples =
+      reinterpret_cast<const int16_t *>(this->recording_buffer_ + this->recording_size_ - bytes_for_vad);
+  float rms = this->compute_rms_(vad_samples, bytes_for_vad / sizeof(int16_t));
+
+  // Log the current RMS so the user can observe the mic's baseline noise floor
+  // and tune silence_threshold accordingly. Throttled to once per VAD check.
+  ESP_LOGV(TAG, "VAD rms=%.4f threshold=%.4f active=%d (recording=%u bytes)",
+           rms, this->silence_threshold_, this->speech_active_ ? 1 : 0,
+           (unsigned) this->recording_size_);
+
+  if (rms > this->silence_threshold_) {
+    // Speech above threshold.
+    if (!this->speech_active_) {
+      // Require sustained speech for SPEECH_ONSET_MS before transitioning.
+      if (this->speech_onset_ms_ == 0) {
+        this->speech_onset_ms_ = now;
+      }
+      if (now - this->speech_onset_ms_ >= SPEECH_ONSET_MS) {
+        this->speech_active_ = true;
+        ESP_LOGD(TAG, "Speech detected (rms=%.4f)", rms);
+      }
+    }
+    // While speech is active, reset the silence timer so the silence window
+    // only counts consecutive quiet samples.
+    this->silence_since_ms_ = 0;
+  } else {
+    // Below threshold.
+    if (this->speech_active_) {
+      if (this->silence_since_ms_ == 0) {
+        this->silence_since_ms_ = now;
+      } else if (now - this->silence_since_ms_ >= this->silence_duration_ms_) {
+        ESP_LOGD(TAG, "Silence for %" PRIu32 " ms, end of speech", now - this->silence_since_ms_);
+        this->speech_ended_ = true;
+      }
+    }
+  }
+}
+
+// --- Public API ------------------------------------------------------------
+
+void OpenAIConversations::request_start(bool silence_detection) {
+  if (this->state_ != State::IDLE) {
+    ESP_LOGW(TAG, "Cannot start while not idle (state=%u)", (unsigned) this->state_);
+    return;
+  }
+  ESP_LOGV(TAG, "request_start (silence_detection=%d)", silence_detection ? 1 : 0);
+
+  this->silence_detection_ = silence_detection;
+  this->response_text_.clear();
+  this->reasoning_text_.clear();
+  this->stt_response_text_.clear();
+#ifdef USE_OPENAI_CONVERSATIONS_MCP
+  this->reset_accumulated_tool_calls_();
+  this->finish_reason_.clear();
+  this->turn_messages_.clear();
+  this->mcp_response_text_.clear();
+  this->user_text_.clear();
+  this->current_tool_index_ = 0;
+  this->tool_round_ = 0;
+  this->mcp_phase_ = McpPhase::IDLE;
+  this->current_mcp_call_type_ = McpCallType::INITIALIZE;
+  this->current_mcp_url_.clear();
+  this->current_mcp_auth_.clear();
+  this->current_mcp_session_id_.clear();
+  this->tools_prefetch_ = false;
+  this->tools_reinit_ = false;
+  this->reinit_server_index_ = 0;
+  this->mcp_route_server_index_ = 0;
+  this->round1_b64_offset_ = 0;
+  this->round1_b64_len_ = 0;
+#endif
+  this->speech_active_ = false;
+  this->speech_ended_ = false;
+  this->speech_onset_ms_ = 0;
+  this->silence_since_ms_ = 0;
+  this->request_target_ = RequestTarget::NONE;
+  this->tts_stream_started_ = false;
+  this->tts_header_skipped_ = false;
+
+  // Pre-build the auth header value so its pointer stays valid for the
+  // lifetime of any http client we open (esp_http_client_set_header copies
+  // the key but keeps a pointer to the value).
+  if (!this->api_key_.empty()) {
+    this->auth_header_value_ = "Bearer " + this->api_key_;
+  } else {
+    this->auth_header_value_.clear();
+  }
+
+#ifdef USE_OPENAI_CONVERSATIONS_MCP
+  // Check if the tools cache needs refreshing before starting the turn.
+  // The refresh runs in loop() (FETCHING_TOOLS state) and calls
+  // continue_request_start_() when done. If the cache is valid, proceed directly.
+  if (!this->mcp_servers_.empty()) {
+    uint32_t now = millis();
+    bool stale = (this->tools_cache_timestamp_ms_ == 0) ||
+                 ((now - this->tools_cache_timestamp_ms_) >= this->tools_cache_ttl_ms_);
+    if (stale) {
+      ESP_LOGV(TAG, "Tools cache stale; refreshing before turn starts");
+      this->mcp_phase_ = McpPhase::FETCHING_TOOLS;
+      this->mcp_route_server_index_ = 0;
+      this->tool_routes_.clear();
+      this->raw_tools_per_server_.clear();
+      this->cached_tools_json_.clear();
+      // Determine the first call type: initialize if the first server hasn't
+      // been initialized yet (and isn't stateless), tools/list otherwise.
+      this->current_mcp_call_type_ =
+          (this->mcp_servers_[0].initialized || this->mcp_servers_[0].stateless)
+              ? McpCallType::TOOLS_LIST
+              : McpCallType::INITIALIZE;
+      this->current_mcp_session_id_.clear();
+      this->tools_prefetch_ = false;
+      this->set_state_(State::FETCHING_TOOLS);
+      return;  // loop() handles the fetch; it calls continue_request_start_()
+    }
+  }
+#endif
+
+  // Defer continue_request_start_() into loop() via STARTING_TURN. This
+  // avoids running the on_start callback + MWW stop + buffer reset inside
+  // MWW's wake-word trigger (which fires from MWW's loop() and inflates its
+  // operation time past the watchdog threshold).
+  this->set_state_(State::STARTING_TURN);
+}
+
+void OpenAIConversations::continue_request_start_() {
+  // Stop micro_wake_word: it owns the mic while detecting wake words, and we
+  // need exclusive access to the mic to record. MWW.stop_after_detection may
+  // already have stopped it; this is defensive (handles stop_after_detection=false).
+  // NOTE: on_start / on_wake_word_detected callbacks are deferred to after the
+  // mic starts (see STARTING_MICROPHONE case in loop()) so the display update
+  // (which can take ~580ms for a full 320x240 framebuffer redraw) doesn't block
+  // the time-critical wake→listen path.
+#ifdef USE_MICRO_WAKE_WORD
+  if (this->micro_wake_word_ != nullptr && this->micro_wake_word_->is_running()) {
+    this->micro_wake_word_->stop();
+  }
+#endif
+
+  if (!this->allocate_buffers_()) {
+    this->fail_("alloc_failed", "Could not allocate PSRAM buffers");
+    return;
+  }
+
+  this->listening_start_ms_ = millis();
+  this->set_state_(State::STARTING_MICROPHONE);
+}
+
+#ifdef USE_OPENAI_CONVERSATIONS_MCP
+void OpenAIConversations::prefetch_tools() {
+  if (this->state_ != State::IDLE) {
+    ESP_LOGV(TAG, "prefetch_tools: skipping (not idle, state=%u)", (unsigned) this->state_);
+    return;
+  }
+  if (this->mcp_servers_.empty()) {
+    return;
+  }
+  uint32_t now = millis();
+  if (this->tools_cache_timestamp_ms_ != 0 &&
+      (now - this->tools_cache_timestamp_ms_) < this->tools_cache_ttl_ms_) {
+    ESP_LOGV(TAG, "prefetch_tools: cache already valid");
+    return;
+  }
+  ESP_LOGV(TAG, "prefetch_tools: refreshing tools cache");
+  this->mcp_phase_ = McpPhase::FETCHING_TOOLS;
+  this->mcp_route_server_index_ = 0;
+  this->tool_routes_.clear();
+  this->raw_tools_per_server_.clear();
+  this->cached_tools_json_.clear();
+  this->current_mcp_call_type_ =
+      (this->mcp_servers_[0].initialized || this->mcp_servers_[0].stateless)
+          ? McpCallType::TOOLS_LIST
+          : McpCallType::INITIALIZE;
+  this->current_mcp_session_id_.clear();
+  this->tools_prefetch_ = true;
+  this->set_state_(State::FETCHING_TOOLS);
+}
+
+#endif
+
+void OpenAIConversations::prewarm_models_task_(void *arg) {
+  auto *self = static_cast<OpenAIConversations *>(arg);
+  // Build auth header before any HTTP calls.
+  std::string auth;
+  if (!self->api_key_.empty()) {
+    auth = "Bearer " + self->api_key_;
+  }
+  const std::string *models[] = {&self->chat_model_, &self->stt_model_, &self->tts_model_};
+  for (int m = 0; m < 3; m++) {
+    if (models[m]->empty()) {
+      continue;
+    }
+    std::string body = "{\"model\":\"" + *models[m] + "\"}";
+    char url[512];
+    snprintf(url, sizeof(url), "%s/backend/load", self->endpoint_base_.c_str());
+    esp_http_client_config_t config = {};
+    config.url = url;
+    config.method = HTTP_METHOD_POST;
+    config.timeout_ms = 10000;
+    config.disable_auto_redirect = false;
+    esp_http_client_handle_t client = esp_http_client_init(&config);
+    if (client == nullptr) {
+      ESP_LOGW(TAG, "prewarm: init failed for %s", models[m]->c_str());
+      continue;
+    }
+    esp_http_client_set_header(client, "Content-Type", "application/json");
+    if (!auth.empty()) {
+      esp_http_client_set_header(client, "Authorization", auth.c_str());
+    }
+    esp_err_t err = esp_http_client_open(client, body.size());
+    if (err == ESP_OK) {
+      esp_http_client_write(client, body.c_str(), body.size());
+      esp_http_client_fetch_headers(client);
+      int status = esp_http_client_get_status_code(client);
+      if (status == 200 || status == 201 || status == 204) {
+        ESP_LOGI(TAG, "prewarm: %s loaded (HTTP %d)", models[m]->c_str(), status);
+      } else {
+        ESP_LOGW(TAG, "prewarm: %s returned HTTP %d", models[m]->c_str(), status);
+      }
+    } else {
+      ESP_LOGW(TAG, "prewarm: %s open failed: %s", models[m]->c_str(), esp_err_to_name(err));
+    }
+    esp_http_client_cleanup(client);
+  }
+  vTaskDelete(nullptr);  // self-terminate
+}
+
+void OpenAIConversations::prewarm_models() {
+  // Spawn a short-lived FreeRTOS task so the synchronous HTTP calls don't
+  // block the main loop. The task self-terminates after all models are loaded.
+  // Uses xTaskCreate (dynamic allocation) since this is a one-shot boot task.
+  xTaskCreate(prewarm_models_task_, "oai_prewarm", HTTP_TASK_STACK_SIZE, this,
+              HTTP_TASK_PRIORITY, nullptr);
+}
+
+void OpenAIConversations::request_stop() {
+  if (this->state_ == State::IDLE) {
+    return;
+  }
+  ESP_LOGV(TAG, "request_stop (state=%u)", (unsigned) this->state_);
+  // An explicit stop is not an error: teardown without firing on_error.
+  this->set_state_(State::ERROR_TEARDOWN);
+}
+
+void OpenAIConversations::fail_(const std::string &code, const std::string &message) {
+  ESP_LOGE(TAG, "Error: %s - %s", code.c_str(), message.c_str());
+  this->on_error_cb_.call(code, message);
+  this->set_state_(State::ERROR_TEARDOWN);
+}
+
+void OpenAIConversations::teardown_to_idle_() {
+  // Kill the HTTP task if still running and clean up its resources. This is
+  // a safety net — normally the task has already been stopped by the
+  // READING_* state that received DONE/ERROR, or by ERROR_TEARDOWN.
+  this->stop_http_task_();
+
+  // Stop the speaker if it is running, then wait for it to fully stop before
+  // restarting the mic/wake word (shared i2s bus). The actual wait happens in
+  // the DRAINING_AUDIO / ERROR_TEARDOWN loop states; teardown_to_idle_() is
+  // only called once the speaker has stopped.
+  if (this->speaker_ != nullptr && !this->speaker_->is_stopped()) {
+    this->speaker_->stop();
+    return;  // caller will re-enter teardown once stopped
+  }
+
+  // Make sure the mic is stopped. Normally the mic is already stopped by the
+  // time we get here (ERROR_TEARDOWN waits for it, STOPPING_MICROPHONE waits
+  // for it, DRAINING_AUDIO is after TTS so the mic was stopped earlier).
+  // This is a safety net only — if the mic IS still running here, we call
+  // stop() but don't wait (no multi-pass wait in teardown_to_idle_). The
+  // caller is responsible for ensuring the mic has stopped before calling.
+  if (this->mic_source_ != nullptr && this->mic_source_->is_running()) {
+    this->stop_microphone_();
+  }
+
+  // Reset turn-scoped state only (indices + variable-size buffers). The
+  // fixed long-lived buffers stay allocated for the component lifetime to
+  // avoid PSRAM churn (allocated once in setup()).
+  this->reset_turn_state_();
+
+  this->on_end_cb_.call();
+
+  // Restart micro_wake_word so the device is ready for the next wake. The
+  // speaker has stopped by now so there is no i2s bus contention with the
+  // mic that MWW will start.
+#ifdef USE_MICRO_WAKE_WORD
+  if (this->micro_wake_word_ != nullptr && !this->micro_wake_word_->is_running()) {
+    this->micro_wake_word_->start();
+  }
+#endif
+
+  this->on_idle_cb_.call();
+  this->set_state_(State::IDLE);
+}
+
+// --- HTTP task (all blocking esp_http_client calls run here) ---------------
+
+esp_err_t OpenAIConversations::http_event_handler_(esp_http_client_event_t *event) {
+  // We drive all reads explicitly via esp_http_client_read() in the task, so
+  // the only event we handle here is HTTP_EVENT_ON_HEADER — used to capture
+  // the Mcp-Session-Id response header from the `initialize` handshake.
+#ifdef USE_OPENAI_CONVERSATIONS_MCP
+  if (event->event_id == HTTP_EVENT_ON_HEADER && event->header_key != nullptr &&
+      event->header_value != nullptr) {
+    if (strcasecmp(event->header_key, "Mcp-Session-Id") == 0) {
+      auto *self = static_cast<OpenAIConversations *>(event->user_data);
+      if (self != nullptr) {
+        self->current_mcp_session_id_ = event->header_value;
+        ESP_LOGV(TAG, "Captured Mcp-Session-Id: %s", self->current_mcp_session_id_.c_str());
+      }
+    }
+  }
+#endif
+  return ESP_OK;
+}
+
+void OpenAIConversations::start_http_task_() {
+  this->http_task_should_exit_ = false;
+
+  // The message buffer is pre-allocated in setup() and reused across turns.
+  // Drain any stale data from a previous turn before starting.
+  if (this->http_msg_buffer_ != nullptr) {
+    uint8_t drain[64];
+    while (xMessageBufferReceive(this->http_msg_buffer_, drain, sizeof(drain), 0) > 0) {
+      // discard
+    }
+  } else {
+    // Should not happen (allocated in setup), but handle gracefully.
+    this->fail_("msg_buffer_alloc", "Message buffer is null");
+    return;
+  }
+
+  // Create the HTTP task with an internal-RAM stack. PSRAM stacks crash
+  // during interrupt-heavy network I/O (lwip/socket callbacks preempt the
+  // task and the cache may not have the PSRAM stack lines, causing
+  // IllegalInstruction). 8KB of internal RAM is affordable on the S3-Box-3.
+  // The StaticTask::destroy() called in stop_http_task_() keeps the stack
+  // buffer allocated for reuse by the next create() call.
+  if (!this->http_task_.create(OpenAIConversations::http_task_fn_, "oai_http",
+                               HTTP_TASK_STACK_SIZE, this, HTTP_TASK_PRIORITY, false)) {
+    this->fail_("task_alloc", "Failed to create HTTP task");
+    return;
+  }
+}
+
+void OpenAIConversations::stop_http_task_() {
+  // Signal the task to exit. The task checks http_task_should_exit_ in its
+  // read/write loops and, when it sees the flag, calls close_http_() itself
+  // (cleaning up the esp_http_client + TLS socket from the task that owns
+  // them) before reaching vTaskSuspend(nullptr) at the end of http_task_fn_.
+  //
+  // We must NOT vTaskDelete immediately after setting the flag: if the task
+  // is blocked inside esp_http_client_read() or xMessageBufferSend() when we
+  // delete it, the lwIP socket's internal state is left inconsistent, and
+  // the subsequent close_http_() from this (main loop) task crashes with an
+  // xQueueGenericSend assert (the socket's queue belongs to the deleted task).
+  //
+  // Instead: set the flag, drain the message buffer (so any blocked
+  // xMessageBufferSend in the task unblocks), and wait up to 500ms for the
+  // task to suspend itself. Then destroy the (suspended) task.
+  this->http_task_should_exit_ = true;
+
+  bool suspended = false;  // hoisted out of the is_created() block
+  if (this->http_task_.is_created()) {
+    // Drain the message buffer so the task's xMessageBufferSend (if blocked
+    // on a full buffer) unblocks and can check the exit flag.
+    if (this->http_msg_buffer_ != nullptr) {
+      uint8_t drain[64];
+      while (xMessageBufferReceive(this->http_msg_buffer_, drain, sizeof(drain), 0) > 0) {
+        // discard
+      }
+    }
+
+    // Wait for the task to reach vTaskSuspend(nullptr). The task checks the
+    // exit flag in its read loops (every chunk, ~10-50ms), calls
+    // close_http_(), then suspends. We poll at 10ms intervals for up to 500ms
+    // (bounded to avoid tripping the main-loop watchdog). In the normal case
+    // (active stream), the task exits within one read-chunk interval.
+    for (int i = 0; i < 50; i++) {
+      if (eTaskGetState(this->http_task_.get_handle()) == eSuspended) {
+        suspended = true;
+        break;
+      }
+      vTaskDelay(pdMS_TO_TICKS(10));
+    }
+    if (!suspended) {
+      ESP_LOGW(TAG, "HTTP task did not suspend within 500ms; force-deleting (socket may be left dirty)");
+    }
+
+    // Now safe to delete — the task is suspended (not mid-syscall) and has
+    // already cleaned up its own HTTP client. If it didn't suspend in time,
+    // vTaskDelete is still safe from FreeRTOS's perspective; we handle the
+    // socket below.
+    this->http_task_.destroy();
+  }
+  this->http_task_should_exit_ = false;
+
+  // If the task suspended cleanly, it already called close_http_() itself
+  // (so http_client_ is null and this is a no-op). If we had to force-delete
+  // (task didn't suspend), do NOT call close_http_() — closing the socket
+  // from this task when its lwIP state is inconsistent crashes with an
+  // xQueueGenericSend assert. A leaked socket is preferable to a crash; it
+  // times out and frees itself.
+  if (suspended) {
+    this->close_http_();
+  } else {
+    this->http_client_ = nullptr;  // prevent double-free / stale access
+  }
+
+  // The message buffer is pre-allocated in setup() and reused across turns.
+  // Do NOT delete it here — just drain any pending messages so the next
+  // turn starts with a clean buffer.
+  if (this->http_msg_buffer_ != nullptr) {
+    uint8_t drain[64];
+    while (xMessageBufferReceive(this->http_msg_buffer_, drain, sizeof(drain), 0) > 0) {
+      // discard
+    }
+  }
+}
+
+void OpenAIConversations::http_task_fn_(void *arg) {
+  // This task runs on its own FreeRTOS task, separate from the main loop.
+  // It performs the full HTTP request lifecycle:
+  //   1. Build URL + content type from request_target_
+  //   2. esp_http_client_init (allocates client)
+  //   3. esp_http_client_open (DNS + TCP + TLS handshake — blocking)
+  //   4. esp_http_client_write loop (sends request body — blocking per chunk)
+  //   5. esp_http_client_fetch_headers (waits for response start — blocking,
+  //      this is the ~1.3s "time to first token" for LLM endpoints)
+  //   6. esp_http_client_read loop (reads response chunks — blocking)
+  //      Each chunk is sent to the main loop via the message buffer.
+  //   7. On EOF: send DONE. On error: send ERROR. On cancel: just exit.
+  //   8. esp_http_client_cleanup (closes sockets, frees client)
+  //
+  // The main loop never blocks on HTTP I/O — it does 0-timeout
+  // xMessageBufferReceive in the READING_* states.
+  OpenAIConversations *self = static_cast<OpenAIConversations *>(arg);
+
+  // 1) Build URL and content type from the current request target.
+  //    Use a C-style char buffer (not std::string) to avoid heap allocation
+  //    in the task — the std::string destructor crashed at function return
+  //    due to heap corruption from the esp_http_client call chain.
+  //
+  // The entire body is wrapped in a single scope so that the `task_done:`
+  // label is outside all local variable scopes. Otherwise `goto task_done`
+  // would cross initializations, which is a compile error in C++.
+  {
+  char url[512];
+  const char *content_type = "application/json";
+  if (self->request_target_ == RequestTarget::CHAT) {
+    snprintf(url, sizeof(url), "%s/v1/chat/completions", self->endpoint_base_.c_str());
+    content_type = "application/json";
+  } else if (self->request_target_ == RequestTarget::STT) {
+    snprintf(url, sizeof(url), "%s/v1/audio/transcriptions", self->endpoint_base_.c_str());
+    content_type = "multipart/form-data; boundary=----esphome_openai_conv";
+  } else if (self->request_target_ == RequestTarget::TTS) {
+    snprintf(url, sizeof(url), "%s/v1/audio/speech", self->endpoint_base_.c_str());
+    content_type = "application/json";
+#ifdef USE_OPENAI_CONVERSATIONS_MCP
+  } else if (self->request_target_ == RequestTarget::MCP_CALL) {
+    snprintf(url, sizeof(url), "%s", self->current_mcp_url_.c_str());
+    content_type = "application/json";
+#endif
+  } else {
+    // No valid target — shouldn't happen, but handle gracefully.
+    goto task_done;
+  }
+
+  ESP_LOGV(TAG, "HTTP POST %s (content_length=%u)", url, (unsigned) self->request_body_size_);
+
+  // 2) Configure and init the HTTP client. The url char buffer lives on the
+  //    task stack and is valid for the entire function — the client is
+  //    created and destroyed within this function.
+  esp_http_client_config_t config = {};
+  config.url = url;
+  config.cert_pem = nullptr;
+  config.disable_auto_redirect = false;
+  config.max_redirection_count = 5;
+  config.event_handler = OpenAIConversations::http_event_handler_;
+  config.user_data = self;  // passed to event_handler via event->user_data
+  config.buffer_size = HTTP_TASK_READ_CHUNK * 2;
+  config.buffer_size_tx = HTTP_WRITE_CHUNK * 2;
+  config.timeout_ms = HTTP_TIMEOUT_MS;
+
+#if CONFIG_MBEDTLS_CERTIFICATE_BUNDLE
+  if (strstr(url, "https:") != nullptr) {
+    config.crt_bundle_attach = esp_crt_bundle_attach;
+  }
+#endif
+
+  self->http_client_ = esp_http_client_init(&config);
+  if (self->http_client_ == nullptr) {
+    ESP_LOGE(TAG, "esp_http_client_init failed");
+    self->send_http_error_(self->http_msg_buffer_, "http_init", "esp_http_client_init failed");
+    goto task_done;
+  }
+
+  esp_http_client_set_method(self->http_client_, HTTP_METHOD_POST);
+  esp_http_client_set_header(self->http_client_, "Content-Type", content_type);
+#ifdef USE_OPENAI_CONVERSATIONS_MCP
+  if (self->request_target_ == RequestTarget::MCP_CALL) {
+    // MCP servers may return either a single JSON body or an SSE stream.
+    esp_http_client_set_header(self->http_client_, "Accept",
+                               "application/json, text/event-stream");
+    if (!self->current_mcp_auth_.empty()) {
+      esp_http_client_set_header(self->http_client_, "Authorization",
+                                 self->current_mcp_auth_.c_str());
+    }
+    // Include the session ID on all calls after `initialize`.
+    if (!self->current_mcp_session_id_.empty()) {
+      esp_http_client_set_header(self->http_client_, "Mcp-Session-Id",
+                                 self->current_mcp_session_id_.c_str());
+    }
+  } else {
+#endif
+    if (!self->auth_header_value_.empty()) {
+      esp_http_client_set_header(self->http_client_, "Authorization",
+                                 self->auth_header_value_.c_str());
+    }
+#ifdef USE_OPENAI_CONVERSATIONS_MCP
+  }
+#endif
+
+  // 3) Open the connection with the exact content length (Content-Length
+  //    header is set automatically by open() when write_len > 0).
+  esp_err_t err = esp_http_client_open(self->http_client_, self->request_body_size_);
+  if (err != ESP_OK) {
+    ESP_LOGE(TAG, "esp_http_client_open failed: %s", esp_err_to_name(err));
+    self->close_http_();
+    self->send_http_error_(self->http_msg_buffer_, "http_open", esp_err_to_name(err));
+    goto task_done;
+  }
+
+  // 4) Write the request body in chunks. Each write may block on the socket
+  //    send buffer.
+  size_t sent = 0;
+  while (sent < self->request_body_size_ && !self->http_task_should_exit_) {
+    size_t remaining = self->request_body_size_ - sent;
+    size_t to_write = (remaining < HTTP_WRITE_CHUNK) ? remaining : HTTP_WRITE_CHUNK;
+    int written = esp_http_client_write(self->http_client_,
+                                        reinterpret_cast<const char *>(self->request_body_ + sent), to_write);
+    if (written < 0) {
+      ESP_LOGE(TAG, "esp_http_client_write failed");
+      self->close_http_();
+      self->send_http_error_(self->http_msg_buffer_, "http_write", "Failed to write request body");
+      goto task_done;
+    }
+    sent += written;
+  }
+
+  // Check if we were cancelled during the write loop.
+  if (self->http_task_should_exit_) {
+    self->close_http_();
+    goto task_done;  // no message sent; the loop called stop_http_task_
+  }
+
+  // 5) Fetch response headers. This is the biggest blocking call — it waits
+  //    for the server to begin responding. For LLM endpoints this is the
+  //    "time to first token" (observed ~1.3s for a local Gemma model).
+  int64_t header_len = esp_http_client_fetch_headers(self->http_client_);
+  if (header_len < 0) {
+    ESP_LOGE(TAG, "esp_http_client_fetch_headers failed");
+    self->close_http_();
+    self->send_http_error_(self->http_msg_buffer_, "http_headers", "Failed to fetch response headers");
+    goto task_done;
+  }
+
+  // 5b) For MCP calls, the Mcp-Session-Id response header is captured by the
+  //     HTTP_EVENT_ON_HEADER event handler (set during `initialize`).
+  //     No action needed here.
+
+  // 6) Check the HTTP status code. Accept 200 for normal responses and 202
+  //    for MCP notifications (which have no JSON-RPC response body).
+  int status = esp_http_client_get_status_code(self->http_client_);
+#ifdef USE_OPENAI_CONVERSATIONS_MCP
+  bool is_notification = (self->request_target_ == RequestTarget::MCP_CALL &&
+                          self->current_mcp_call_type_ == McpCallType::INITIALIZED_NOTIF);
+  if (status != 200 && !(is_notification && status == 202)) {
+#else
+  if (status != 200) {
+#endif
+    ESP_LOGE(TAG, "HTTP status %d", status);
+    self->close_http_();
+    char status_msg[32];
+    snprintf(status_msg, sizeof(status_msg), "HTTP %d", status);
+    self->send_http_error_(self->http_msg_buffer_, "http_status", status_msg);
+    goto task_done;
+  }
+
+  // 7) Read the response body. For chat/STT, each chunk is sent to the main
+  //    loop via the message buffer for SSE/JSON parsing. For TTS, the task
+  //    feeds the speaker directly — play(portMAX_DELAY) blocks until the
+  //    speaker consumes the data (natural backpressure), and the main loop
+  //    never blocks on speaker I/O.
+  if (self->request_target_ == RequestTarget::TTS) {
+    // --- TTS: feed speaker directly ---
+    // play(data, len, portMAX_DELAY) handles the full speaker lifecycle:
+    //   - If not started: calls start() internally
+    //   - If STARTING: waits portMAX_DELAY for STATE_RUNNING
+    //   - If RUNNING: writes to ring buffer (blocks if full = backpressure)
+    //   - If STOPPED: returns 0 (data dropped — shouldn't happen)
+    bool speaker_started = false;
+    size_t header_skip = 44;  // WAV header bytes to skip
+    uint8_t read_buf[HTTP_TASK_READ_CHUNK];
+
+    while (!self->http_task_should_exit_) {
+      int got = esp_http_client_read(self->http_client_,
+                                     reinterpret_cast<char *>(read_buf), HTTP_TASK_READ_CHUNK);
+      if (got < 0) {
+        ESP_LOGE(TAG, "esp_http_client_read failed (TTS)");
+        self->close_http_();
+        self->send_http_error_(self->http_msg_buffer_, "http_read", "Failed to read TTS response");
+        goto task_done;
+      }
+      if (got == 0) {
+        break;  // EOF
+      }
+
+      size_t off = 0;
+
+      // Start the speaker on the first chunk (data is already in hand — no
+      // underrun window). Signal the main loop to fire on_tts_stream_start.
+      if (!speaker_started) {
+        speaker_started = true;
+        if (self->speaker_ != nullptr) {
+          ESP_LOGV(TAG, "Starting speaker (sample_rate=%u bits=%u ch=%u)",
+                   (unsigned) self->tts_sample_rate_, (unsigned) MIC_BITS_PER_SAMPLE, (unsigned) MIC_CHANNELS);
+          self->speaker_->set_audio_stream_info(
+              audio::AudioStreamInfo(MIC_BITS_PER_SAMPLE, MIC_CHANNELS, self->tts_sample_rate_));
+          // Explicitly start the speaker. play() would call start() internally,
+          // but only if state_ is not STATE_RUNNING or STATE_STARTING — and our
+          // is_stopped() guard would bail before play() ever runs.
+          self->speaker_->start();
+        }
+        uint8_t start_msg = (uint8_t) HttpMsgType::TTS_STREAM_START;
+        xMessageBufferSend(self->http_msg_buffer_, &start_msg, 1, portMAX_DELAY);
+      }
+
+      // Skip the 44-byte WAV header (may span multiple chunks).
+      while (off < (size_t) got && header_skip > 0) {
+        size_t to_skip = (header_skip < (size_t) got - off) ? header_skip : ((size_t) got - off);
+        off += to_skip;
+        header_skip -= to_skip;
+      }
+
+        if (off < (size_t) got) {
+          size_t pcm_len = (size_t) got - off;
+          uint8_t *pcm = read_buf + off;
+
+          // Apply volume multiplier to int16 samples.
+        if (self->volume_multiplier_ != 1.0f) {
+          size_t num_samples = pcm_len / sizeof(int16_t);
+          int16_t *samples = reinterpret_cast<int16_t *>(pcm);
+          for (size_t i = 0; i < num_samples; i++) {
+            float scaled = (float) samples[i] * self->volume_multiplier_;
+            if (scaled > 32767.0f) {
+              scaled = 32767.0f;
+            } else if (scaled < -32768.0f) {
+              scaled = -32768.0f;
+            }
+            samples[i] = (int16_t) scaled;
+          }
+        }
+
+        // Feed directly to the speaker. We use play(data, len, 0) — the
+        // non-blocking variant — because the 3-arg play() with ticks_to_wait>0
+        // calls vTaskDelay(ticks_to_wait) while the speaker is in
+        // STATE_STARTING. During that delay the speaker's 100ms buffer
+        // underruns and it stops before we ever write any data.
+        //
+        // Instead: play(data, len, 0) auto-starts the speaker if needed, then
+        // tries to write to the ring buffer immediately (0 = non-blocking).
+        // If the speaker isn't ready yet (ring buffer not created), it
+        // returns 0. We retry after a short 10ms delay — this gives the
+        // speaker task time to create its ring buffer without underrunning.
+        if (self->speaker_ != nullptr) {
+          size_t pcm_off = 0;
+          while (pcm_off < pcm_len && !self->http_task_should_exit_) {
+            // Only check is_stopped() after play() has been called at least
+            // once. Before that, the speaker may still be in STATE_STARTING
+            // (not STOPPED), and we need play() to trigger the ring buffer
+            // write once STATE_RUNNING is reached.
+            if (pcm_off > 0 && self->speaker_->is_stopped()) {
+              ESP_LOGW(TAG, "Speaker stopped during TTS playback at byte %u/%u",
+                       (unsigned) pcm_off, (unsigned) pcm_len);
+              break;
+            }
+            size_t written = self->speaker_->play(pcm + pcm_off, pcm_len - pcm_off, 0);
+            pcm_off += written;
+            if (written == 0) {
+              // Ring buffer not ready or full. Wait 10ms for the speaker
+              // task to create its ring buffer or consume data, then retry.
+              vTaskDelay(pdMS_TO_TICKS(10));
+            }
+          }
+        }
+      }
+    }
+  } else {
+    // --- Chat/STT: send DATA messages via message buffer ---
+    uint8_t send_buf[HTTP_TASK_READ_CHUNK + 1];
+    send_buf[0] = (uint8_t) HttpMsgType::DATA;
+
+    while (!self->http_task_should_exit_) {
+      int got = esp_http_client_read(self->http_client_,
+                                     reinterpret_cast<char *>(send_buf + 1), HTTP_TASK_READ_CHUNK);
+      if (got < 0) {
+        ESP_LOGE(TAG, "esp_http_client_read failed");
+        self->close_http_();
+        self->send_http_error_(self->http_msg_buffer_, "http_read", "Failed to read response");
+        goto task_done;
+      }
+      if (got == 0) {
+        break;  // EOF
+      }
+      xMessageBufferSend(self->http_msg_buffer_, send_buf, (size_t) got + 1, portMAX_DELAY);
+    }
+  }
+
+  // 8) Clean up the HTTP client.
+  self->close_http_();
+
+  // 9) Send DONE to signal the loop that the response is complete. If we were
+  //    cancelled, skip this — the loop called stop_http_task_ which already
+  //    cleaned up.
+  if (!self->http_task_should_exit_) {
+    uint8_t done = (uint8_t) HttpMsgType::DONE;
+    xMessageBufferSend(self->http_msg_buffer_, &done, 1, portMAX_DELAY);
+  }
+
+  // Log the stack high-water mark so we can detect if we're close to
+  // overflow. This is the minimum free stack (in words) ever seen.
+  UBaseType_t high_water = uxTaskGetStackHighWaterMark(nullptr);
+  ESP_LOGV(TAG, "HTTP task stack high-water mark: %u words free", (unsigned) high_water);
+  }  // end of scope for all locals
+
+task_done:
+  // A FreeRTOS task must NEVER return from its entry function — doing so
+  // causes an IllegalInstruction crash (the return address is 0x00000000).
+  // Suspend ourselves and wait for stop_http_task_() to call vTaskDelete(),
+  // which safely deletes a suspended task.
+  vTaskSuspend(nullptr);
+}
+
+void OpenAIConversations::close_http_() {
+  if (this->http_client_ != nullptr) {
+    esp_http_client_cleanup(this->http_client_);
+    this->http_client_ = nullptr;
+  }
+}
+
+void OpenAIConversations::send_http_error_(MessageBufferHandle_t buf, const char *code, const char *message) {
+  // Pack the error code and message into a single message buffer message:
+  //   [ERROR_ type byte] [code_len byte] [code bytes] [msg_len byte] [msg bytes]
+  uint8_t code_len = (uint8_t) strlen(code);
+  uint8_t msg_len = (uint8_t) strlen(message);
+  size_t total = 3 + code_len + msg_len;
+  uint8_t err_buf[128];
+  if (total > sizeof(err_buf)) {
+    // Truncate the message if it doesn't fit.
+    msg_len = (uint8_t)(sizeof(err_buf) - 3 - code_len);
+    total = 3 + code_len + msg_len;
+  }
+  err_buf[0] = (uint8_t) HttpMsgType::ERROR_;
+  err_buf[1] = code_len;
+  memcpy(err_buf + 2, code, code_len);
+  err_buf[2 + code_len] = msg_len;
+  memcpy(err_buf + 3 + code_len, message, msg_len);
+  xMessageBufferSend(buf, err_buf, total, portMAX_DELAY);
+}
+
+// --- Request body builders -------------------------------------------------
+
+/// Writes a 44-byte canonical PCM WAV header into `out` (must be >= 44 bytes)
+/// for the given PCM data length (bytes), sample rate, bits, channels.
+static void write_wav_header_(uint8_t *out, uint32_t data_len, uint32_t sample_rate,
+                             uint16_t bits_per_sample, uint16_t channels) {
+  uint32_t byte_rate = sample_rate * channels * bits_per_sample / 8;
+  uint16_t block_align = channels * bits_per_sample / 8;
+  uint32_t chunk_size = 36 + data_len;
+  uint32_t fmt_chunk_size = 16;
+  uint16_t audio_format = 1;  // PCM
+
+  auto put32 = [&](size_t off, uint32_t v) {
+    out[off] = (uint8_t) v;
+    out[off + 1] = (uint8_t) (v >> 8);
+    out[off + 2] = (uint8_t) (v >> 16);
+    out[off + 3] = (uint8_t) (v >> 24);
+  };
+  auto put16 = [&](size_t off, uint16_t v) {
+    out[off] = (uint8_t) v;
+    out[off + 1] = (uint8_t) (v >> 8);
+  };
+  auto putstr = [&](size_t off, const char *s) {
+    memcpy(out + off, s, 4);
+  };
+
+  putstr(0, "RIFF");
+  put32(4, chunk_size);
+  putstr(8, "WAVE");
+  putstr(12, "fmt ");
+  put32(16, fmt_chunk_size);
+  put16(20, audio_format);
+  put16(22, channels);
+  put32(24, sample_rate);
+  put32(28, byte_rate);
+  put16(32, block_align);
+  put16(34, bits_per_sample);
+  putstr(36, "data");
+  put32(40, data_len);
+}
+
+void OpenAIConversations::build_chat_request_body_multimodal_() {
+  // Builds the chat-completions JSON for Mode 1 (multimodal). The user content
+  // is an audio_url data URL containing a base64-encoded WAV (header + PCM).
+  //
+  //   {"model":"<chat_model>","stream":true,
+  //    "messages":[{"role":"system","content":"<system_prompt>"},
+  //                {"role":"user","content":[
+  //                  {"type":"text","text":""},
+  //                  {"type":"audio_url","audio_url":{"url":"data:audio/wav;base64,<b64>"}}]}]
+  //    ,"tool_choice":"auto"
+  //    [,"tools":[...]]}
+  //
+  // We assemble the body directly into a PSRAM buffer to avoid std::string
+  // churn: JSON prefix, then base64 of the WAV (encoded in-place), then JSON
+  // suffix.
+
+  // 1) Build the WAV (header + recorded PCM) in the recording buffer region.
+  //    We reuse the first 44 bytes of recording_buffer_ as scratch for the
+  //    header, but the PCM starts at offset 0 currently. So we shift the PCM
+  //    right by 44 bytes to make room for the header. recording_buffer_ has
+  //    capacity for max_recording_ms; recording_size_ <= capacity - we need
+  //    capacity >= recording_size_ + 44, which holds because the ring drain
+  //    stops when recording_size_ hits capacity and we leave margin.
+  size_t pcm_len = this->recording_size_;
+  if (pcm_len + 44 > this->recording_capacity_) {
+    this->fail_("recording_too_large", "Recording exceeds buffer capacity for WAV header");
+    return;
+  }
+  memmove(this->recording_buffer_ + 44, this->recording_buffer_, pcm_len);
+  write_wav_header_(this->recording_buffer_, pcm_len, MIC_SAMPLE_RATE, MIC_BITS_PER_SAMPLE, MIC_CHANNELS);
+  size_t wav_len = 44 + pcm_len;
+
+  // 2) Compute sizes for the JSON prefix/suffix and the base64 payload.
+  //    JSON-escape the system prompt and chat model inline by copying char by
+  //    char into a local std::string (these are small).
+  std::string escaped_prompt;
+  escaped_prompt.reserve(this->system_prompt_.size() + 16);
+  for (char c : this->system_prompt_) {
+    if (c == '"' || c == '\\') {
+      escaped_prompt.push_back('\\');
+      escaped_prompt.push_back(c);
+    } else if (c == '\n') {
+      escaped_prompt.push_back('\\');
+      escaped_prompt.push_back('n');
+    } else if (c == '\r') {
+      escaped_prompt.push_back('\\');
+      escaped_prompt.push_back('r');
+    } else if (c == '\t') {
+      escaped_prompt.push_back('\\');
+      escaped_prompt.push_back('t');
+    } else if ((unsigned char) c < 0x20) {
+      continue;  // drop other control chars
+    } else {
+      escaped_prompt.push_back(c);
+    }
+  }
+
+  std::string escaped_model;
+  escaped_model.reserve(this->chat_model_.size() + 8);
+  for (char c : this->chat_model_) {
+    if (c == '"' || c == '\\') {
+      escaped_model.push_back('\\');
+    }
+    escaped_model.push_back(c);
+  }
+
+  // Prefix: everything up to the base64 audio data.
+  // Per the OpenAI Chat Completions spec, the audio content part is:
+  //   {"type":"input_audio","input_audio":{"data":"<base64>","format":"wav"}}
+  // (The "audio_url"/data-URL format used by the Responses API does NOT exist
+  // in the Chat Completions API — see openapi.yaml schema
+  // ChatCompletionContentPartInputAudio.)
+  std::string prefix =
+      "{\"model\":\"" + escaped_model + "\",\"stream\":true,\"messages\":["
+      "{\"role\":\"system\",\"content\":\"" + escaped_prompt + "\"},"
+      "{\"role\":\"user\",\"content\":["
+      "{\"type\":\"text\",\"text\":\"\"},"
+      "{\"type\":\"input_audio\",\"input_audio\":{\"data\":\"";
+
+  // Suffix: closes the data field, sets the format, closes the content array,
+  // the messages array, and the object. Includes tool_choice and optionally
+  // the tools array.
+  std::string suffix = "\",\"format\":\"wav\"}}]}],\"tool_choice\":\"auto\"";
+#ifdef USE_OPENAI_CONVERSATIONS_MCP
+  if (!this->cached_tools_json_.empty()) {
+    suffix += ",\"tools\":" + this->cached_tools_json_;
+  } else
+#endif
+#ifdef USE_OPENAI_CONVERSATIONS_TOOLS
+  if (this->has_tools_) {
+    suffix += ",\"tools\":" + std::string(TOOLS_JSON);
+  }
+#endif
+  suffix += "}";
+
+  size_t b64_len = ((wav_len + 2) / 3) * 4;
+  size_t total = prefix.size() + b64_len + suffix.size();
+
+  // 3) Allocate the request body buffer in PSRAM.
+  ExternalRAMAllocator<uint8_t> ext(ExternalRAMAllocator<uint8_t>::ALLOC_EXTERNAL);
+  if (this->request_body_ != nullptr) {
+    ext.deallocate(this->request_body_, this->request_body_capacity_);
+  }
+  this->request_body_capacity_ = total + 1;
+  this->request_body_ = ext.allocate(this->request_body_capacity_);
+  if (this->request_body_ == nullptr) {
+    ESP_LOGE(TAG, "Failed to allocate request body (%d bytes)", (int) this->request_body_capacity_);
+    this->fail_("alloc_failed", "Could not allocate chat request body");
+    return;
+  }
+
+  // 4) Copy prefix, encode base64 in-place, copy suffix.
+  memcpy(this->request_body_, prefix.data(), prefix.size());
+  size_t encoded = base64_encode_to(this->recording_buffer_, wav_len,
+                                   reinterpret_cast<char *>(this->request_body_ + prefix.size()),
+                                   this->request_body_capacity_ - prefix.size() - suffix.size());
+  if (encoded == 0) {
+    this->fail_("b64_failed", "Base64 encoding failed");
+    return;
+  }
+  memcpy(this->request_body_ + prefix.size() + encoded, suffix.data(), suffix.size());
+  this->request_body_size_ = prefix.size() + encoded + suffix.size();
+  this->request_body_sent_ = 0;
+#ifdef USE_OPENAI_CONVERSATIONS_MCP
+  // Save the base64 offset + length so we can retain it for round 2+ if the
+  // LLM requests tool execution.
+  this->round1_b64_offset_ = prefix.size();
+  this->round1_b64_len_ = encoded;
+#endif
+
+  ESP_LOGV(TAG, "Built multimodal chat body: %u bytes (wav=%u b64=%u)",
+           (unsigned) this->request_body_size_, (unsigned) wav_len, (unsigned) encoded);
+}
+
+void OpenAIConversations::build_chat_request_body_text_(const std::string &user_text) {
+  // Mode 2 chat request: text-only user message.
+  //   {"model":"<chat_model>","stream":true,"messages":[
+  //     {"role":"system","content":"<system_prompt>"},
+  //     {"role":"user","content":"<transcript>"}],
+  //    "tool_choice":"auto"[,"tools":[...]]}
+#ifdef USE_OPENAI_CONVERSATIONS_MCP
+  this->user_text_ = user_text;  // saved for round 2+ re-inclusion
+#endif
+  std::string escaped_prompt;
+  escaped_prompt.reserve(this->system_prompt_.size() + 16);
+  for (char c : this->system_prompt_) {
+    if (c == '"' || c == '\\') {
+      escaped_prompt.push_back('\\');
+      escaped_prompt.push_back(c);
+    } else if (c == '\n') {
+      escaped_prompt.push_back('\\');
+      escaped_prompt.push_back('n');
+    } else if (c == '\r') {
+      escaped_prompt.push_back('\\');
+      escaped_prompt.push_back('r');
+    } else if (c == '\t') {
+      escaped_prompt.push_back('\\');
+      escaped_prompt.push_back('t');
+    } else if ((unsigned char) c < 0x20) {
+      continue;
+    } else {
+      escaped_prompt.push_back(c);
+    }
+  }
+  std::string escaped_text;
+  escaped_text.reserve(user_text.size() + 16);
+  for (char c : user_text) {
+    if (c == '"' || c == '\\') {
+      escaped_text.push_back('\\');
+      escaped_text.push_back(c);
+    } else if (c == '\n') {
+      escaped_text.push_back('\\');
+      escaped_text.push_back('n');
+    } else if (c == '\r') {
+      escaped_text.push_back('\\');
+      escaped_text.push_back('r');
+    } else if (c == '\t') {
+      escaped_text.push_back('\\');
+      escaped_text.push_back('t');
+    } else if ((unsigned char) c < 0x20) {
+      continue;
+    } else {
+      escaped_text.push_back(c);
+    }
+  }
+  std::string body =
+      "{\"model\":\"" + this->chat_model_ + "\",\"stream\":true,\"messages\":["
+      "{\"role\":\"system\",\"content\":\"" + escaped_prompt + "\"},"
+      "{\"role\":\"user\",\"content\":\"" + escaped_text + "\"}],"
+      "\"tool_choice\":\"auto\"";
+#ifdef USE_OPENAI_CONVERSATIONS_MCP
+  if (!this->cached_tools_json_.empty()) {
+    body += ",\"tools\":" + this->cached_tools_json_;
+  } else
+#endif
+#ifdef USE_OPENAI_CONVERSATIONS_TOOLS
+  if (this->has_tools_) {
+    body += ",\"tools\":" + std::string(TOOLS_JSON);
+  }
+#endif
+  body += "}";
+
+  ExternalRAMAllocator<uint8_t> ext(ExternalRAMAllocator<uint8_t>::ALLOC_EXTERNAL);
+  if (this->request_body_ != nullptr) {
+    ext.deallocate(this->request_body_, this->request_body_capacity_);
+  }
+  this->request_body_capacity_ = body.size() + 1;
+  this->request_body_ = ext.allocate(this->request_body_capacity_);
+  if (this->request_body_ == nullptr) {
+    this->fail_("alloc_failed", "Could not allocate chat text body");
+    return;
+  }
+  memcpy(this->request_body_, body.data(), body.size());
+  this->request_body_size_ = body.size();
+  this->request_body_sent_ = 0;
+}
+
+void OpenAIConversations::build_stt_multipart_body_() {
+  // Builds a multipart/form-data body for POST /v1/audio/transcriptions:
+  //   --<boundary>\r\n
+  //   Content-Disposition: form-data; name="model"\r\n\r\n
+  //   <stt_model>\r\n
+  //   --<boundary>\r\n
+  //   Content-Disposition: form-data; name="file"; filename="audio.wav"\r\n
+  //   Content-Type: audio/wav\r\n\r\n
+  //   <WAV header + PCM>\r\n
+  //   --<boundary>--\r\n
+  // The WAV (header + PCM) is built in the recording buffer (shift PCM right
+  // by 44 for the header, same as multimodal).
+  size_t pcm_len = this->recording_size_;
+  if (pcm_len + 44 > this->recording_capacity_) {
+    this->fail_("recording_too_large", "Recording exceeds buffer capacity for WAV header");
+    return;
+  }
+  memmove(this->recording_buffer_ + 44, this->recording_buffer_, pcm_len);
+  write_wav_header_(this->recording_buffer_, pcm_len, MIC_SAMPLE_RATE, MIC_BITS_PER_SAMPLE, MIC_CHANNELS);
+  size_t wav_len = 44 + pcm_len;
+
+  const char *boundary = "----esphome_openai_conv";
+  std::string part_model = std::string("--") + boundary +
+                           "\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\n" + this->stt_model_ + "\r\n";
+  std::string part_file_head = std::string("--") + boundary +
+                               "\r\nContent-Disposition: form-data; name=\"file\"; filename=\"audio.wav\"\r\n"
+                               "Content-Type: audio/wav\r\n\r\n";
+  std::string closing = std::string("\r\n--") + boundary + "--\r\n";
+
+  size_t total = part_model.size() + part_file_head.size() + wav_len + closing.size();
+
+  ExternalRAMAllocator<uint8_t> ext(ExternalRAMAllocator<uint8_t>::ALLOC_EXTERNAL);
+  if (this->request_body_ != nullptr) {
+    ext.deallocate(this->request_body_, this->request_body_capacity_);
+  }
+  this->request_body_capacity_ = total + 1;
+  this->request_body_ = ext.allocate(this->request_body_capacity_);
+  if (this->request_body_ == nullptr) {
+    this->fail_("alloc_failed", "Could not allocate STT multipart body");
+    return;
+  }
+  size_t off = 0;
+  memcpy(this->request_body_ + off, part_model.data(), part_model.size());
+  off += part_model.size();
+  memcpy(this->request_body_ + off, part_file_head.data(), part_file_head.size());
+  off += part_file_head.size();
+  memcpy(this->request_body_ + off, this->recording_buffer_, wav_len);
+  off += wav_len;
+  memcpy(this->request_body_ + off, closing.data(), closing.size());
+  off += closing.size();
+  this->request_body_size_ = off;
+  this->request_body_sent_ = 0;
+
+  ESP_LOGV(TAG, "Built STT multipart body: %u bytes (wav=%u)", (unsigned) this->request_body_size_,
+           (unsigned) wav_len);
+}
+
+void OpenAIConversations::build_tts_request_body_() {
+  // POST /v1/audio/speech body:
+  //   {"model":"<tts_model>","input":"<response_text>","voice":"<tts_voice>","response_format":"wav"}
+  std::string escaped_input;
+  escaped_input.reserve(this->response_text_.size() + 16);
+  for (char c : this->response_text_) {
+    if (c == '"' || c == '\\') {
+      escaped_input.push_back('\\');
+      escaped_input.push_back(c);
+    } else if (c == '\n') {
+      escaped_input.push_back('\\');
+      escaped_input.push_back('n');
+    } else if (c == '\r') {
+      escaped_input.push_back('\\');
+      escaped_input.push_back('r');
+    } else if (c == '\t') {
+      escaped_input.push_back('\\');
+      escaped_input.push_back('t');
+    } else if ((unsigned char) c < 0x20) {
+      continue;
+    } else {
+      escaped_input.push_back(c);
+    }
+  }
+  std::string body =
+      "{\"model\":\"" + this->tts_model_ + "\",\"input\":\"" + escaped_input +
+      "\",\"voice\":\"" + this->tts_voice_ + "\",\"response_format\":\"wav\"}";
+
+  ExternalRAMAllocator<uint8_t> ext(ExternalRAMAllocator<uint8_t>::ALLOC_EXTERNAL);
+  if (this->request_body_ != nullptr) {
+    ext.deallocate(this->request_body_, this->request_body_capacity_);
+  }
+  this->request_body_capacity_ = body.size() + 1;
+  this->request_body_ = ext.allocate(this->request_body_capacity_);
+  if (this->request_body_ == nullptr) {
+    this->fail_("alloc_failed", "Could not allocate TTS body");
+    return;
+  }
+  memcpy(this->request_body_, body.data(), body.size());
+  this->request_body_size_ = body.size();
+  this->request_body_sent_ = 0;
+}
+
+// --- Response processing ---------------------------------------------------
+
+void OpenAIConversations::process_sse_bytes_(const uint8_t *data, size_t len) {
+  // Append bytes to the line buffer, and whenever a '\n' is found, process
+  // the complete line. SSE events are separated by '\n'; a line starting with
+  // "data: " carries a JSON payload. The stream terminates with "data: [DONE]".
+  for (size_t i = 0; i < len; i++) {
+    char c = (char) data[i];
+    if (c == '\n') {
+      // NUL-terminate and process the accumulated line.
+      if (this->sse_line_len_ < SSE_LINE_MAX) {
+        this->sse_line_buffer_[this->sse_line_len_] = '\0';
+      } else {
+        this->sse_line_buffer_[SSE_LINE_MAX - 1] = '\0';
+      }
+      this->process_sse_line_(this->sse_line_buffer_, this->sse_line_len_);
+      this->sse_line_len_ = 0;
+    } else if (c != '\r') {
+      if (this->sse_line_len_ < SSE_LINE_MAX - 1) {
+        this->sse_line_buffer_[this->sse_line_len_++] = c;
+      }
+      // else: line too long; drop excess until the next newline.
+    }
+  }
+}
+
+void OpenAIConversations::process_sse_line_(const char *line, size_t len) {
+  if (len == 0) {
+    return;  // blank line separates events
+  }
+  // Lines we care about start with "data: ".
+  const char *prefix = "data: ";
+  const size_t prefix_len = 6;
+  if (len < prefix_len || strncmp(line, prefix, prefix_len) != 0) {
+    return;  // ignore comments, event:, id:, etc.
+  }
+  const char *payload = line + prefix_len;
+  size_t payload_len = len - prefix_len;
+
+  // Termination sentinel.
+  if (payload_len == 6 && strncmp(payload, "[DONE]", 6) == 0) {
+    ESP_LOGV(TAG, "SSE [DONE] received");
+    this->speech_ended_ = true;  // reuse as "stream done" signal for the chat read loop
+    return;
+  }
+
+  // Parse the JSON delta chunk. The Chat Completions SSE format is:
+  //   {"choices":[{"delta":{"content":"Hello"}}]}
+  //
+  // Standard servers send the response text via delta.content. Some
+  // non-standard servers (e.g. reasoning models via llama.cpp/GGUF) also send
+  // delta.reasoning — the model's internal thinking, which should NOT be
+  // spoken. We accumulate them separately:
+  //   - delta.content → response_text_ (the actual response to speak)
+  //   - delta.reasoning → reasoning_text_ (internal thinking, discarded unless
+  //     no content was ever received, in which case reasoning is the fallback)
+  ESP_LOGV(TAG, "SSE line (%u bytes): %s", (unsigned) payload_len, payload);
+  auto doc = json::parse_json(reinterpret_cast<const uint8_t *>(payload), payload_len);
+  if (doc.isNull()) {
+    ESP_LOGW(TAG, "SSE JSON parse failed (%u bytes)", (unsigned) payload_len);
+    return;
+  }
+  JsonObject root = doc.as<JsonObject>();
+  JsonArray choices = root["choices"].as<JsonArray>();
+  if (choices.isNull() || choices.size() == 0) {
+    ESP_LOGW(TAG, "SSE: no choices in chunk");
+    return;
+  }
+  JsonObject first_choice = choices[0].as<JsonObject>();
+
+  // Capture finish_reason early — it may appear on a chunk with no delta.
+#ifdef USE_OPENAI_CONVERSATIONS_MCP
+  const char *finish_reason = first_choice["finish_reason"];
+  if (finish_reason != nullptr && finish_reason[0] != '\0') {
+    this->finish_reason_ = finish_reason;
+    ESP_LOGV(TAG, "SSE finish_reason: %s", finish_reason);
+  }
+#endif
+
+  JsonObject delta = first_choice["delta"].as<JsonObject>();
+  if (delta.isNull()) {
+    ESP_LOGV(TAG, "SSE: no delta in choice");
+    return;
+  }
+  // Accumulate delta.content into response_text_ (the text to speak).
+  const char *content = delta["content"];
+  if (content != nullptr && content[0] != '\0') {
+    this->response_text_.append(content);
+#ifdef USE_TEXT_SENSOR
+    if (this->text_response_sensor_ != nullptr) {
+      this->text_response_sensor_->publish_state(this->response_text_);
+    }
+#endif
+  }
+  // Accumulate delta.reasoning into reasoning_text_ (internal thinking).
+  // Not published to the text sensor — the user should not see thinking.
+  // Used as a fallback at stream end only if no content was received.
+  const char *reasoning = delta["reasoning"];
+  if (reasoning != nullptr && reasoning[0] != '\0') {
+    this->reasoning_text_.append(reasoning);
+  }
+#ifdef USE_OPENAI_CONVERSATIONS_MCP
+  // Accumulate delta.tool_calls (fragmented across SSE chunks). Each element
+  // is keyed by "index": the first chunk for an index carries id +
+  // function.name, subsequent chunks append to function.arguments (partial
+  // JSON string — do NOT parse until stream end).
+  JsonArray tool_calls = delta["tool_calls"].as<JsonArray>();
+  if (!tool_calls.isNull()) {
+    for (JsonObject tc : tool_calls) {
+      int index = tc["index"] | 0;
+      if (index < 0 || index >= (int) MAX_PARALLEL_TOOLS) {
+        continue;
+      }
+      // Find existing entry with this index, or create a new one.
+      AccumulatedToolCall *acc = nullptr;
+      for (size_t i = 0; i < this->accumulated_tool_call_count_; i++) {
+        if (this->accumulated_tool_calls_[i].index == index) {
+          acc = &this->accumulated_tool_calls_[i];
+          break;
+        }
+      }
+      if (acc == nullptr && this->accumulated_tool_call_count_ < MAX_PARALLEL_TOOLS) {
+        acc = &this->accumulated_tool_calls_[this->accumulated_tool_call_count_++];
+        acc->index = index;
+      }
+      if (acc == nullptr) {
+        continue;
+      }
+      // Capture id (first chunk only).
+      const char *id = tc["id"];
+      if (id != nullptr && id[0] != '\0') {
+        acc->id = id;
+      }
+      // Capture function.name + arguments.
+      JsonObject function = tc["function"].as<JsonObject>();
+      if (!function.isNull()) {
+        const char *name = function["name"];
+        if (name != nullptr && name[0] != '\0') {
+          acc->name = name;
+        }
+        const char *args = function["arguments"];
+        if (args != nullptr) {
+          acc->arguments.append(args);
+        }
+      }
+    }
+  }
+#else
+  // Without MCP support, tool_calls can't be executed. Log and move on.
+  const char *finish_reason = first_choice["finish_reason"];
+  if (finish_reason != nullptr && strcmp(finish_reason, "tool_calls") == 0) {
+    ESP_LOGW(TAG, "Server returned finish_reason=tool_calls; no MCP servers configured");
+  }
+#endif
+}
+
+void OpenAIConversations::process_stt_response_(const uint8_t *data, size_t len) {
+  // Append to the accumulating STT response text; the full body is parsed once
+  // the stream ends (handled in loop READING_STT).
+  this->stt_response_text_.append(reinterpret_cast<const char *>(data), len);
+}
+
+// --- Speaker output --------------------------------------------------------
+
+void OpenAIConversations::feed_speaker_(const uint8_t *data, size_t len) {
+  if (this->speaker_ == nullptr || this->speaker_buffer_ == nullptr) {
+    return;
+  }
+  size_t offset = 0;
+  while (offset < len) {
+    size_t free = SPEAKER_BUFFER_SIZE - this->speaker_buffer_index_;
+    size_t to_copy = (len - offset < free) ? (len - offset) : free;
+    memcpy(this->speaker_buffer_ + this->speaker_buffer_index_, data + offset, to_copy);
+    this->speaker_buffer_index_ += to_copy;
+    offset += to_copy;
+
+    // Apply volume multiplier to the newly copied int16 samples.
+    if (this->volume_multiplier_ != 1.0f && to_copy > 0) {
+      size_t start_sample_index = (this->speaker_buffer_index_ - to_copy) / sizeof(int16_t);
+      size_t num_samples = to_copy / sizeof(int16_t);
+      int16_t *samples = reinterpret_cast<int16_t *>(this->speaker_buffer_);
+      for (size_t i = 0; i < num_samples; i++) {
+        float scaled = (float) samples[start_sample_index + i] * this->volume_multiplier_;
+        if (scaled > 32767.0f) {
+          scaled = 32767.0f;
+        } else if (scaled < -32768.0f) {
+          scaled = -32768.0f;
+        }
+        samples[start_sample_index + i] = (int16_t) scaled;
+      }
+    }
+
+    if (this->speaker_buffer_index_ >= SPEAKER_BUFFER_SIZE) {
+      this->flush_speaker_buffer_();
+    }
+  }
+}
+
+void OpenAIConversations::flush_speaker_buffer_() {
+  if (this->speaker_ == nullptr || this->speaker_buffer_ == nullptr || this->speaker_buffer_index_ == 0) {
+    return;
+  }
+  // If the speaker has stopped (e.g. underrun on a short TTS response),
+  // play() would block forever waiting for a dead speaker task to consume
+  // data. Drop the buffer and let the loop transition to teardown.
+  if (this->speaker_->is_stopped()) {
+    ESP_LOGW(TAG, "Speaker stopped during TTS playback; dropping %u bytes",
+             (unsigned) this->speaker_buffer_index_);
+    this->speaker_buffer_index_ = 0;
+    return;
+  }
+  size_t written = this->speaker_->play(this->speaker_buffer_, this->speaker_buffer_index_);
+  // Move any unwritten bytes to the front of the buffer.
+  if (written > 0 && written < this->speaker_buffer_index_) {
+    memmove(this->speaker_buffer_, this->speaker_buffer_ + written, this->speaker_buffer_index_ - written);
+  }
+  this->speaker_buffer_index_ -= (written <= this->speaker_buffer_index_) ? written : this->speaker_buffer_index_;
+}
+
+// --- Main loop state machine ------------------------------------------------
+
+#ifdef USE_OPENAI_CONVERSATIONS_MCP
+// --- Tool execution helpers -------------------------------------------------
+
+void OpenAIConversations::retain_b64_audio_(size_t offset, size_t len) {
+  ExternalRAMAllocator<char> ext(ExternalRAMAllocator<char>::ALLOC_EXTERNAL);
+  this->retained_b64_capacity_ = len + 1;
+  this->retained_b64_audio_ = ext.allocate(this->retained_b64_capacity_);
+  if (this->retained_b64_audio_ == nullptr) {
+    ESP_LOGE(TAG, "Failed to allocate retained b64 audio (%d bytes)", (int) len);
+    return;
+  }
+  memcpy(this->retained_b64_audio_, reinterpret_cast<const char *>(this->request_body_) + offset, len);
+  this->retained_b64_len_ = len;
+  ESP_LOGV(TAG, "Retained base64 audio: %u bytes", (unsigned) len);
+}
+
+void OpenAIConversations::append_assistant_tool_calls_message_() {
+  std::string msg = "{\"role\":\"assistant\",\"tool_calls\":[";
+  bool first = true;
+  for (size_t i = 0; i < this->accumulated_tool_call_count_; i++) {
+    const auto &tc = this->accumulated_tool_calls_[i];
+    if (tc.index < 0) {
+      continue;
+    }
+    if (!first) {
+      msg += ",";
+    }
+    first = false;
+    msg += "{\"id\":\"" + escape_json_string_(tc.id) + "\"";
+    msg += ",\"type\":\"function\"";
+    msg += ",\"function\":{\"name\":\"" + escape_json_string_(tc.name) + "\"";
+    msg += ",\"arguments\":\"" + escape_json_string_(tc.arguments) + "\"}}";
+  }
+  msg += "]}";
+  this->turn_messages_.push_back(std::move(msg));
+}
+
+void OpenAIConversations::reset_accumulated_tool_calls_() {
+  for (size_t i = 0; i < this->accumulated_tool_call_count_; i++) {
+    this->accumulated_tool_calls_[i].index = -1;
+    this->accumulated_tool_calls_[i].id.clear();
+    this->accumulated_tool_calls_[i].name.clear();
+    this->accumulated_tool_calls_[i].arguments.clear();
+  }
+  this->accumulated_tool_call_count_ = 0;
+}
+
+void OpenAIConversations::append_tool_result_message_(const std::string &tool_call_id,
+                                                        const std::string &result) {
+  std::string msg = "{\"role\":\"tool\",\"tool_call_id\":\"" + escape_json_string_(tool_call_id);
+  msg += "\",\"content\":\"" + escape_json_string_(result) + "\"}";
+  this->turn_messages_.push_back(std::move(msg));
+}
+
+void OpenAIConversations::build_chat_request_body_from_history_() {
+  std::string escaped_prompt = escape_json_string_(this->system_prompt_);
+  std::string escaped_model = escape_json_string_(this->chat_model_);
+
+  // Suffix: closes messages array + tool_choice + tools.
+  std::string suffix = "],\"tool_choice\":\"auto\"";
+#ifdef USE_OPENAI_CONVERSATIONS_MCP
+  if (!this->cached_tools_json_.empty()) {
+    suffix += ",\"tools\":" + this->cached_tools_json_;
+  } else
+#endif
+#ifdef USE_OPENAI_CONVERSATIONS_TOOLS
+  if (this->has_tools_) {
+    suffix += ",\"tools\":" + std::string(TOOLS_JSON);
+  }
+#endif
+  suffix += "}";
+
+  if (this->multimodal_ && this->retained_b64_audio_ != nullptr) {
+    // Multimodal: user message contains the retained base64 audio.
+    std::string prefix =
+        "{\"model\":\"" + escaped_model + "\",\"stream\":true,\"messages\":["
+        "{\"role\":\"system\",\"content\":\"" + escaped_prompt + "\"},"
+        "{\"role\":\"user\",\"content\":["
+        "{\"type\":\"text\",\"text\":\"\"},"
+        "{\"type\":\"input_audio\",\"input_audio\":{\"data\":\"";
+    std::string user_suffix = "\",\"format\":\"wav\"}}]}";
+
+    // Turn messages (assistant + tool messages from previous rounds).
+    std::string turn_msgs;
+    for (const auto &msg : this->turn_messages_) {
+      turn_msgs += "," + msg;
+    }
+
+    size_t b64_len = this->retained_b64_len_;
+    size_t total = prefix.size() + b64_len + user_suffix.size() + turn_msgs.size() + suffix.size();
+
+    ExternalRAMAllocator<uint8_t> ext(ExternalRAMAllocator<uint8_t>::ALLOC_EXTERNAL);
+    if (this->request_body_ != nullptr) {
+      ext.deallocate(this->request_body_, this->request_body_capacity_);
+    }
+    this->request_body_capacity_ = total + 1;
+    this->request_body_ = ext.allocate(this->request_body_capacity_);
+    if (this->request_body_ == nullptr) {
+      this->fail_("alloc_failed", "Could not allocate chat history body");
+      return;
+    }
+
+    size_t off = 0;
+    memcpy(this->request_body_ + off, prefix.data(), prefix.size());
+    off += prefix.size();
+    memcpy(this->request_body_ + off, this->retained_b64_audio_, b64_len);
+    off += b64_len;
+    memcpy(this->request_body_ + off, user_suffix.data(), user_suffix.size());
+    off += user_suffix.size();
+    memcpy(this->request_body_ + off, turn_msgs.data(), turn_msgs.size());
+    off += turn_msgs.size();
+    memcpy(this->request_body_ + off, suffix.data(), suffix.size());
+    off += suffix.size();
+
+    this->request_body_size_ = off;
+    this->request_body_sent_ = 0;
+    ESP_LOGV(TAG, "Built chat history body (multimodal): %u bytes (b64=%u msgs=%u)",
+             (unsigned) this->request_body_size_, (unsigned) b64_len,
+             (unsigned) this->turn_messages_.size());
+  } else {
+    // Text mode: user message is text.
+    std::string escaped_text = escape_json_string_(this->user_text_);
+    std::string body =
+        "{\"model\":\"" + escaped_model + "\",\"stream\":true,\"messages\":["
+        "{\"role\":\"system\",\"content\":\"" + escaped_prompt + "\"},"
+        "{\"role\":\"user\",\"content\":\"" + escaped_text + "\"}";
+    for (const auto &msg : this->turn_messages_) {
+      body += "," + msg;
+    }
+    body += suffix;
+
+    ExternalRAMAllocator<uint8_t> ext(ExternalRAMAllocator<uint8_t>::ALLOC_EXTERNAL);
+    if (this->request_body_ != nullptr) {
+      ext.deallocate(this->request_body_, this->request_body_capacity_);
+    }
+    this->request_body_capacity_ = body.size() + 1;
+    this->request_body_ = ext.allocate(this->request_body_capacity_);
+    if (this->request_body_ == nullptr) {
+      this->fail_("alloc_failed", "Could not allocate chat history body");
+      return;
+    }
+    memcpy(this->request_body_, body.data(), body.size());
+    this->request_body_size_ = body.size();
+    this->request_body_sent_ = 0;
+    ESP_LOGV(TAG, "Built chat history body (text): %u bytes (msgs=%u)",
+             (unsigned) this->request_body_size_, (unsigned) this->turn_messages_.size());
+  }
+}
+
+std::string OpenAIConversations::extract_mcp_json_() {
+  const std::string &raw = this->mcp_response_text_;
+
+  // Check if it's SSE (contains "data: ").
+  size_t data_pos = raw.find("data: ");
+  if (data_pos != std::string::npos) {
+    // Find the last "data: " line containing a JSON object.
+    size_t search_from = 0;
+    std::string last_json;
+    while (true) {
+      size_t pos = raw.find("data: ", search_from);
+      if (pos == std::string::npos) {
+        break;
+      }
+      size_t start = pos + 6;
+      size_t end = raw.find('\n', start);
+      if (end == std::string::npos) {
+        end = raw.size();
+      }
+      std::string line = raw.substr(start, end - start);
+      while (!line.empty() && (line.back() == '\r' || line.back() == ' ')) {
+        line.pop_back();
+      }
+      if (!line.empty() && line[0] == '{') {
+        last_json = line;
+      }
+      search_from = end;
+    }
+    return last_json;
+  }
+
+  // Not SSE: trim leading/trailing whitespace and return the raw body.
+  size_t start = raw.find_first_not_of(" \t\r\n");
+  if (start == std::string::npos) {
+    return "";
+  }
+  size_t end = raw.find_last_not_of(" \t\r\n");
+  return raw.substr(start, end - start + 1);
+}
+
+void OpenAIConversations::process_mcp_response_() {
+  // Handle `initialize` and `notifications/initialized` responses first
+  // (they don't carry tool data, just handshake bookkeeping).
+  if (this->current_mcp_call_type_ == McpCallType::INITIALIZED_NOTIF) {
+    // notifications/initialized response (may be empty or 202 Accepted).
+    // The server is now fully initialized. Store the session ID and proceed
+    // to tools/list on the next FETCHING_TOOLS pass.
+    auto &srv = this->mcp_servers_[this->mcp_route_server_index_];
+    srv.session_id = this->current_mcp_session_id_;
+    srv.initialized = true;
+    ESP_LOGV(TAG, "MCP server %u initialized (session=%s)",
+             (unsigned) this->mcp_route_server_index_,
+             srv.session_id.c_str());
+    this->current_mcp_call_type_ = McpCallType::TOOLS_LIST;
+    this->set_state_(State::FETCHING_TOOLS);
+    return;
+  }
+
+  if (this->current_mcp_call_type_ == McpCallType::INITIALIZE) {
+    // initialize response: the http_task already captured Mcp-Session-Id.
+    auto &srv = this->mcp_servers_[this->mcp_route_server_index_];
+    srv.session_id = this->current_mcp_session_id_;
+    ESP_LOGV(TAG, "MCP server %u initialize response received (session=%s)",
+             (unsigned) this->mcp_route_server_index_, srv.session_id.c_str());
+    if (srv.session_id.empty()) {
+      // Server didn't return a Mcp-Session-Id: it's stateless. Skip the
+      // handshake (no notifications/initialized) and go straight to tools/list.
+      // Calling initialize on a stateless server creates a server-side session
+      // that expires, causing 400s on later calls.
+      ESP_LOGV(TAG, "MCP server %u is stateless (no session ID); skipping handshake",
+               (unsigned) this->mcp_route_server_index_);
+      srv.stateless = true;
+      srv.initialized = true;
+      this->current_mcp_call_type_ = McpCallType::TOOLS_LIST;
+    } else {
+      // Server returned a session ID: send notifications/initialized next.
+      this->current_mcp_call_type_ = McpCallType::INITIALIZED_NOTIF;
+    }
+    this->set_state_(State::FETCHING_TOOLS);
+    return;
+  }
+
+  // For tools/list and tools/call responses, parse the JSON.
+  std::string json_str = this->extract_mcp_json_();
+  if (json_str.empty()) {
+    ESP_LOGW(TAG, "MCP response was empty");
+    if (this->mcp_phase_ == McpPhase::FETCHING_TOOLS) {
+      this->mcp_route_server_index_++;
+      // Set call type for the next server (or finish if no more servers).
+      if (this->mcp_route_server_index_ < this->mcp_servers_.size()) {
+        const auto &next_srv = this->mcp_servers_[this->mcp_route_server_index_];
+        this->current_mcp_call_type_ = (next_srv.initialized || next_srv.stateless)
+                                           ? McpCallType::TOOLS_LIST
+                                           : McpCallType::INITIALIZE;
+      }
+      this->set_state_(State::FETCHING_TOOLS);
+    } else {
+      const auto &tool = this->accumulated_tool_calls_[this->current_tool_index_];
+      this->append_tool_result_message_(tool.id, "MCP response was empty");
+      this->current_tool_index_++;
+      this->set_state_(State::EXECUTING_TOOLS);
+    }
+    return;
+  }
+
+  ESP_LOGV(TAG, "Parsing MCP response JSON (%u bytes)", (unsigned) json_str.size());
+  // Parse with a higher nesting limit than the default (10) — the zim_query
+  // tool's inputSchema has deeply nested anyOf/properties that exceed it.
+  // Use a PSRAM-backed allocator so the JSON document buffer doesn't fragment
+  // the internal heap (zim_query schemas can be 10KB+).
+#ifdef USE_PSRAM
+  PsRamJsonAllocator psram_alloc;
+  JsonDocument doc(&psram_alloc);
+#else
+  JsonDocument doc;
+#endif
+  DeserializationError err =
+      deserializeJson(doc, json_str.c_str(), json_str.size(),
+                      DeserializationOption::NestingLimit(20));
+  if (err != DeserializationError::Ok) {
+    ESP_LOGE(TAG, "MCP JSON parse failed: %s", err.c_str());
+    if (this->mcp_phase_ == McpPhase::FETCHING_TOOLS) {
+      this->mcp_route_server_index_++;
+      if (this->mcp_route_server_index_ < this->mcp_servers_.size()) {
+        const auto &next_srv = this->mcp_servers_[this->mcp_route_server_index_];
+        this->current_mcp_call_type_ = (next_srv.initialized || next_srv.stateless)
+                                           ? McpCallType::TOOLS_LIST
+                                           : McpCallType::INITIALIZE;
+      }
+      this->set_state_(State::FETCHING_TOOLS);
+    } else {
+      const auto &tool = this->accumulated_tool_calls_[this->current_tool_index_];
+      this->append_tool_result_message_(tool.id, "MCP JSON parse failed");
+      this->current_tool_index_++;
+      this->set_state_(State::EXECUTING_TOOLS);
+    }
+    return;
+  }
+
+  JsonObject root = doc.as<JsonObject>();
+
+  // Check for JSON-RPC error response (transport/server-level error).
+  JsonObject error = root["error"].as<JsonObject>();
+  if (!error.isNull()) {
+    const char *msg = error["message"];
+    std::string err_msg = (msg != nullptr) ? std::string(msg) : "unknown MCP error";
+    ESP_LOGW(TAG, "MCP error: %s", err_msg.c_str());
+    if (this->mcp_phase_ == McpPhase::FETCHING_TOOLS) {
+      this->mcp_route_server_index_++;
+      this->set_state_(State::FETCHING_TOOLS);
+    } else {
+      const auto &tool = this->accumulated_tool_calls_[this->current_tool_index_];
+      this->append_tool_result_message_(tool.id, "error: " + err_msg);
+      this->current_tool_index_++;
+      this->set_state_(State::EXECUTING_TOOLS);
+    }
+    return;
+  }
+
+  JsonObject result = root["result"].as<JsonObject>();
+  if (result.isNull()) {
+    ESP_LOGW(TAG, "MCP response has no result");
+    if (this->mcp_phase_ == McpPhase::FETCHING_TOOLS) {
+      this->mcp_route_server_index_++;
+      this->set_state_(State::FETCHING_TOOLS);
+    } else {
+      const auto &tool = this->accumulated_tool_calls_[this->current_tool_index_];
+      this->append_tool_result_message_(tool.id, "MCP response had no result");
+      this->current_tool_index_++;
+      this->set_state_(State::EXECUTING_TOOLS);
+    }
+    return;
+  }
+
+  if (this->mcp_phase_ == McpPhase::FETCHING_TOOLS) {
+    // tools/list response: store the raw JSON for schema conversion later,
+    // and extract tool names into the routing map.
+    // Skip this during re-init (routes are already built; we only needed
+    // to refresh the session ID).
+    if (!this->tools_reinit_) {
+      this->raw_tools_per_server_.push_back(json_str);
+      JsonArray tools = result["tools"].as<JsonArray>();
+      if (!tools.isNull()) {
+        for (JsonObject tool : tools) {
+          const char *name = tool["name"];
+          if (name != nullptr && name[0] != '\0') {
+            this->tool_routes_.push_back({name, this->mcp_route_server_index_});
+            ESP_LOGV(TAG, "MCP route: %s -> server %u", name,
+                     (unsigned) this->mcp_route_server_index_);
+          }
+        }
+      }
+    }
+    this->mcp_route_server_index_++;
+    // Set call type for the next server: initialize if not yet initialized
+    // (and not stateless), tools/list otherwise.
+    if (this->mcp_route_server_index_ < this->mcp_servers_.size()) {
+      const auto &next_srv = this->mcp_servers_[this->mcp_route_server_index_];
+      this->current_mcp_call_type_ = (next_srv.initialized || next_srv.stateless)
+                                         ? McpCallType::TOOLS_LIST
+                                         : McpCallType::INITIALIZE;
+    }
+    this->set_state_(State::FETCHING_TOOLS);
+  } else {
+    // tools/call response: extract result text (all text content blocks).
+    JsonArray content = result["content"].as<JsonArray>();
+    std::string text_result;
+    if (!content.isNull()) {
+      for (JsonObject item : content) {
+        const char *type = item["type"];
+        if (type != nullptr && strcmp(type, "text") == 0) {
+          const char *text = item["text"];
+          if (text != nullptr) {
+            if (!text_result.empty()) {
+              text_result += "\n";
+            }
+            text_result += text;
+          }
+        }
+      }
+    }
+    // Truncate large results (e.g. Wikipedia articles).
+    if (text_result.size() > MAX_TOOL_RESULT_BYTES) {
+      text_result.resize(MAX_TOOL_RESULT_BYTES);
+    }
+    bool is_error = result["isError"] | false;
+    const auto &tool = this->accumulated_tool_calls_[this->current_tool_index_];
+    if (is_error) {
+      text_result = "tool error: " + text_result;
+    }
+    ESP_LOGV(TAG, "Tool %s result (%u chars): %.100s", tool.name.c_str(),
+             (unsigned) text_result.size(), text_result.c_str());
+    this->append_tool_result_message_(tool.id, text_result);
+    this->current_tool_index_++;
+    this->set_state_(State::EXECUTING_TOOLS);
+  }
+}
+
+void OpenAIConversations::build_cached_tools_json_() {
+  // Convert raw MCP tools/list responses into an OpenAI-format tools JSON array.
+  // MCP shape:      {"name":"X","description":"Y","inputSchema":{...}}
+  // OpenAI shape:   {"type":"function","function":{"name":"X","description":"Y","parameters":{...}}}
+  std::string out = "[";
+  bool first = true;
+
+  for (const auto &raw : this->raw_tools_per_server_) {
+    ESP_LOGV(TAG, "Parsing raw tools JSON (%u bytes)", (unsigned) raw.size());
+#ifdef USE_PSRAM
+    PsRamJsonAllocator psram_alloc;
+    JsonDocument doc(&psram_alloc);
+#else
+    JsonDocument doc;
+#endif
+    DeserializationError err =
+        deserializeJson(doc, raw.c_str(), raw.size(),
+                        DeserializationOption::NestingLimit(20));
+    if (err != DeserializationError::Ok) {
+      ESP_LOGE(TAG, "Raw tools JSON parse failed: %s", err.c_str());
+      continue;
+    }
+    JsonArray tools = doc["result"]["tools"].as<JsonArray>();
+    if (tools.isNull()) {
+      continue;
+    }
+    for (JsonObject tool : tools) {
+      const char *name = tool["name"];
+      if (name == nullptr || name[0] == '\0') {
+        continue;
+      }
+      const char *description = tool["description"];
+
+      // Build the OpenAI-shape tool object using ArduinoJson, then serialize.
+#ifdef USE_PSRAM
+      PsRamJsonAllocator out_psram_alloc;
+      JsonDocument out_doc(&out_psram_alloc);
+#else
+      JsonDocument out_doc;
+#endif
+      JsonObject func_obj = out_doc.to<JsonObject>();
+      func_obj["type"] = "function";
+      JsonObject function = func_obj["function"].to<JsonObject>();
+      function["name"] = name;
+      if (description != nullptr) {
+        function["description"] = description;
+      }
+      // Move inputSchema -> parameters (copy the subtree).
+      JsonObject input_schema = tool["inputSchema"].as<JsonObject>();
+      if (!input_schema.isNull()) {
+        function["parameters"] = input_schema;
+      }
+
+      std::string serialized;
+      serialized.reserve(512);
+      serializeJson(out_doc, serialized);
+
+      if (!first) {
+        out += ",";
+      }
+      first = false;
+      out += serialized;
+    }
+  }
+  out += "]";
+  this->cached_tools_json_ = std::move(out);
+  this->raw_tools_per_server_.clear();
+  this->tools_cache_timestamp_ms_ = millis();
+  ESP_LOGV(TAG, "Cached tools JSON: %u bytes, %u routes",
+           (unsigned) this->cached_tools_json_.size(),
+           (unsigned) this->tool_routes_.size());
+}
+#endif  // USE_OPENAI_CONVERSATIONS_MCP
+
+void OpenAIConversations::loop() {
+  switch (this->state_) {
+    case State::IDLE:
+      break;
+
+    case State::STARTING_TURN: {
+      // Deferred from request_start() so the on_start callback + MWW stop +
+      // buffer reset run in our own loop context, not inside MWW's wake-word
+      // trigger. continue_request_start_() transitions to STARTING_MICROPHONE.
+      this->continue_request_start_();
+      break;
+    }
+
+    case State::STARTING_MICROPHONE: {
+      // Start the mic source; once it is running, begin listening. The
+      // MicrophoneSource::start() is non-blocking (it signals the mic to
+      // start), and is_running() reflects the mic task state.
+      this->start_microphone_();
+      if (this->mic_source_ == nullptr || !this->mic_source_->is_running()) {
+        // Not running yet; retry next loop pass. (The mic may take a few
+        // passes to start on some platforms.)
+        break;
+      }
+      // CRITICAL: set state to LISTENING before firing display callbacks.
+      // The mic data callback only writes to the ring buffer when
+      // state_ == LISTENING || state_ == RECORDING. If we fire the display
+      // update (which blocks ~580ms for a full framebuffer redraw) while
+      // still in STARTING_MICROPHONE, all audio during that window is
+      // discarded. By switching to LISTENING first, the ring buffer captures
+      // audio while the display redraws in this same loop pass.
+      this->vad_last_check_ms_ = millis();
+      this->speech_active_ = false;
+      this->speech_ended_ = false;
+      this->speech_onset_ms_ = 0;
+      this->silence_since_ms_ = 0;
+      // Reset the request target so BUILDING_REQUEST picks the right endpoint
+      // (CHAT or STT). This is important after FETCHING_TOOLS, which leaves
+      // request_target_ set to MCP_CALL.
+      this->request_target_ = RequestTarget::NONE;
+      this->set_state_(State::LISTENING);
+      // Fire on_start + on_wake_word_detected + on_listening now. The display
+      // update blocks loop() for ~580ms, but the mic callback is capturing
+      // audio into the ring buffer during that time (state is already
+      // LISTENING). VAD will process the buffered audio on the next pass.
+      // Only on_listening fires a display update — on_start's display was
+      // removed (it showed the same page as on_listening).
+      this->on_start_cb_.call();
+      if (!this->wake_word_.empty()) {
+        this->on_wake_word_detected_cb_.call();
+      }
+      this->on_listening_cb_.call();
+      break;
+    }
+
+    case State::LISTENING:
+    case State::RECORDING: {
+      // Drain mic data from the ring buffer into the recording buffer and
+      // run the VAD. This does one bounded chunk per pass.
+      this->drain_ring_buffer_to_recording_();
+
+      // Promote LISTENING -> RECORDING once speech onset is confirmed.
+      if (this->state_ == State::LISTENING && this->speech_active_) {
+        this->set_state_(State::RECORDING);
+      }
+
+      // End of speech: stop the mic and build the request.
+      if (this->speech_ended_) {
+        this->speech_ended_ = false;
+        this->set_state_(State::STOPPING_MICROPHONE);
+        break;
+      }
+
+      // No-speech timeout in LISTENING: silently return to idle (a user
+      // cancel, not an error).
+      if (this->state_ == State::LISTENING &&
+          (millis() - this->listening_start_ms_) >= this->max_recording_ms_) {
+        ESP_LOGD(TAG, "No speech detected within max_recording_ms; returning to idle");
+        this->set_state_(State::STOPPING_MICROPHONE);
+        // Mark as a silent teardown so STOPPING_MICROPHONE -> idle (not error).
+        this->response_text_.clear();
+        break;
+      }
+
+      // Recording length safety cap.
+      if (this->state_ == State::RECORDING && this->recording_size_ >= this->recording_capacity_) {
+        ESP_LOGW(TAG, "Recording buffer full; forcing end of speech");
+        this->speech_ended_ = true;
+      }
+      break;
+    }
+
+    case State::STOPPING_MICROPHONE: {
+      // Stop the mic; once stopped, build the next request body.
+      this->stop_microphone_();
+      if (this->mic_source_ != nullptr && this->mic_source_->is_running()) {
+        break;  // wait for the mic task to stop
+      }
+      // If we got here via no-speech timeout with no recording, tear down.
+      if (this->recording_size_ == 0) {
+        this->set_state_(State::ERROR_TEARDOWN);
+        break;
+      }
+      this->set_state_(State::BUILDING_REQUEST);
+      break;
+    }
+
+    case State::BUILDING_REQUEST: {
+      // Build the next request body based on the current target. The initial
+      // target is CHAT (multimodal) or STT (Mode 2).
+      if (this->request_target_ == RequestTarget::NONE) {
+        if (this->multimodal_) {
+          this->request_target_ = RequestTarget::CHAT;
+          this->build_chat_request_body_multimodal_();
+        } else {
+          this->request_target_ = RequestTarget::STT;
+          this->build_stt_multipart_body_();
+        }
+      } else if (this->request_target_ == RequestTarget::CHAT) {
+        // Built inline at the STT->CHAT transition (see READING_STT); nothing
+        // to do here except proceed to send.
+      }
+      if (this->request_body_ == nullptr) {
+        // build_* already called fail_().
+        break;
+      }
+      this->set_state_(State::SENDING_REQUEST);
+      break;
+    }
+
+    case State::SENDING_REQUEST: {
+      // Start the HTTP task which handles: init, open, write body, fetch
+      // headers, read response. All blocking I/O runs on the task; the main
+      // loop just drains the message buffer in the READING_* states.
+      // Reset SSE line buffer for a fresh chat read.
+      this->sse_line_len_ = 0;
+      this->speech_ended_ = false;
+      if (this->request_target_ == RequestTarget::CHAT) {
+        this->response_text_.clear();
+        this->reasoning_text_.clear();
+#ifdef USE_OPENAI_CONVERSATIONS_MCP
+        this->reset_accumulated_tool_calls_();
+        this->finish_reason_.clear();
+#endif
+      } else if (this->request_target_ == RequestTarget::STT) {
+        this->stt_response_text_.clear();
+#ifdef USE_OPENAI_CONVERSATIONS_MCP
+      } else if (this->request_target_ == RequestTarget::MCP_CALL) {
+        this->mcp_response_text_.clear();
+#endif
+      }
+      // TTS: no reset needed — the task handles speaker start, WAV header
+      // skip, and volume internally.
+
+      this->start_http_task_();
+      if (this->state_ != State::SENDING_REQUEST) {
+        break;  // start_http_task_ called fail_()
+      }
+
+      // Transition immediately to the appropriate read state. The task will
+      // send DATA messages as response data arrives, DONE on completion, or
+      // ERROR on failure.
+      if (this->request_target_ == RequestTarget::CHAT) {
+        this->set_state_(State::READING_CHAT);
+      } else if (this->request_target_ == RequestTarget::STT) {
+        this->set_state_(State::READING_STT);
+      } else if (this->request_target_ == RequestTarget::TTS) {
+        this->set_state_(State::READING_TTS);
+#ifdef USE_OPENAI_CONVERSATIONS_MCP
+      } else if (this->request_target_ == RequestTarget::MCP_CALL) {
+        this->set_state_(State::READING_MCP);
+#endif
+      }
+      break;
+    }
+
+    case State::READING_STT: {
+      // Mode 2: drain the message buffer for the transcription JSON response.
+      uint8_t recv_buf[HTTP_TASK_READ_CHUNK + 1];
+      size_t received = xMessageBufferReceive(this->http_msg_buffer_, recv_buf, sizeof(recv_buf), 0);
+      if (received == 0) {
+        break;  // no data yet, try next loop pass
+      }
+      HttpMsgType type = (HttpMsgType) recv_buf[0];
+      if (type == HttpMsgType::DATA) {
+        this->process_stt_response_(recv_buf + 1, received - 1);
+        break;  // keep draining
+      }
+      // DONE or ERROR: the HTTP task has finished. Clean up and process.
+      this->stop_http_task_();
+      if (type == HttpMsgType::ERROR_) {
+        size_t off = 1;
+        uint8_t code_len = recv_buf[off++];
+        std::string code((const char *) (recv_buf + off), code_len);
+        off += code_len;
+        uint8_t msg_len = recv_buf[off++];
+        std::string message((const char *) (recv_buf + off), msg_len);
+        this->fail_(code, message);
+        break;
+      }
+      // DONE: parse the full STT response.
+      if (this->stt_response_text_.empty()) {
+        this->fail_("stt_empty", "Empty STT response");
+        break;
+      }
+      auto doc = json::parse_json(this->stt_response_text_);
+      const char *text = doc["text"];
+      std::string transcript = (text != nullptr) ? std::string(text) : std::string();
+      if (transcript.empty()) {
+        this->fail_("stt_no_text", "STT response had no text field");
+        break;
+      }
+      ESP_LOGD(TAG, "STT transcript: %s", transcript.c_str());
+      this->request_target_ = RequestTarget::CHAT;
+      this->build_chat_request_body_text_(transcript);
+      if (this->request_body_ == nullptr) {
+        break;  // fail_ already called
+      }
+      // Start the chat HTTP task BEFORE firing on_stt_end. The HTTP task runs
+      // on a separate FreeRTOS task, so once start_http_task_() returns, the
+      // network request is in flight. We can then fire on_stt_end (which
+      // redraws the display, ~412ms blocking) in parallel with the HTTP
+      // request — saving ~412ms on the critical path.
+      // We must do the SENDING_REQUEST resets + start_http_task_ here rather
+      // than in the SENDING_REQUEST state because the display callback blocks
+      // loop() and the SENDING_REQUEST case wouldn't run until after it.
+      this->sse_line_len_ = 0;
+      this->speech_ended_ = false;
+      this->response_text_.clear();
+      this->reasoning_text_.clear();
+#ifdef USE_OPENAI_CONVERSATIONS_MCP
+      this->reset_accumulated_tool_calls_();
+      this->finish_reason_.clear();
+#endif
+      this->set_state_(State::SENDING_REQUEST);
+      this->start_http_task_();
+      if (this->state_ != State::SENDING_REQUEST) {
+        break;  // start_http_task_ called fail_()
+      }
+      // Transition immediately to READING_CHAT. The HTTP task is now in
+      // flight on its own FreeRTOS task, reading the SSE response into the
+      // message buffer. The main loop will drain it.
+      this->set_state_(State::READING_CHAT);
+      // Fire on_stt_end now — the display update (~412ms) overlaps with the
+      // chat HTTP request running on the HTTP task.
+      this->on_stt_end_cb_.call(transcript);
+#ifdef USE_TEXT_SENSOR
+      if (this->text_request_sensor_ != nullptr) {
+        this->text_request_sensor_->publish_state(transcript);
+      }
+#endif
+      break;
+    }
+
+    case State::READING_CHAT: {
+      // Drain the message buffer for SSE chunks and accumulate the chat
+      // response text.
+      uint8_t recv_buf[HTTP_TASK_READ_CHUNK + 1];
+      size_t received = xMessageBufferReceive(this->http_msg_buffer_, recv_buf, sizeof(recv_buf), 0);
+      if (received == 0) {
+        break;  // no data yet, try next loop pass
+      }
+      HttpMsgType type = (HttpMsgType) recv_buf[0];
+      if (type == HttpMsgType::DATA) {
+        this->process_sse_bytes_(recv_buf + 1, received - 1);
+        break;  // keep draining
+      }
+      // DONE or ERROR: the HTTP task has finished. Clean up and process.
+      this->stop_http_task_();
+      if (type == HttpMsgType::ERROR_) {
+        size_t off = 1;
+        uint8_t code_len = recv_buf[off++];
+        std::string code((const char *) (recv_buf + off), code_len);
+        off += code_len;
+        uint8_t msg_len = recv_buf[off++];
+        std::string message((const char *) (recv_buf + off), msg_len);
+        this->fail_(code, message);
+        break;
+      }
+      // DONE: stream ended (either [DONE] or EOF).
+#ifdef USE_OPENAI_CONVERSATIONS_MCP
+      // Check if the LLM requested tool execution. If so, do NOT TTS or use
+      // reasoning — route to the tool execution state instead.
+      if (this->finish_reason_ == "tool_calls" || this->accumulated_tool_call_count_ > 0) {
+        if (this->mcp_servers_.empty()) {
+          this->fail_("no_mcp_servers", "LLM requested tool calls but no MCP servers configured");
+          break;
+        }
+        this->tool_round_++;
+        if (this->tool_round_ > MAX_TOOL_ROUNDS) {
+          this->fail_("max_tool_rounds", "Exceeded maximum tool call rounds");
+          break;
+        }
+        ESP_LOGD(TAG, "Tool calls requested (round %u, %u tools)",
+                 (unsigned) this->tool_round_, (unsigned) this->accumulated_tool_call_count_);
+        // Retain base64 audio (multimodal) so round 2+ can re-include it.
+        if (this->multimodal_ && this->retained_b64_audio_ == nullptr) {
+          this->retain_b64_audio_(this->round1_b64_offset_, this->round1_b64_len_);
+        }
+        // Build the assistant message with tool_calls and add to history.
+        this->append_assistant_tool_calls_message_();
+        // Clear response/reasoning — they are not spoken when tools are called.
+        this->response_text_.clear();
+        this->reasoning_text_.clear();
+        // Routes were already built during FETCHING_TOOLS; go straight to execution.
+        this->current_tool_index_ = 0;
+        this->mcp_phase_ = McpPhase::EXECUTING;
+        this->set_state_(State::EXECUTING_TOOLS);
+        break;
+      }
+#endif
+      // No tool calls: normal response handling.
+      // If no content was received (some non-standard servers send all text
+      // via delta.reasoning with content=null), fall back to reasoning_text_.
+      if (this->response_text_.empty()) {
+        if (!this->reasoning_text_.empty()) {
+          ESP_LOGV(TAG, "No content received; using reasoning as response (%u chars)",
+                   (unsigned) this->reasoning_text_.size());
+          this->response_text_ = std::move(this->reasoning_text_);
+#ifdef USE_TEXT_SENSOR
+          if (this->text_response_sensor_ != nullptr) {
+            this->text_response_sensor_->publish_state(this->response_text_);
+          }
+#endif
+        } else {
+          // Empty response with no reasoning: use a default acknowledgment
+          // instead of erroring. This handles broadcast/tool scenarios where
+          // the LLM has nothing to say after executing a tool.
+          this->response_text_ = "Done.";
+#ifdef USE_TEXT_SENSOR
+          if (this->text_response_sensor_ != nullptr) {
+            this->text_response_sensor_->publish_state(this->response_text_);
+          }
+#endif
+        }
+      }
+      ESP_LOGD(TAG, "Chat response (%u chars): %s", (unsigned) this->response_text_.size(),
+               this->response_text_.c_str());
+      this->on_tts_start_cb_.call(this->response_text_);
+      // Build the TTS request and send it.
+      this->request_target_ = RequestTarget::TTS;
+      this->build_tts_request_body_();
+      if (this->request_body_ == nullptr) {
+        break;  // fail_ already called
+      }
+      this->set_state_(State::SENDING_REQUEST);
+      break;
+    }
+
+    case State::READING_TTS: {
+      // For TTS, the HTTP task feeds the speaker directly (play() with
+      // portMAX_DELAY for natural backpressure). The main loop only handles
+      // control messages: TTS_STREAM_START (fire callback), DONE (finish
+      // speaker + drain), ERROR (fail). No DATA messages for TTS.
+      uint8_t recv_buf[128];  // small — only control messages, no data
+      size_t received = xMessageBufferReceive(this->http_msg_buffer_, recv_buf, sizeof(recv_buf), 0);
+      if (received == 0) {
+        break;  // no message yet, try next loop pass
+      }
+      HttpMsgType type = (HttpMsgType) recv_buf[0];
+
+      if (type == HttpMsgType::TTS_STREAM_START) {
+        // The task has started the speaker and is about to feed audio.
+        this->on_tts_stream_start_cb_.call();
+        break;
+      }
+
+      // DONE or ERROR: the TTS stream has ended.
+      this->stop_http_task_();
+      if (type == HttpMsgType::ERROR_) {
+        size_t off = 1;
+        uint8_t code_len = recv_buf[off++];
+        std::string code((const char *) (recv_buf + off), code_len);
+        off += code_len;
+        uint8_t msg_len = recv_buf[off++];
+        std::string message((const char *) (recv_buf + off), msg_len);
+        this->fail_(code, message);
+        break;
+      }
+      // DONE: the task has fed all audio to the speaker. Tell the speaker to
+      // drain its internal buffer and stop when empty.
+      if (this->speaker_ != nullptr) {
+        this->speaker_->finish();
+      }
+      this->on_tts_stream_end_cb_.call();
+      this->on_tts_end_cb_.call(this->response_text_);
+      this->set_state_(State::DRAINING_AUDIO);
+      break;
+    }
+
+#ifdef USE_OPENAI_CONVERSATIONS_MCP
+    case State::FETCHING_TOOLS: {
+      // Proactive tools cache refresh (before a turn starts). For each MCP
+      // server: (1) send `initialize` if not yet initialized, (2) send
+      // `notifications/initialized`, (3) send `tools/list`.
+      // For re-init (mid-turn session refresh), only query the one failed server.
+      bool server_in_range =
+          this->mcp_route_server_index_ < this->mcp_servers_.size() &&
+          (!this->tools_reinit_ || this->mcp_route_server_index_ <= this->reinit_server_index_);
+      if (server_in_range) {
+        auto &srv = this->mcp_servers_[this->mcp_route_server_index_];
+        this->current_mcp_url_ = srv.url;
+        this->current_mcp_auth_ = srv.auth_header;
+        // Set the session ID from the server's stored value (empty if not
+        // yet initialized — the http_task captures it from the response).
+        this->current_mcp_session_id_ = srv.session_id;
+
+        // Determine which call to make next.
+        std::string body;
+        if (!srv.initialized && !srv.stateless) {
+          // Server hasn't been initialized and isn't known to be stateless.
+          if (this->current_mcp_call_type_ == McpCallType::INITIALIZE) {
+            body = mcp_build_initialize_request(this->mcp_request_id_++);
+            ESP_LOGV(TAG, "Initializing MCP server %u (%s)",
+                     (unsigned) this->mcp_route_server_index_, srv.name.c_str());
+          } else if (this->current_mcp_call_type_ == McpCallType::INITIALIZED_NOTIF) {
+            body = mcp_build_initialized_notification();
+            ESP_LOGV(TAG, "Sending notifications/initialized to server %u",
+                     (unsigned) this->mcp_route_server_index_);
+          }
+        } else {
+          // Already initialized or stateless: send tools/list.
+          this->current_mcp_call_type_ = McpCallType::TOOLS_LIST;
+          body = mcp_build_tools_list_request(this->mcp_request_id_++);
+          ESP_LOGV(TAG, "Fetching tools from MCP server %u (%s)",
+                   (unsigned) this->mcp_route_server_index_, srv.name.c_str());
+        }
+
+        ExternalRAMAllocator<uint8_t> ext(ExternalRAMAllocator<uint8_t>::ALLOC_EXTERNAL);
+        if (this->request_body_ != nullptr) {
+          ext.deallocate(this->request_body_, this->request_body_capacity_);
+        }
+        this->request_body_capacity_ = body.size() + 1;
+        this->request_body_ = ext.allocate(this->request_body_capacity_);
+        if (this->request_body_ == nullptr) {
+          this->fail_("alloc_failed", "Could not allocate MCP body");
+          break;
+        }
+        memcpy(this->request_body_, body.data(), body.size());
+        this->request_body_size_ = body.size();
+        this->request_body_sent_ = 0;
+        this->request_target_ = RequestTarget::MCP_CALL;
+        this->set_state_(State::SENDING_REQUEST);
+        break;
+      }
+      // All servers queried.
+      this->mcp_phase_ = McpPhase::IDLE;
+      if (this->tools_reinit_) {
+        // Re-initialization complete: just return to EXECUTING_TOOLS and
+        // retry the tool call. No need to rebuild the cache — the tools
+        // list hasn't changed, only the session was refreshed.
+        ESP_LOGV(TAG, "Re-init complete; retrying tool call");
+        this->tools_reinit_ = false;
+        this->mcp_phase_ = McpPhase::EXECUTING;
+        this->set_state_(State::EXECUTING_TOOLS);
+      } else {
+        // Full refresh: build the cached tools JSON + routing map.
+        this->build_cached_tools_json_();
+        if (this->tools_prefetch_) {
+          ESP_LOGV(TAG, "Tools prefetch complete; returning to idle");
+          this->tools_prefetch_ = false;
+          this->set_state_(State::IDLE);
+        } else {
+          // Mid-turn refresh: continue the request_start that was deferred.
+          this->continue_request_start_();
+        }
+      }
+      break;
+    }
+
+    case State::EXECUTING_TOOLS: {
+      // Routes were already built during FETCHING_TOOLS; go straight to execution.
+      if (this->current_tool_index_ < this->accumulated_tool_call_count_) {
+        const auto &tool = this->accumulated_tool_calls_[this->current_tool_index_];
+        // Look up the server for this tool.
+        uint8_t server_idx = 0;
+        bool found = false;
+        for (const auto &route : this->tool_routes_) {
+          if (route.tool_name == tool.name) {
+            server_idx = route.server_index;
+            found = true;
+            break;
+          }
+        }
+        if (!found) {
+          ESP_LOGW(TAG, "Tool not found in routes: %s", tool.name.c_str());
+          this->append_tool_result_message_(tool.id, "tool not found: " + tool.name);
+          this->current_tool_index_++;
+          break;  // re-enter next loop pass
+        }
+        const auto &srv = this->mcp_servers_[server_idx];
+        this->current_mcp_url_ = srv.url;
+        this->current_mcp_auth_ = srv.auth_header;
+        std::string body =
+            mcp_build_tools_call_request(this->mcp_request_id_++, tool.name, tool.arguments);
+        ExternalRAMAllocator<uint8_t> ext(ExternalRAMAllocator<uint8_t>::ALLOC_EXTERNAL);
+        if (this->request_body_ != nullptr) {
+          ext.deallocate(this->request_body_, this->request_body_capacity_);
+        }
+        this->request_body_capacity_ = body.size() + 1;
+        this->request_body_ = ext.allocate(this->request_body_capacity_);
+        if (this->request_body_ == nullptr) {
+          this->fail_("alloc_failed", "Could not allocate MCP tools/call body");
+          break;
+        }
+        memcpy(this->request_body_, body.data(), body.size());
+        this->request_body_size_ = body.size();
+        this->request_body_sent_ = 0;
+        this->request_target_ = RequestTarget::MCP_CALL;
+        this->mcp_phase_ = McpPhase::EXECUTING;
+        this->current_mcp_call_type_ = McpCallType::TOOLS_CALL;
+        // Restore the session ID for this server (so the http_task includes
+        // the Mcp-Session-Id header on the tools/call request).
+        this->current_mcp_session_id_ = srv.session_id;
+        ESP_LOGV(TAG, "Calling tool %s on server %u (%s)", tool.name.c_str(),
+                 (unsigned) server_idx, srv.name.c_str());
+        this->set_state_(State::SENDING_REQUEST);
+        break;
+      }
+
+      // All tools executed for this round. Build round 2+ chat request.
+      this->reset_accumulated_tool_calls_();
+      this->current_tool_index_ = 0;
+      this->build_chat_request_body_from_history_();
+      if (this->request_body_ == nullptr) {
+        break;  // fail_ already called
+      }
+      this->request_target_ = RequestTarget::CHAT;
+      ESP_LOGV(TAG, "Re-querying LLM with tool results (round %u, %u messages)",
+               (unsigned) this->tool_round_, (unsigned) this->turn_messages_.size());
+      this->set_state_(State::SENDING_REQUEST);
+      break;
+    }
+
+    case State::READING_MCP: {
+      // Drain MCP JSON-RPC response chunks into mcp_response_text_.
+      uint8_t recv_buf[HTTP_TASK_READ_CHUNK + 1];
+      size_t received = xMessageBufferReceive(this->http_msg_buffer_, recv_buf, sizeof(recv_buf), 0);
+      if (received == 0) {
+        break;  // no data yet
+      }
+      HttpMsgType type = (HttpMsgType) recv_buf[0];
+      if (type == HttpMsgType::DATA) {
+        this->mcp_response_text_.append(reinterpret_cast<const char *>(recv_buf + 1), received - 1);
+        break;  // keep draining
+      }
+      // DONE or ERROR
+      this->stop_http_task_();
+      if (type == HttpMsgType::ERROR_) {
+        size_t off = 1;
+        uint8_t code_len = recv_buf[off++];
+        std::string code((const char *) (recv_buf + off), code_len);
+        off += code_len;
+        uint8_t msg_len = recv_buf[off++];
+        std::string message((const char *) (recv_buf + off), msg_len);
+        if (this->mcp_phase_ == McpPhase::FETCHING_TOOLS) {
+          // Server unreachable during tools/list refresh: skip it and continue.
+          ESP_LOGW(TAG, "MCP server %u unreachable during fetch: %s %s",
+                   (unsigned) this->mcp_route_server_index_, code.c_str(), message.c_str());
+          this->mcp_route_server_index_++;
+          this->set_state_(State::FETCHING_TOOLS);
+        } else if (this->mcp_phase_ == McpPhase::EXECUTING &&
+                   this->current_tool_index_ < this->accumulated_tool_call_count_) {
+          // Check if this is a 400 from a stateful server whose session may
+          // have expired. If so, re-initialize and retry the tool call.
+          const auto &tool = this->accumulated_tool_calls_[this->current_tool_index_];
+          uint8_t server_idx = 0;
+          bool found = false;
+          for (const auto &route : this->tool_routes_) {
+            if (route.tool_name == tool.name) {
+              server_idx = route.server_index;
+              found = true;
+              break;
+            }
+          }
+          if (found && code == "http_status" && message.find("400") != std::string::npos &&
+              !this->mcp_servers_[server_idx].stateless &&
+              !this->mcp_servers_[server_idx].session_id.empty()) {
+            // Session likely expired: reset and re-initialize.
+            ESP_LOGW(TAG, "MCP server %u returned 400; re-initializing (session may have expired)",
+                     (unsigned) server_idx);
+            this->mcp_servers_[server_idx].initialized = false;
+            this->mcp_servers_[server_idx].session_id.clear();
+            // Set up to re-initialize this server, then retry the tool call.
+            this->mcp_route_server_index_ = server_idx;
+            this->reinit_server_index_ = server_idx;
+            this->current_mcp_call_type_ = McpCallType::INITIALIZE;
+            this->mcp_phase_ = McpPhase::FETCHING_TOOLS;
+            this->tools_reinit_ = true;
+            this->set_state_(State::FETCHING_TOOLS);
+          } else {
+            // Other HTTP errors: return the error as a tool result so the
+            // LLM can recover gracefully.
+            this->append_tool_result_message_(tool.id, "tool backend error: " + code + " " + message);
+            this->current_tool_index_++;
+            this->set_state_(State::EXECUTING_TOOLS);
+          }
+        } else {
+          this->fail_(code, message);
+        }
+        break;
+      }
+      // DONE: parse the MCP response.
+      this->process_mcp_response_();
+      break;
+    }
+#endif
+
+    case State::DRAINING_AUDIO: {
+      // Wait for the speaker to finish playing buffered audio before tearing
+      // down. The i2s bus is shared with the mic, so we cannot restart MWW
+      // until the speaker has fully stopped.
+      if (this->speaker_ != nullptr && !this->speaker_->is_stopped()) {
+        break;
+      }
+      this->teardown_to_idle_();
+      break;
+    }
+
+    case State::ERROR_TEARDOWN: {
+      // Cleanup path for both errors and explicit stops. Kill the HTTP task
+      // if still running, stop the speaker + mic, then wait for them to stop
+      // before tearing down fully.
+      this->stop_http_task_();
+      if (this->speaker_ != nullptr && !this->speaker_->is_stopped()) {
+        this->speaker_->stop();
+        break;  // wait for speaker to stop (shared i2s bus)
+      }
+      // Stop the mic if it is still running (e.g. button pressed during
+      // LISTENING/RECORDING). mic->stop() is asynchronous — we must wait for
+      // is_running() to return false before starting MWW, otherwise MWW's
+      // mic->start() races with the ongoing stop and the mic ends up in a
+      // broken state where MWW reads silence forever.
+      if (this->mic_source_ != nullptr && this->mic_source_->is_running()) {
+        this->stop_microphone_();
+        break;  // wait for mic to stop (next loop pass re-enters ERROR_TEARDOWN)
+      }
+      this->teardown_to_idle_();
+      break;
+    }
+  }
+}
+
+}  // namespace esphome::openai_conversations
+
+#endif  // USE_OPENAI_CONVERSATIONS
+
+
+

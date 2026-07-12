@@ -1,0 +1,317 @@
+﻿substitutions:
+  device_name: esp32-s3-box-3-640554
+  friendly_name: Jarvis
+  openai_endpoint: "!secret endpoint"
+  openai_model: "gpt-realtime"
+  openai_api_key: "" #can be empty if using a local endpoint that doesn't require authentication
+  openai_prompt: >-
+    You are Jeeves, a voice assistant. You have access to tools called "Assist" and "openzim-mcp". Assist is tools relating to controlling devices inside a home. openzim-mcp is an archive of wikipedia for June 2026.
+    You have two operating modes:
+    - Mode 1: If the user gives you a simple home automation command (e.g., "turn off the kitchen lights", "tell me about the weather" "what time is it?") use tools from Assist to answer them (e.g., HassTurnOff, GetLiveContext, GetDateTime). Answer the question or execute the command as quickly as possible, with a succinct response (e.g., "done") as appropriate.
+    - Mode 2: If the user asks a more open ended question (e.g., "Who is the President", "Who won the superbowl", "what is Boyle's law") use tools from openzim-mcp to research the answer. Do not simply input the user prompt into the tool. First, think about what article would have the answer to the user's question. For example, if the user is asking about a historical figure, the wikipedia article title is probably that person's name. Use the openzim-mcp tool to search for the article name that would most likely have the answer to the users' question. Provide a summary. Do not ask if the user has follow-on questions. 
+    For all answers:
+    - Be succinct, and do not ask follow-up questions.
+    - Your Text-To-Speech system cannot read thinking tags or markdown.
+    - If you need clarification on your task, ask the user.
+    - If you hear rambling, conversing, or background media, respond "*".
+    - If the user says nevermind, stop, or cancel: Respond "Cancelled."
+    - Never respond with the tool_call. call the tool, think about the result, and respond with the answer. Do not ask the user if they want to call a tool.
+  openai_voice: "" #can be empty if defined on endpoint
+  openai_language: "en"
+
+# Load the local openai_assistant component from the parent directory.
+# Adjust the path if you copy this YAML to a different location.
+external_components:
+  - source:
+      type: local
+      path: /config
+    components: [openai_assistant]
+
+esphome:
+  name: ${device_name}
+  friendly_name: ${friendly_name}
+  min_version: 2025.1.0
+
+esp32:
+  board: esp32s3box
+  flash_size: 16MB
+  cpu_frequency: 240MHz
+  framework:
+    type: esp-idf
+    sdkconfig_options:
+      CONFIG_ESP32S3_DEFAULT_CPU_FREQ_240: "y"
+      CONFIG_ESP32S3_DATA_CACHE_LINE_SIZE_64B: "y"
+      CONFIG_ESP32S3_CACHE_64KB: "y"
+
+psram:
+  mode: octal
+  speed: 80MHz
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  use_psram: true
+
+api:
+  encryption:
+    key: !secret jarviskey
+  on_client_connected:
+    - logger.log: "API connected, starting wake word"
+    - lambda: id(box_speaker).set_volume(0.65);
+    - micro_wake_word.enable_model: hey_jarvis_model
+    - micro_wake_word.start:
+        id: mww
+    - script.execute: mww_heartbeat
+
+ota:
+  - platform: esphome
+    password: !secret otapassword
+
+logger:
+  level: DEBUG
+
+#captive_portal:
+
+i2c:
+  - id: i2c_adc_dac
+    scl: GPIO18
+    sda: GPIO8
+
+i2s_audio:
+  - id: i2s_audio_bus
+    i2s_lrclk_pin:
+      number: GPIO45
+      ignore_strapping_warning: true
+    i2s_bclk_pin: GPIO17
+    i2s_mclk_pin: GPIO2
+
+audio_adc:
+  - platform: es7210
+    i2c_id: i2c_adc_dac
+    id: es7210_adc
+    bits_per_sample: 16bit
+    sample_rate: 16000
+
+audio_dac:
+  - platform: es8311
+    i2c_id: i2c_adc_dac
+    id: es8311_dac
+    bits_per_sample: 16bit
+    sample_rate: 48000
+
+microphone:
+  - platform: i2s_audio
+    id: box_mic
+    sample_rate: 16000
+    i2s_din_pin: GPIO16
+    bits_per_sample: 16bit
+    adc_type: external
+
+speaker:
+  - platform: i2s_audio
+    id: box_speaker
+    i2s_dout_pin: GPIO15
+    dac_type: external
+    sample_rate: 48000
+    bits_per_sample: 16bit
+    channel: left
+    audio_dac: es8311_dac
+    buffer_duration: 100ms
+
+micro_wake_word:
+  id: mww
+  microphone: box_mic
+  task_stack_in_psram: true
+  models:
+    - id: hey_jarvis_model
+      model: hey_jarvis
+      probability_cutoff: 0.4
+  vad:
+    model: https://raw.githubusercontent.com/esphome/micro-wake-word-models/main/models/v2/vad.json
+  on_wake_word_detected:
+    - logger.log: "WAKE WORD DETECTED"
+    - openai_assistant.start:
+        wake_word: !lambda return wake_word;
+
+openai_assistant:
+  id: openai
+  api_key: ${openai_api_key}
+  model: ${openai_model}
+  endpoint: ${openai_endpoint}
+  system_prompt: ${openai_prompt}
+  voice: ${openai_voice}
+  language: ${openai_language}
+  microphone: box_mic
+  speaker: box_speaker
+  micro_wake_word: mww
+  noise_suppression_level: 2
+  auto_gain: 31dBFS
+  volume_multiplier: 2.5
+  # MCP tool servers — declared in session.update with type:"mcp" so the server
+  # connects to them, imports tools, and executes them server-side. Per OpenAI
+  # Realtime API docs, MCP tools use "authorization" (string), not headers.
+  tools:
+    - type: mcp
+      server_label: homeassistant
+      server_url: !secret ha_server
+      auth_token: !secret ha_token
+      require_approval: never
+    - type: mcp
+      server_label: openzim
+      server_url: !secret openzim_server
+      auth_token: !secret openzim_token
+      require_approval: never
+  text_request: request_text
+  text_response: response_text
+  on_listening:
+    - lambda: |-
+        id(status_text).publish_state("Listening...");
+        id(request_text).publish_state("");
+        id(response_text).publish_state("");
+        id(display_spi).update();
+  on_start:
+    - lambda: id(status_text).publish_state("Connected");
+  on_stt_vad_start:
+    - lambda: id(status_text).publish_state("Speech started");
+  on_stt_vad_end:
+    - lambda: id(status_text).publish_state("Speech ended");
+  on_stt_end:
+    - lambda: |-
+        id(request_text).publish_state(x);
+        id(display_spi).update();
+  on_tts_start:
+    - lambda: id(response_text).publish_state(x);
+  on_tts_end:
+    - lambda: |-
+        id(response_text).publish_state(x);
+        id(display_spi).update();
+  on_tts_stream_start:
+    - lambda: id(status_text).publish_state("Speaking...");
+  on_tts_stream_end:
+    - lambda: id(status_text).publish_state("Finished");
+  on_end:
+    - lambda: |-
+        id(status_text).publish_state("Done");
+        id(display_spi).update();
+  on_error:
+    - lambda: |-
+        id(status_text).publish_state("Error: " + code);
+        id(display_spi).update();
+  on_idle:
+    - lambda: |-
+        id(status_text).publish_state("Idle");
+        id(display_spi).update();
+    - micro_wake_word.start:
+        id: mww
+  on_client_connected:
+    - lambda: id(status_text).publish_state("OpenAI connected");
+  on_client_disconnected:
+    - lambda: id(status_text).publish_state("OpenAI disconnected");
+
+# Heartbeat + watchdog: log MWW state every 10s and restart MWW when it has
+# stopped AND openai_assistant is not actively running a conversation.
+script:
+  - id: mww_heartbeat
+    mode: single
+    then:
+      - while:
+          condition:
+            lambda: return true;
+          then:
+            - lambda: |-
+                bool mww_running = id(mww).is_running();
+                bool openai_running = id(openai).is_running();
+                bool enabled = id(hey_jarvis_model)->is_enabled();
+                ESP_LOGI("mww_heartbeat", "mww running=%s model_enabled=%s openai_running=%s",
+                         YESNO(mww_running), YESNO(enabled), YESNO(openai_running));
+            - if:
+                condition:
+                  lambda: return !id(mww).is_running() && !id(openai).is_running();
+                then:
+                  - logger.log: "MWW stopped and openai idle; restarting wake word"
+                  - micro_wake_word.start:
+                      id: mww
+            - delay: 10s
+
+# Status and transcript text sensors
+text_sensor:
+  - platform: template
+    id: status_text
+    name: "${friendly_name} Status"
+    update_interval: never
+  - platform: template
+    id: request_text
+    name: "${friendly_name} Request"
+    update_interval: never
+  - platform: template
+    id: response_text
+    name: "${friendly_name} Response"
+    update_interval: never
+
+spi:
+  id: spi_bus
+  clk_pin: 7
+  mosi_pin: 6
+
+display:
+  - platform: mipi_spi
+    id: display_spi
+    spi_id: spi_bus
+    model: S3BOX
+    invert_colors: false
+    cs_pin: 5
+    dc_pin: 4
+    reset_pin:
+      number: 48
+      inverted: true
+    lambda: |-
+      it.printf(0, 0, id(font_status), "Status: %s", id(status_text).state.c_str());
+      it.printf(0, 40, id(font_text), "You: %s", id(request_text).state.c_str());
+      it.printf(0, 120, id(font_text), "Assistant: %s", id(response_text).state.c_str());
+
+font:
+  - file: "gfonts://Roboto"
+    id: font_status
+    size: 20
+  - file: "gfonts://Roboto"
+    id: font_text
+    size: 16
+
+color:
+  - id: my_white
+    white: 100%
+
+output:
+  - platform: ledc
+    id: backlight_output
+    pin: GPIO47
+
+light:
+  - platform: monochromatic
+    id: led
+    name: Screen
+    icon: "mdi:television"
+    entity_category: "config"
+    output: backlight_output
+    restore_mode: RESTORE_DEFAULT_ON
+    default_transition_length: 250ms
+
+# binary_sensor:
+#   - platform: gpio
+#     id: mute_button
+#     pin:
+#       number: GPIO0
+#       mode:
+#         input: true
+#         pullup: true
+#       inverted: true
+#
+# switch:
+#   - platform: template
+#     id: mute_switch
+#     name: "Mute microphone"
+#     optimistic: true
+#     turn_on_action:
+#       - microphone.mute: box_mic
+#     turn_off_action:
+#       - microphone.unmute: box_mic
