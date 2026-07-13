@@ -25,7 +25,7 @@ substitutions:
 
   # Multimodal chat model: accepts audio input directly (no separate STT step).
   # For a non-multimodal model, set stt_model below to run in STT+LLM mode.
-  openai_chat_model: "gemma-4-26b-a4b-it-qat"
+  openai_chat_model: "gemma-4-12b-it-GGUF"
 
   # TTS model + voice. The user's server runs piper (kokoro-compatible).
   openai_tts_model: "voice-en_US-joe-medium"
@@ -36,8 +36,9 @@ substitutions:
   openai_prompt: >-
     You are Jeeves, a voice assistant. Your responses are spoken aloud by a text-to-speech system, so you must write in a way that sounds like natural human conversation.
     General Rules:Respond in English only.
-    Do not use any markdown (no bold, italics, headers, lists, etc.).
+    Do not use any markdown (no bold, italics, headers, bullet points, numbered lists, asterisks, or pound signs). This is CRITICAL for voice output.
     Your Text-To-Speech system cannot read markdown; if you include it, it will be spoken literally or sound robotic.
+    When summarizing research or long-form content, present it as flowing paragraphs of spoken prose, not as structured sections with headers.
     Be succinct.
     Do not ask follow-up questions.
     Do not reveal your "thinking" process. Only output the final response.
@@ -125,9 +126,16 @@ globals:
 # The API is used here only for the dashboard/OTA integration; openai_responses
 # does NOT call Home Assistant services via the api (it talks directly to the LLM
 # server). The on_client_connected hook boots the wake-word engine on startup.
+# A service is exposed to stop a turn remotely (the touch button may not fire
+# during TTS playback due to I2C/display contention).
 api:
   encryption:
     key: !secret jarviskey
+  services:
+    - service: stop_assistant
+      then:
+        - openai_responses.stop:
+            id: openai
   on_client_connected:
     - logger.log: "API connected, starting wake word"
     - lambda: |-
@@ -191,19 +199,52 @@ i2s_audio:
 
 # --- Touchscreen -------------------------------------------------------------
 # The S3-Box-3 uses a GT911 capacitive touch controller on the shared I2C
-# bus. Touch point index 0 is the red home button below the screen.
+# bus. The gt911 keeps its interrupt_pin (GPIO3) for normal display touch
+# operation. The stop button uses a template binary_sensor that polls GPIO3
+# directly via gpio_get_level() — this reads the raw pin state without
+# claiming the pin or doing any I2C, so it works even during TTS playback
+# when the I2C bus is busy.
 touchscreen:
   - platform: gt911
     id: box_touchscreen
     display: display_spi
     i2c_id: i2c_adc_dac
     interrupt_pin: GPIO3
+    on_touch:
+      - lambda: |-
+          // Secondary stop: if the gt911 I2C read succeeds, stop on bottom-area touch.
+          if (id(openai).is_running() && touch.y > 200) {
+            id(openai).request_stop();
+          }
 
 # --- Binary sensors ----------------------------------------------------------
-# The S3-Box-3 home button is the red capacitive circle below the screen
-# (gt911 touch point index 0). Pressing it immediately stops any in-progress
-# conversation and returns to idle.
+# The S3-Box-3 home button is the red capacitive circle below the screen.
+#
+# The gt911 binary_sensor (index 0) relies on an I2C read after the GPIO
+# interrupt fires — if the I2C bus is busy during TTS playback (display
+# update, ADC read), the touch event is never processed and the button
+# appears dead.
+#
+# To work around this, a template binary_sensor polls GPIO3 (the gt911 IRQ
+# pin) directly via gpio_get_level(). This reads the raw hardware pin state
+# without claiming the pin or touching the I2C bus — it's a microsecond
+# operation that works regardless of what's happening on I2C. The gt911
+# IRQ line is active-low (pulled low on touch), so level 0 = touched.
 binary_sensor:
+  # Primary stop: raw GPIO3 polling via ESP-IDF (no I2C, no pin conflict).
+  # Template binary sensors are evaluated on every loop() pass, so the poll
+  # rate is effectively the loop frequency (~10ms).
+  - platform: template
+    name: "S3 Box Home Button (GPIO)"
+    id: screen_home_key_gpio
+    lambda: |-
+      return gpio_get_level(GPIO_NUM_3) == 0;
+    on_press:
+      - lambda: |-
+          if (id(openai).is_running()) {
+            id(openai).request_stop();
+          }
+  # Secondary stop: gt911 touch point 0 (works when I2C is free).
   - platform: gt911
     name: "S3 Box Home Button"
     id: screen_home_key

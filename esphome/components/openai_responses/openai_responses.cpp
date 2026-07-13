@@ -149,6 +149,80 @@ static std::string escape_json_string_(const std::string &input) {
   return out;
 }
 
+// Strip common markdown formatting from text before sending to TTS. Models
+// don't always follow "no markdown" instructions, and TTS systems read
+// markdown syntax literally (e.g., "hash hash hash one" for "### 1.").
+// This removes: headers (###), bold/italic markers (**, *, __, _), bullet
+// points (-, *), numbered lists (1.), and extra blank lines.
+static std::string strip_markdown_(const std::string &input) {
+  std::string out;
+  out.reserve(input.size());
+  size_t i = 0;
+  bool at_line_start = true;
+  while (i < input.size()) {
+    char c = input[i];
+
+    // Strip markdown headers at line start: #, ##, ###, etc.
+    if (at_line_start && c == '#') {
+      while (i < input.size() && input[i] == '#') {
+        i++;
+      }
+      // Skip the space after the hashes.
+      while (i < input.size() && input[i] == ' ') {
+        i++;
+      }
+      at_line_start = false;
+      continue;
+    }
+
+    // Strip bullet points at line start: - or * followed by space
+    if (at_line_start && (c == '-' || c == '*') && i + 1 < input.size() && input[i + 1] == ' ') {
+      i += 2;
+      at_line_start = false;
+      continue;
+    }
+
+    // Strip numbered list at line start: "1. ", "2. ", etc.
+    if (at_line_start && c >= '0' && c <= '9') {
+      size_t j = i;
+      while (j < input.size() && input[j] >= '0' && input[j] <= '9') {
+        j++;
+      }
+      if (j < input.size() && input[j] == '.' && j + 1 < input.size() && input[j + 1] == ' ') {
+        i = j + 2;
+        at_line_start = false;
+        continue;
+      }
+    }
+
+    // Strip bold/italic markers: **text**, *text*, __text__, _text_
+    if (c == '*' || c == '_') {
+      // Check for double (**) or single (*)
+      if (i + 1 < input.size() && input[i + 1] == c) {
+        i += 2;
+        continue;
+      }
+      i++;
+      continue;
+    }
+
+    // Track line position for at_line_start detection.
+    if (c == '\n') {
+      at_line_start = true;
+      // Collapse multiple blank lines into one.
+      if (!out.empty() && out.back() == '\n') {
+        i++;
+        continue;
+      }
+    } else if (c != ' ' && c != '\t') {
+      at_line_start = false;
+    }
+
+    out.push_back(c);
+    i++;
+  }
+  return out;
+}
 // --- Lifecycle -------------------------------------------------------------
 
 OpenAIResponses::OpenAIResponses() = default;
@@ -754,7 +828,13 @@ void OpenAIResponses::request_stop() {
   if (this->state_ == State::IDLE) {
     return;
   }
-  ESP_LOGV(TAG, "request_stop (state=%u)", (unsigned) this->state_);
+  ESP_LOGI(TAG, "Stop requested (state=%u)", (unsigned) this->state_);
+  // Immediately stop the speaker so audio doesn't keep playing while we wait
+  // for the loop to process the ERROR_TEARDOWN state. The HTTP task (if
+  // running) is killed by ERROR_TEARDOWN on the next loop pass.
+  if (this->speaker_ != nullptr && !this->speaker_->is_stopped()) {
+    this->speaker_->stop();
+  }
   // An explicit stop is not an error: teardown without firing on_error.
   this->set_state_(State::ERROR_TEARDOWN);
 }
@@ -2044,17 +2124,11 @@ void OpenAIResponses::build_chat_request_body_from_history_() {
     body += "]";
     // Mark all current messages as sent so the next round only sends new ones.
     this->turn_messages_sent_count_ = this->turn_messages_.size();
-    // Include tools + tool_choice so the model knows how to format tool calls
-    // (some servers don't restore tools from the stored response).
-    body += ",\"tool_choice\":\"auto\"";
-    if (!this->cached_tools_json_.empty()) {
-      body += ",\"tools\":" + this->cached_tools_json_;
-    } else
-#ifdef USE_OPENAI_RESPONSES_TOOLS
-    if (this->has_tools_) {
-      body += ",\"tools\":" + std::string(TOOLS_JSON);
-    }
-#endif
+    // Per the spec, previous_response_id restores the prior response's full
+    // input (including tools and instructions), so we don't re-send them.
+    // This shrinks the round-2 request by ~16KB and the server's lifecycle
+    // events (response.created/completed) shrink accordingly since they no
+    // longer echo the tools array back.
     body += "}";
 
     ExternalRAMAllocator<uint8_t> ext(ExternalRAMAllocator<uint8_t>::ALLOC_EXTERNAL);
@@ -2876,6 +2950,10 @@ void OpenAIResponses::loop() {
 #endif
         }
       }
+      // Strip markdown formatting from the response text before TTS — models
+      // don't always follow "no markdown" instructions, and TTS reads markdown
+      // syntax literally (e.g., "hash hash hash" for "###").
+      this->response_text_ = strip_markdown_(this->response_text_);
       ESP_LOGD(TAG, "Chat response (%u chars): %s", (unsigned) this->response_text_.size(),
                this->response_text_.c_str());
       // Build the TTS request and start the HTTP task BEFORE firing
