@@ -133,13 +133,14 @@ bool OpenAIAssistant::allocate_buffers_() {
     }
   }
 
-  if (this->speaker_buffer_ == nullptr) {
-    ExternalRAMAllocator<uint8_t> allocator(ExternalRAMAllocator<uint8_t>::ALLOC_EXTERNAL);
-    this->speaker_buffer_ = allocator.allocate(SPEAKER_BUFFER_SIZE);
-    if (this->speaker_buffer_ == nullptr) {
-      ESP_LOGE(TAG, "Could not allocate speaker buffer");
-      return false;
-    }
+  this->audio_delta_mutex_ = xSemaphoreCreateMutex();
+  if (this->audio_delta_mutex_ == nullptr) {
+    ESP_LOGE(TAG, "Failed to create audio delta mutex");
+    return false;
+  }
+  if (!this->audio_buffer_.init()) {
+    ESP_LOGE(TAG, "Failed to allocate PSRAM audio buffer");
+    return false;
   }
 
   return true;
@@ -149,18 +150,16 @@ void OpenAIAssistant::clear_buffers_() {
   if (this->ring_buffer_ != nullptr) {
     this->ring_buffer_->reset();
   }
-  if (this->speaker_buffer_ != nullptr) {
-    memset(this->speaker_buffer_, 0, SPEAKER_BUFFER_SIZE);
-  }
-  this->speaker_buffer_index_ = 0;
+  this->audio_buffer_.reset();
 }
 
 void OpenAIAssistant::deallocate_buffers_() {
+  this->stop_audio_pipeline_();
   this->ring_buffer_.reset();
-  if (this->speaker_buffer_ != nullptr) {
-    ExternalRAMAllocator<uint8_t> allocator(ExternalRAMAllocator<uint8_t>::ALLOC_EXTERNAL);
-    allocator.deallocate(this->speaker_buffer_, SPEAKER_BUFFER_SIZE);
-    this->speaker_buffer_ = nullptr;
+  this->audio_buffer_.deinit();
+  if (this->audio_delta_mutex_ != nullptr) {
+    vSemaphoreDelete(this->audio_delta_mutex_);
+    this->audio_delta_mutex_ = nullptr;
   }
   // Free all queued audio deltas
   for (auto &delta : this->audio_delta_queue_) {
@@ -316,6 +315,8 @@ void OpenAIAssistant::request_stop() {
     case State::AWAITING_RESPONSE:
     case State::STREAMING_RESPONSE:
     case State::DRAINING_AUDIO:
+      this->audio_buffer_.request_exit();
+      this->stop_audio_pipeline_();
       this->finish_response_now_();
       break;
   }
@@ -326,15 +327,16 @@ void OpenAIAssistant::finish_response_() {
     return;
   }
 
-  // If there's still audio in the decode queue or the speaker is playing,
-  // don't tear down yet — transition to DRAINING_AUDIO and let loop() finish
-  // the response once all audio has been played. response.done can arrive
-  // before the streamed audio deltas have been fully decoded and sent to
-  // the speaker.
-  if (!this->audio_delta_queue_.empty() ||
-      (this->speaker_ != nullptr && !this->speaker_->is_stopped() && this->speaker_buffer_index_ > 0)) {
-    ESP_LOGD(TAG, "Deferring finish_response_ — %u deltas queued, %u bytes buffered",
-             (unsigned) this->audio_delta_queue_.size(), (unsigned) this->speaker_buffer_index_);
+  // Tell the audio producer that no more deltas are coming. The producer
+  // task will finish decoding remaining deltas, write to the ring buffer,
+  // and the feeder will drain before signaling stream_done.
+  this->audio_buffer_.set_producer_done();
+
+  // If there's still audio in the decode queue or the feeder is still
+  // playing, don't tear down yet — transition to DRAINING_AUDIO and let
+  // loop() finish the response once the feeder signals stream_done.
+  if (this->audio_producer_task_.is_created() || this->audio_buffer_.is_feeder_active()) {
+    ESP_LOGD(TAG, "Deferring finish_response_ — audio pipeline still active");
     this->cancel_response_timeout_();
     this->pending_finish_ = true;
     this->set_state_(State::DRAINING_AUDIO);
@@ -345,14 +347,7 @@ void OpenAIAssistant::finish_response_() {
 }
 
 void OpenAIAssistant::finish_response_now_() {
-  if (this->tts_streaming_) {
-    this->tts_streaming_ = false;
-    this->flush_speaker_buffer_();
-    if (this->speaker_ != nullptr) {
-      this->speaker_->finish();
-    }
-    this->tts_stream_end_trigger_.trigger();
-  }
+  this->stop_audio_pipeline_();
 
   this->publish_response_text_(this->response_text_, true);
   this->end_trigger_.trigger();
@@ -626,10 +621,8 @@ void OpenAIAssistant::handle_json_message_(const uint8_t *data, size_t len) {
     if (this->state_ == State::AWAITING_RESPONSE) {
       this->set_state_(State::STREAMING_RESPONSE);
     }
-    if (!this->tts_streaming_) {
-      this->tts_streaming_ = true;
-      this->tts_stream_start_trigger_.trigger();
-    }
+    // handle_audio_delta_() starts the audio pipeline (which fires
+    // tts_stream_start_trigger_) on the first delta.
     this->last_response_event_time_ = millis();
     this->start_response_timeout_();
     return;
@@ -649,7 +642,7 @@ void OpenAIAssistant::handle_json_message_(const uint8_t *data, size_t len) {
   // the speaker and reset the timeout.
   if (is_audio_done) {
     ESP_LOGD(TAG, "Received event: response.output_audio.done (fast-path, %u bytes)", (unsigned) len);
-    this->flush_speaker_buffer_();
+    this->audio_buffer_.set_producer_done();
     this->last_response_event_time_ = millis();
     this->start_response_timeout_();
     return;
@@ -729,10 +722,9 @@ void OpenAIAssistant::handle_json_message_(const uint8_t *data, size_t len) {
       if (this->state_ == State::AWAITING_RESPONSE) {
         this->set_state_(State::STREAMING_RESPONSE);
       }
-      if (!this->tts_streaming_) {
-        this->tts_streaming_ = true;
-        this->tts_stream_start_trigger_.trigger();
-      }
+      // tts_stream_start_trigger_ is fired by start_audio_pipeline_() when
+      // the first audio delta arrives. Text transcript deltas typically
+      // arrive around the same time as audio deltas.
       this->last_response_event_time_ = millis();
       this->start_response_timeout_();
     } else if (strcmp(type, "response.output_audio_transcript.done") == 0 ||
@@ -745,7 +737,7 @@ void OpenAIAssistant::handle_json_message_(const uint8_t *data, size_t len) {
       this->start_response_timeout_();
     } else if (strcmp(type, "response.output_audio.done") == 0 ||
                strcmp(type, "response.audio.done") == 0) {
-      this->flush_speaker_buffer_();
+      this->audio_buffer_.set_producer_done();
       this->last_response_event_time_ = millis();
       this->start_response_timeout_();
     } else if (strcmp(type, "response.output_item.done") == 0) {
@@ -782,150 +774,141 @@ void OpenAIAssistant::handle_json_message_(const uint8_t *data, size_t len) {
 }
 
 void OpenAIAssistant::handle_audio_delta_(const char *delta, size_t len) {
-  if (this->speaker_ == nullptr || this->speaker_buffer_ == nullptr || len == 0) {
+  if (this->speaker_ == nullptr || len == 0) {
     return;
   }
 
-  // Start the speaker on the first audio delta.
-  // Don't call set_audio_stream_info or set_mute_state — voice_assistant
-  // doesn't, and the speaker is already configured from the YAML (24kHz).
-  // Explicitly setting stream info may reconfigure I2S in a way that breaks
-  // output on the ES8311.
-  if (this->speaker_->is_stopped()) {
-    this->speaker_->start();
+  // Start the audio pipeline on the first delta of a response.
+  if (!this->tts_streaming_) {
+    this->start_audio_pipeline_();
   }
 
-  // Push the delta onto the PSRAM-backed queue. process_pending_audio_delta_()
-  // in loop() decodes deltas in order, one chunk per loop iteration, so this
-  // never blocks. No audio is lost — deltas accumulate and are processed in
-  // sequence. The queue is capped to prevent unbounded growth if the speaker
-  // can't keep up (e.g. playback slower than network).
-  if (this->audio_delta_queue_.size() >= MAX_AUDIO_DELTA_QUEUE) {
-    ESP_LOGW(TAG, "Audio delta queue full (%u); dropping oldest delta", (unsigned) MAX_AUDIO_DELTA_QUEUE);
-    free(this->audio_delta_queue_.front().data);
-    this->audio_delta_queue_.erase(this->audio_delta_queue_.begin());
+  // Push the delta onto the PSRAM-backed queue. The audio producer task
+  // will pop and decode it. The queue is capped to prevent unbounded growth.
+  if (this->audio_delta_mutex_ != nullptr) {
+    xSemaphoreTake(this->audio_delta_mutex_, portMAX_DELAY);
+    if (this->audio_delta_queue_.size() >= MAX_AUDIO_DELTA_QUEUE) {
+      ESP_LOGW(TAG, "Audio delta queue full (%u); dropping oldest delta", (unsigned) MAX_AUDIO_DELTA_QUEUE);
+      free(this->audio_delta_queue_.front().data);
+      this->audio_delta_queue_.erase(this->audio_delta_queue_.begin());
+    }
+    ExternalRAMAllocator<uint8_t> allocator(ExternalRAMAllocator<uint8_t>::ALLOC_EXTERNAL);
+    uint8_t *buf = allocator.allocate(len);
+    if (buf != nullptr) {
+      memcpy(buf, delta, len);
+      this->audio_delta_queue_.push_back({buf, len});
+    } else {
+      ESP_LOGW(TAG, "Could not allocate %u bytes in PSRAM for audio delta; dropping", (unsigned) len);
+    }
+    xSemaphoreGive(this->audio_delta_mutex_);
   }
 
-  ExternalRAMAllocator<uint8_t> allocator(ExternalRAMAllocator<uint8_t>::ALLOC_EXTERNAL);
-  uint8_t *buf = allocator.allocate(len);
-  if (buf == nullptr) {
-    ESP_LOGW(TAG, "Could not allocate %u bytes in PSRAM for audio delta; dropping", (unsigned) len);
-    return;
-  }
-  memcpy(buf, delta, len);
-  this->audio_delta_queue_.push_back({buf, len, 0});
   this->response_audio_chunks_received_++;
+  this->last_response_event_time_ = millis();
+  this->start_response_timeout_();
 }
 
-void OpenAIAssistant::process_pending_audio_delta_() {
-  if (this->speaker_buffer_ == nullptr || this->audio_delta_queue_.empty()) {
-    return;
+void OpenAIAssistant::start_audio_pipeline_() {
+  this->audio_buffer_.reset();
+  // Realtime API outputs 24kHz mono 16-bit PCM
+  this->audio_buffer_.start_feeder(this->speaker_, 24000, 16, 1);
+  this->audio_producer_should_exit_ = false;
+  if (!this->audio_producer_task_.create(OpenAIAssistant::audio_producer_task_fn_,
+                                          "oai_aud_prod", AUDIO_PRODUCER_STACK_SIZE,
+                                          this, AUDIO_TASK_PRIORITY, false)) {
+    ESP_LOGE(TAG, "Failed to create audio producer task");
   }
+  this->tts_streaming_ = true;
+  this->tts_stream_start_trigger_.trigger();
+}
 
-  // Process ONE chunk from the front of the queue per call. Each chunk may
-  // trigger a flush to the speaker, and speaker_->play() can block for up to
-  // 500ms. One chunk per loop() iteration bounds the blocking to a single
-  // play() call, keeping the main loop responsive and the task watchdog fed.
-  AudioDelta &delta = this->audio_delta_queue_.front();
-
-  if (delta.offset >= delta.len) {
-    // This delta is fully consumed — free it and pop from queue.
-    free(delta.data);
-    this->audio_delta_queue_.erase(this->audio_delta_queue_.begin());
-    return;
-  }
-
-  size_t remaining_b64 = delta.len - delta.offset;
-  size_t free_space = SPEAKER_BUFFER_SIZE - this->speaker_buffer_index_;
-
-  if (free_space < 3) {
-    // Buffer is full — flush to speaker.
-    size_t before_flush = this->speaker_buffer_index_;
-    this->flush_speaker_buffer_();
-    free_space = SPEAKER_BUFFER_SIZE - this->speaker_buffer_index_;
-    if (free_space < 3 || this->speaker_buffer_index_ >= before_flush) {
-      // Speaker didn't accept any data (play() returned 0). Yield back to
-      // loop() — the speaker task will drain its ring buffer at playback
-      // rate and we'll retry next iteration.
-      return;
-    }
-  }
-
-  // Each 4 base64 chars decode to 3 bytes.
-  size_t b64_chars_for_free = (free_space / 3) * 4;
-  size_t b64_chunk = std::min(remaining_b64, b64_chars_for_free);
-  b64_chunk -= (b64_chunk % 4);  // keep base64 alignment
-
-  if (b64_chunk == 0) {
-    // Not enough free space for even one base64 group — flush and return.
-    this->flush_speaker_buffer_();
-    return;
-  }
-
-  size_t before_index = this->speaker_buffer_index_;
-  size_t decoded = base64_decode(
-      delta.data + delta.offset, b64_chunk,
-      this->speaker_buffer_ + this->speaker_buffer_index_,
-      SPEAKER_BUFFER_SIZE - this->speaker_buffer_index_);
-
-  if (decoded == 0) {
-    this->flush_speaker_buffer_();
-    decoded = base64_decode(
-        delta.data + delta.offset, b64_chunk,
-        this->speaker_buffer_, SPEAKER_BUFFER_SIZE);
-    if (decoded == 0) {
-      ESP_LOGW(TAG, "Failed to decode audio delta chunk at offset %u", (unsigned) delta.offset);
-      delta.offset += b64_chunk;  // skip bad chunk
-      return;
-    }
-    before_index = 0;
-  }
-
-  // Apply volume multiplier to the newly decoded samples.
-  if (this->volume_multiplier_ != 1.0f) {
-    size_t samples = decoded / sizeof(int16_t);
-    int16_t *samples_ptr = reinterpret_cast<int16_t *>(this->speaker_buffer_ + before_index);
-    static uint32_t clip_warn_count = 0;
-    for (size_t i = 0; i < samples; i++) {
-      float scaled = static_cast<float>(samples_ptr[i]) * this->volume_multiplier_;
-      if (scaled > INT16_MAX) {
-        scaled = INT16_MAX;
-        if (clip_warn_count < 5) {
-          clip_warn_count++;
-          ESP_LOGW(TAG, "volume_multiplier is too high: sample=%d * %.2f = %.0f (clipped to %d)",
-                   samples_ptr[i], this->volume_multiplier_, static_cast<float>(samples_ptr[i]) * this->volume_multiplier_, INT16_MAX);
-        }
-      } else if (scaled < INT16_MIN) {
-        scaled = INT16_MIN;
-        if (clip_warn_count < 5) {
-          clip_warn_count++;
-          ESP_LOGW(TAG, "volume_multiplier is too low: sample=%d * %.2f = %.0f (clipped to %d)",
-                   samples_ptr[i], this->volume_multiplier_, static_cast<float>(samples_ptr[i]) * this->volume_multiplier_, INT16_MIN);
-        }
+void OpenAIAssistant::stop_audio_pipeline_() {
+  this->audio_producer_should_exit_ = true;
+  this->audio_buffer_.request_exit();
+  this->audio_buffer_.set_producer_done();
+  if (this->audio_producer_task_.is_created()) {
+    for (int i = 0; i < 50; i++) {
+      if (eTaskGetState(this->audio_producer_task_.get_handle()) == eSuspended) {
+        break;
       }
-      samples_ptr[i] = static_cast<int16_t>(scaled);
+      vTaskDelay(pdMS_TO_TICKS(10));
     }
+    this->audio_producer_task_.destroy();
   }
-
-  this->speaker_buffer_index_ += decoded;
-  this->response_audio_bytes_received_ += decoded;
-  delta.offset += b64_chunk;
-
-  // Flush when buffer is full.
-  if (this->speaker_buffer_index_ >= SPEAKER_BUFFER_SIZE) {
-    this->flush_speaker_buffer_();
+  this->audio_buffer_.stop_feeder();
+  if (this->tts_streaming_) {
+    this->tts_streaming_ = false;
+    this->tts_stream_end_trigger_.trigger();
   }
 }
 
-void OpenAIAssistant::flush_speaker_buffer_() {
-  if (this->speaker_ == nullptr || this->speaker_buffer_ == nullptr || this->speaker_buffer_index_ == 0) {
-    return;
+void OpenAIAssistant::audio_producer_task_fn_(void *arg) {
+  OpenAIAssistant *self = (OpenAIAssistant *) arg;
+  // Decode buffer: 3 bytes PCM per 4 base64 chars. Use 4KB chunks.
+  uint8_t decode_buf[4096];
+
+  while (!self->audio_producer_should_exit_) {
+    // Pop a delta from the queue (mutex-protected)
+    AudioDelta delta;
+    bool got_delta = false;
+    if (self->audio_delta_mutex_ != nullptr) {
+      xSemaphoreTake(self->audio_delta_mutex_, portMAX_DELAY);
+      if (!self->audio_delta_queue_.empty()) {
+        delta = self->audio_delta_queue_.front();
+        self->audio_delta_queue_.erase(self->audio_delta_queue_.begin());
+        got_delta = true;
+      }
+      xSemaphoreGive(self->audio_delta_mutex_);
+    }
+
+    if (!got_delta) {
+      // No deltas available. If response is done, signal producer done.
+      // Otherwise wait briefly and retry.
+      vTaskDelay(pdMS_TO_TICKS(10));
+      continue;
+    }
+
+    // Decode the base64 delta in chunks and write PCM to the ring buffer.
+    size_t offset = 0;
+    while (offset < delta.len && !self->audio_producer_should_exit_) {
+      size_t remaining = delta.len - offset;
+      size_t b64_chunk = std::min(remaining, (size_t) 4096);
+      b64_chunk -= (b64_chunk % 4);  // keep base64 alignment
+
+      if (b64_chunk == 0) {
+        break;
+      }
+
+      size_t decoded = base64_decode(
+          delta.data + offset, b64_chunk, decode_buf, sizeof(decode_buf));
+
+      if (decoded > 0) {
+        // Apply volume multiplier to decoded int16 samples
+        if (self->volume_multiplier_ != 1.0f) {
+          size_t num_samples = decoded / sizeof(int16_t);
+          int16_t *samples = reinterpret_cast<int16_t *>(decode_buf);
+          for (size_t i = 0; i < num_samples; i++) {
+            float scaled = (float) samples[i] * self->volume_multiplier_;
+            if (scaled > 32767.0f) scaled = 32767.0f;
+            else if (scaled < -32768.0f) scaled = -32768.0f;
+            samples[i] = (int16_t) scaled;
+          }
+        }
+        self->audio_buffer_.write(decode_buf, decoded);
+      }
+
+      offset += b64_chunk;
+    }
+
+    // Free the delta's PSRAM allocation
+    free(delta.data);
+    self->response_audio_bytes_received_ += delta.len;
   }
-  size_t written = this->speaker_->play(this->speaker_buffer_, this->speaker_buffer_index_);
-  if (written > 0 && written < this->speaker_buffer_index_) {
-    memmove(this->speaker_buffer_, this->speaker_buffer_ + written, this->speaker_buffer_index_ - written);
-  }
-  this->speaker_buffer_index_ -= written;
+
+  // Signal the feeder that no more audio is coming
+  self->audio_buffer_.set_producer_done();
+  ESP_LOGD(TAG, "Audio producer task finished");
+  vTaskSuspend(nullptr);
 }
 
 void OpenAIAssistant::log_response_status_(JsonObject root) {
@@ -1081,41 +1064,25 @@ void OpenAIAssistant::loop() {
     }
 
     case State::AWAITING_RESPONSE:
-      // Also process pending audio deltas here — the first audio delta can
-      // arrive while still nominally AWAITING_RESPONSE (state transitions to
-      // STREAMING_RESPONSE inside the handler).
-      this->process_pending_audio_delta_();
       // Waiting for response events; timeouts handled by start_response_timeout_.
       break;
 
     case State::STREAMING_RESPONSE:
-      // Decode audio deltas incrementally to avoid blocking the main loop.
-      this->process_pending_audio_delta_();
+      // Check for stream completion signaled by the feeder task.
+      if (this->audio_buffer_.is_stream_done()) {
+        this->audio_buffer_.clear_stream_done();
+        this->set_state_(State::DRAINING_AUDIO);
+      }
       // Continue receiving response events; timeouts handled by start_response_timeout_.
       break;
 
     case State::DRAINING_AUDIO:
-      // response.done was received but audio is still being decoded/played.
-      // Continue processing the audio queue. When the queue is empty, flush
-      // the speaker buffer and signal the speaker to finish. Wait for the
-      // speaker to actually stop before tearing down — the speaker task may
-      // still be playing from its ring buffer / DMA buffers.
-      this->process_pending_audio_delta_();
-      if (this->audio_delta_queue_.empty()) {
-        this->flush_speaker_buffer_();
-        // Signal the speaker to drain and stop (idempotent — safe to call
-        // every loop iteration until is_stopped() returns true).
-        if (this->speaker_ != nullptr && !this->speaker_->is_stopped()) {
-          this->speaker_->finish();
-          // If the speaker has no buffered data left, it's done playing —
-          // don't wait for the task to fully exit.
-          if (!this->speaker_->has_buffered_data() && this->speaker_buffer_index_ == 0) {
-            this->finish_response_now_();
-          }
-        } else {
-          // Speaker has stopped — safe to tear down.
-          this->finish_response_now_();
-        }
+      // Poll the audio buffer for stream completion. The feeder task drains
+      // the ring buffer, finishes the speaker, and sets stream_done.
+      if (this->audio_buffer_.is_stream_done()) {
+        this->audio_buffer_.clear_stream_done();
+        this->stop_audio_pipeline_();
+        this->finish_response_now_();
       }
       break;
   }

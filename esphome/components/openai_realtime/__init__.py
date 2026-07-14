@@ -16,7 +16,7 @@ from esphome.const import (
 )
 from esphome.core import CORE
 
-AUTO_LOAD = ["audio", "json", "ring_buffer"]
+AUTO_LOAD = ["audio", "json", "ring_buffer", "openai_common"]
 DEPENDENCIES = ["microphone", "micro_wake_word", "network", "psram"]
 
 CODEOWNERS = ["@edk4971"]
@@ -294,6 +294,7 @@ async def to_code(config):
         )
 
     cg.add_define("USE_OPENAI_ASSISTANT")
+    cg.add_define("USE_OPENAI_COMMON")
     esp32.add_idf_component(name="espressif/esp_websocket_client", ref="1.4.0")
 
 

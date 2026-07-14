@@ -7,10 +7,12 @@
 #include "esphome/core/automation.h"
 #include "esphome/core/component.h"
 #include "esphome/core/helpers.h"
+#include "esphome/core/static_task.h"
 
 #include "esphome/components/microphone/microphone_source.h"
 #include "esphome/components/ring_buffer/ring_buffer.h"
 #include "esphome/components/speaker/speaker.h"
+#include "esphome/components/openai_common/openai_audio.h"
 #ifdef USE_TEXT_SENSOR
 #include "esphome/components/text_sensor/text_sensor.h"
 #endif
@@ -124,8 +126,9 @@ class OpenAIAssistant : public Component {
   void handle_websocket_event_(esp_websocket_event_id_t event_id, esp_websocket_event_data_t *event_data);
   void handle_json_message_(const uint8_t *data, size_t len);
   void handle_audio_delta_(const char *delta, size_t len);
-  void process_pending_audio_delta_();
-  void flush_speaker_buffer_();
+  void start_audio_pipeline_();
+  void stop_audio_pipeline_();
+  static void audio_producer_task_fn_(void *arg);
   void log_response_status_(JsonObject root);
 
   void publish_request_text_(const std::string &text);
@@ -168,21 +171,28 @@ class OpenAIAssistant : public Component {
   float volume_multiplier_{1.0f};
 
   std::unique_ptr<ring_buffer::RingBuffer> ring_buffer_;
-  uint8_t *speaker_buffer_{nullptr};
-  static constexpr size_t SPEAKER_BUFFER_SIZE = 16384;  // PSRAM-backed; sized to hold one large audio delta
-  size_t speaker_buffer_index_{0};
 
-  // Audio delta queue. Each delta is copied into PSRAM and decoded in small
-  // chunks across multiple loop() iterations. This prevents speaker_->play()
-  // backpressure from blocking the main loop. Multiple deltas can queue up
-  // without loss — process_pending_audio_delta_() works through them in order.
+  // PSRAM ring buffer + feeder task for continuous, crackle-free speaker
+  // playback. The audio producer task decodes base64 deltas and writes PCM
+  // to the ring buffer; the feeder task (inside PsramAudioBuffer) reads PCM
+  // and feeds the speaker continuously, decoupled from the main loop.
+  openai_common::PsramAudioBuffer audio_buffer_;
+  StaticTask audio_producer_task_;
+  static constexpr uint32_t AUDIO_PRODUCER_STACK_SIZE = 4096;
+  static constexpr UBaseType_t AUDIO_TASK_PRIORITY = 3;
+  SemaphoreHandle_t audio_delta_mutex_{nullptr};
+  volatile bool audio_producer_should_exit_{false};
+
+  // Audio delta queue. Each delta is copied into PSRAM and decoded by the
+  // audio producer task (not the main loop). The queue is protected by
+  // audio_delta_mutex_ since handle_audio_delta_() (main loop) pushes and
+  // audio_producer_task_fn_ (producer task) pops.
   struct AudioDelta {
     uint8_t *data{nullptr};   // PSRAM-allocated base64 data
     size_t len{0};            // total base64 length
-    size_t offset{0};         // current decode offset
   };
   std::vector<AudioDelta> audio_delta_queue_;
-  static constexpr size_t MAX_AUDIO_DELTA_QUEUE = 32;  // safety cap
+  static constexpr size_t MAX_AUDIO_DELTA_QUEUE = 64;  // safety cap
 
   // PSRAM-backed receive buffer for assembling fragmented websocket JSON frames.
   // Allocated once in setup() and reused for every frame — avoids per-frame heap
