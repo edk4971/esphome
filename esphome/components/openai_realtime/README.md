@@ -1,15 +1,13 @@
-# openai_realtime — INCOMPLETE / NONFUNCTIONAL
+# openai_realtime
 
-> **⚠️ This component is a non-functional work in progress.**
+> **Audio playback is now fixed** — the component uses the proven `PsramAudioBuffer`
+> from `openai_common` (the same 2 MB PSRAM ring buffer + feeder task pattern
+> from `openai_responses`) for continuous, crackle-free speaker playback.
 >
-> It is kept in this repo only in case someone wants to continue the effort.
-> Development was abandoned because the Realtime API is still too new and
-> isn't uniformly supported across different OpenAI-compatible endpoints.
->
-> **For a working voice assistant, use
-> [`openai_conversations`](../openai_conversations/) instead** — it uses the
-> Chat Completions + Audio HTTP APIs and works with any OpenAI-compatible
-> server.
+> The Realtime API is still beta and may not be uniformly supported across
+> different OpenAI-compatible endpoints. If your endpoint doesn't support the
+> Realtime WebSocket API, use [`openai_conversations`](../openai_conversations/)
+> or [`openai_responses`](../openai_responses/) instead.
 
 ---
 
@@ -23,7 +21,9 @@ An ESPHome component that connects an ESP32 device directly to an OpenAI-compati
 - Beta Realtime API dialect only (`OpenAI-Beta: realtime=v1`).
 - Server-side voice activity detection (VAD) with auto-response.
 - Microphone audio streamed as `input_audio_buffer.append`.
-- Response audio decoded from base64 and played through an ESPHome `speaker`.
+- Response audio decoded from base64 and played through an ESPHome `speaker`
+  via a 2 MB PSRAM ring buffer + dedicated feeder task (from `openai_common`),
+  ensuring continuous, crackle-free playback decoupled from the main loop.
 - Optional `text_sensor` entities for transcribed request/response text.
 - Automation triggers modeled on the built-in `voice_assistant` component.
 - MCP/function tool events are logged for debugging; tool execution is assumed to happen on the Realtime API endpoint/server side.
