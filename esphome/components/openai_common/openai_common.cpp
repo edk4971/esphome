@@ -95,13 +95,10 @@ void OpenAIBase::fail_(const std::string &code, const std::string &message) {
 }
 
 void OpenAIBase::teardown_to_idle_() {
-  // Base implementation: nothing protocol-specific to clean up.
-  // Subclasses override and call this after their cleanup.
-  if (this->speaker_buffer_ != nullptr) {
-    ExternalRAMAllocator<uint8_t> allocator(ExternalRAMAllocator<uint8_t>::ALLOC_EXTERNAL);
-    allocator.deallocate(this->speaker_buffer_, SPEAKER_BUFFER_SIZE);
-    this->speaker_buffer_ = nullptr;
-  }
+  // Base implementation: reset per-turn indices for the shared members owned by
+  // OpenAIBase. The actual allocation/deallocation lifecycle of speaker_buffer_
+  // is managed by the derived class (which allocates it once in setup and frees
+  // it on destruction), so we only reset the index here — we never free it.
   this->speaker_buffer_index_ = 0;
   this->tts_header_skipped_ = false;
 }

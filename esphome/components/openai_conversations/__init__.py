@@ -40,7 +40,8 @@ from esphome.core import CORE
 # in their YAML. ``audio`` provides AudioStreamInfo, ``json`` provides the
 # ArduinoJson parse/build helpers, ``ring_buffer`` provides the thread-safe mic
 # buffer used to hand audio from the mic callback to the main loop.
-AUTO_LOAD = ["audio", "json", "ring_buffer"]
+# ``openai_common`` provides the shared OpenAIBase / OpenAIHTTPBase classes.
+AUTO_LOAD = ["audio", "json", "ring_buffer", "openai_common"]
 
 # Hard requirements: a microphone source, wake-word detection, networking and
 # PSRAM (all audio/HTTP buffers live in external RAM).
@@ -355,6 +356,7 @@ async def to_code(config):
             await automation.build_callback_automation(var, method, args, conf)
 
     cg.add_define("USE_OPENAI_CONVERSATIONS")
+    cg.add_define("USE_OPENAI_COMMON")
 
     # esp_http_client is excluded from ESPHome's ESP-IDF build by default (to
     # save compile time). Re-enable it explicitly; audio's to_code (auto-loaded)

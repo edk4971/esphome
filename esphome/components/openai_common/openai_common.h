@@ -73,7 +73,10 @@ class OpenAIBase : public Component {
   void flush_speaker_buffer_();
 
   // --- Failure signalling ---
-  void fail_(const std::string &code, const std::string &message);
+  /// Fires on_error and routes to teardown. Virtual so subclasses that defer
+  /// teardown through a state machine (e.g. waiting for the speaker/mic to stop
+  /// before cleaning up) can override instead of tearing down immediately.
+  virtual void fail_(const std::string &code, const std::string &message);
 
   // --- Callback registration (templatized to accept forwarder structs) ---
   template<typename F> void add_on_start_callback(F &&cb) { this->on_start_cb_.add(std::forward<F>(cb)); }
