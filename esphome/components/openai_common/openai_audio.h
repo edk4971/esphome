@@ -13,6 +13,8 @@
 #include <atomic>
 #include <cstring>
 
+#include <freertos/semphr.h>
+
 namespace esphome::openai_common {
 
 /// 2 MB PSRAM SPSC ring buffer with a dedicated feeder task for continuous,
@@ -67,7 +69,12 @@ class PsramAudioBuffer {
 
   /// Signal that no more audio data is coming.  The feeder will drain the
   /// remaining buffer, finish the speaker, and set the ``stream_done_`` flag.
-  void set_producer_done() { this->producer_done_ = true; }
+  void set_producer_done() {
+    this->producer_done_ = true;
+    if (this->data_ready_ != nullptr) {
+      xSemaphoreGive(this->data_ready_);
+    }
+  }
 
   /// Request the feeder and any blocked producer to exit.  Set from the
   /// stop/teardown path.

@@ -29,6 +29,8 @@
 #include <string>
 #include <vector>
 
+#include "esphome/components/openai_common/openai_audio.h"
+
 #ifdef USE_OPENAI_RESPONSES_MCP
 #include "mcp_client.h"
 #endif
@@ -286,10 +288,7 @@ class OpenAIResponses : public Component {
   // from the buffer, feeds the i2s speaker continuously).
   void start_tts_producer_task_();
   void stop_tts_producer_task_();
-  void start_speaker_feeder_task_();
-  void stop_speaker_feeder_task_();
   static void tts_producer_task_fn_(void *arg);
-  static void speaker_feeder_task_fn_(void *arg);
   // Pushes a sentence to the thread-safe tts_queue_ and wakes the producer.
   // On the first push of a turn, starts the producer + feeder tasks and fires
   // on_tts_start.
@@ -302,9 +301,6 @@ class OpenAIResponses : public Component {
   // Scans for the last sentence boundary in text. Returns the position after
   // the boundary, or 0 if none found. Requires 40+ chars before splitting.
   size_t find_sentence_boundary_(const std::string &text);
-  // Writes PCM data to the PSRAM ring buffer. Blocks if the buffer is full
-  // (natural backpressure — TTS pauses until the speaker catches up).
-  void write_to_audio_buffer_(const uint8_t *data, size_t len);
 
   // --- Response processing ---
   // Feeds bytes from the HTTP message buffer into sse_line_buffer_ and, on
@@ -435,11 +431,7 @@ class OpenAIResponses : public Component {
   // TTS producer task (pops sentences, does TTS HTTP, writes PCM to buffer).
   StaticTask tts_producer_task_;
   static constexpr uint32_t TTS_PRODUCER_STACK_SIZE = 8192;
-  // Speaker feeder task (reads PCM from buffer, feeds i2s speaker).
-  StaticTask speaker_feeder_task_;
-  static constexpr uint32_t SPEAKER_FEEDER_STACK_SIZE = 4096;
   static constexpr UBaseType_t TTS_TASK_PRIORITY = 3;
-  static constexpr size_t SPEAKER_FEEDER_CHUNK = 2048;
   volatile bool tts_task_should_exit_{false};
 
   // Thread-safe queue of sentences to TTS.
@@ -451,15 +443,9 @@ class OpenAIResponses : public Component {
   // Separate HTTP client for TTS (owned by the TTS producer task).
   esp_http_client_handle_t tts_http_client_{nullptr};
 
-  // PSRAM ring buffer (2MB) — SPSC, lock-free.
+  // PSRAM ring buffer + feeder task (2 MB, SPSC, lock-free).
   // Written by the TTS producer task, read by the speaker feeder task.
-  uint8_t *tts_audio_buffer_{nullptr};
-  static constexpr size_t TTS_AUDIO_BUFFER_SIZE = 2 * 1024 * 1024;
-  std::atomic<size_t> tts_audio_write_offset_{0};
-  std::atomic<size_t> tts_audio_read_offset_{0};
-  SemaphoreHandle_t tts_audio_data_ready_{nullptr};      // producer → feeder
-  SemaphoreHandle_t tts_audio_space_available_{nullptr};  // feeder → producer
-  std::atomic<bool> tts_audio_producer_done_{false};
+  openai_common::PsramAudioBuffer audio_buffer_;
 
   // Sentence accumulator for streaming TTS.
   std::string tts_pending_text_;
