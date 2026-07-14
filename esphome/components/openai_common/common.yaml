@@ -1,0 +1,615 @@
+# =============================================================================
+# OpenAI voice assistant — master config for the ESP32-S3-Box-3.
+#
+# This is the file you compile. It contains all shared S3-Box-3 hardware and
+# platform config. To switch between the three components (responses,
+# conversations, realtime), change the !include line at the very bottom under
+# `packages:`.
+#
+# The shared sections below use generic `openai.start` / `openai.stop` /
+# `openai.is_running` actions that are registered by whichever component is
+# included — so the hardware config works identically regardless of the
+# component choice.
+# =============================================================================
+
+# --- Substitutions -----------------------------------------------------------
+# Centralized values so you can tweak them in one place.
+substitutions:
+  device_name: esp32-s3-box-3-640554
+  friendly_name: Jarvis
+
+  # Base URL of the OpenAI-compatible server (no trailing slash).
+  # - responses/conversations: appends /v1/responses, /v1/chat/completions,
+  #   /v1/audio/transcriptions, /v1/audio/speech
+  # - realtime: used as the WebSocket endpoint (ws:// or wss://)
+  openai_endpoint_base: !secret openai_endpoint_base
+
+  # API key. Can be empty ("") if the server doesn't require authentication.
+  openai_api_key: !secret openai_api_key
+
+  # Chat model. responses/conversations: `chat_model` config key.
+  # realtime: `model` config key. All three reference this substitution.
+  openai_chat_model: "gemma-4-12b-it-GGUF"
+
+  # TTS model + voice (responses/conversations only; realtime ignores these).
+  openai_tts_model: "voice-en_US-joe-medium"
+  openai_tts_voice: "joe"
+
+  # The system prompt sent with every request. Keep it concise — TTS can't
+  # read markdown or thinking tags.
+  openai_prompt: >-
+    You are Jeeves, a voice assistant. Your responses are spoken aloud by a text-to-speech system, so you must write in a way that sounds like natural human conversation.
+    General Rules:
+    Respond in English only.
+    Do not use any markdown (no bold, italics, headers, bullet points, numbered lists, asterisks, or pound signs). This is CRITICAL for voice output.
+    Your Text-To-Speech system cannot read markdown; if you include it, it will be spoken literally or sound robotic.
+    When summarizing research or long-form content, present it as flowing paragraphs of spoken prose, not as structured sections with headers.
+    Be succinct.
+    Do not ask follow-up questions.
+    Do not reveal your "thinking" process. Only output the final response.
+    Maintain a 5th-grade reading level.
+    If you need clarification, ask the user.
+    If you hear background noise or rambling, respond "*".
+    If the user says "nevermind," "stop," or "cancel," respond "Cancelled."
+    Voice Normalization (CRITICAL):
+    - Because you are speaking, you must manually format text to ensure it sounds natural.
+    - Write out all numbers as words (e.g., "nineteen ninety-four" instead of "1994").
+    - Write out Roman numerals as spoken words (e.g., "Queen Elizabeth the second" instead of "Queen Elizabeth II").
+    - Use full words for abbreviations (e.g., "Doctor" instead of "Dr.").
+    - Avoid symbols that don't translate to natural speech.
+    Tool Usage:
+    - Mode 1 (Home Automation): Use homeassistant tools (e.g., HassTurnOff, GetLiveContext, GetDateTime). Provide a very brief confirmation, such as "Done."
+    - Mode 2 (Research): Use openzim-mcp (Wikipedia archive, June 2026).
+    -- First, determine the most likely article title.
+    -- Use the tool to search for the article.
+    -- Summarize the answer in plain, spoken English, applying the Voice Normalization rules above.
+
+# --- ESPHome core -----------------------------------------------------------
+esphome:
+  name: ${device_name}
+  friendly_name: ${friendly_name}
+  min_version: 2025.1.0
+  on_boot:
+    priority: -200  # run after all component setup is complete
+    then:
+      - delay: 2s
+      - lambda: |-
+          // The gt911's reset is shared with the LCD reset (GPIO48). The
+          // gt911 initializes before the display, then the display toggles
+          // GPIO48, resetting the gt911 and breaking its config. By now
+          // (2s after setup) the display is done, so we retry the gt911
+          // setup to re-read switches and re-attach the interrupt.
+          id(box_touchscreen).setup();
+
+# --- ESP32 platform ---------------------------------------------------------
+# S3-Box-3 board, ESP-IDF framework (required by all three components),
+# 240 MHz CPU for enough headroom during HTTP/WebSocket + audio processing.
+esp32:
+  board: esp32s3box
+  flash_size: 16MB
+  cpu_frequency: 240MHz
+  framework:
+    type: esp-idf
+    sdkconfig_options:
+      CONFIG_ESP32S3_DEFAULT_CPU_FREQ_240: "y"
+      CONFIG_ESP32S3_DATA_CACHE_LINE_64B: "y"
+      CONFIG_ESP32S3_CACHE_64KB: "y"
+    advanced:
+      execute_from_psram: true
+
+# --- PSRAM -------------------------------------------------------------------
+# REQUIRED by all three components: all audio/HTTP/WebSocket buffers live in
+# external RAM. Octal mode at 80 MHz matches the S3-Box-3 hardware.
+psram:
+  mode: octal
+  speed: 80MHz
+
+# --- WiFi --------------------------------------------------------------------
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  use_psram: true
+  on_connect:
+    - delay: 5s
+    - lambda: id(openai).prefetch_tools();
+    - lambda: id(openai).prewarm_models();
+
+# --- Globals -----------------------------------------------------------------
+# init_in_progress guards display updates during setup. Template switches
+# with restore_mode fire their on_turn_* automations during setup(), before
+# the display is ready — without this guard, display_spi.update() crashes
+# (StoreProhibited). Set to false in on_client_connected once boot completes.
+globals:
+  - id: init_in_progress
+    type: bool
+    restore_value: false
+    initial_value: "true"
+
+# --- Home Assistant API ------------------------------------------------------
+# The API is used for dashboard/OTA integration. The on_client_connected hook
+# boots the wake-word engine on startup. A service is exposed to stop a turn
+# remotely (the touch button may not fire during TTS playback due to I2C/
+# display contention).
+api:
+  encryption:
+    key: !secret jarviskey
+  services:
+    - service: stop_assistant
+      then:
+        - openai.stop:
+            id: openai
+  on_client_connected:
+    - logger.log: "API connected, starting wake word"
+    - lambda: |-
+        id(display_spi).show_page(idle_page);
+        id(display_spi).update();
+    # Set a comfortable default speaker volume on boot.
+    - lambda: id(box_speaker).set_volume(0.65);
+    # Enable the hey_jarvis model.
+    - micro_wake_word.enable_model: hey_jarvis_model
+    # Start MWW + heartbeat only if the assistant is idle. If a turn
+    # is in progress (e.g. HA reconnects mid-TTS), the component's
+    # teardown_to_idle_() will start MWW after the turn ends. Starting MWW
+    # here while the speaker is using the i2s bus causes "Parent bus is busy"
+    # errors.
+    - if:
+        condition:
+          lambda: 'return !id(openai).is_running();'
+        then:
+          - micro_wake_word.start:
+              id: mww
+          - script.execute: mww_heartbeat
+    # Boot complete: allow display updates from automations (e.g. mute switch).
+    - lambda: id(init_in_progress) = false;
+
+# --- OTA ---------------------------------------------------------------------
+ota:
+  - platform: esphome
+    password: !secret otapassword
+
+# --- Logger ------------------------------------------------------------------
+logger:
+  level: DEBUG
+  # For wake-word sensitivity tuning, set micro_wake_word to VERY_VERBOSE to
+  # see every probability output. DEBUG shows only near-miss detections.
+
+# --- I2C (for the audio codecs) ---------------------------------------------
+# The S3-Box-3 uses an ES7210 (ADC/mic) and ES8311 (DAC/speaker) on a shared
+# I2C bus.
+i2c:
+  - id: i2c_adc_dac
+    scl: GPIO18
+    sda: GPIO8
+
+# --- I2S audio bus -----------------------------------------------------------
+# Shared I2S bus for both mic and speaker. The component handles bus handoff
+# (stops the mic before starting the speaker, and vice-versa) so the two never
+# contend for the bus at the same time.
+i2s_audio:
+  - id: i2s_audio_bus
+    i2s_lrclk_pin:
+      number: GPIO45
+      ignore_strapping_warning: true
+    i2s_bclk_pin: GPIO17
+    i2s_mclk_pin: GPIO2
+
+# --- Touchscreen -------------------------------------------------------------
+# The S3-Box-3 uses a GT911 capacitive touch controller on the shared I2C
+# bus. The gt911 keeps its interrupt_pin (GPIO3) for normal display touch
+# operation. The stop button uses a template binary_sensor that polls GPIO3
+# directly via gpio_get_level() — this reads the raw pin state without
+# claiming the pin or doing any I2C, so it works even during TTS playback
+# when the I2C bus is busy.
+touchscreen:
+  - platform: gt911
+    id: box_touchscreen
+    display: display_spi
+    i2c_id: i2c_adc_dac
+    interrupt_pin: GPIO3
+    on_touch:
+      - lambda: |-
+          // Secondary stop: if the gt911 I2C read succeeds, stop on bottom-area touch.
+          if (id(openai).is_running() && touch.y > 200) {
+            id(openai).request_stop();
+          }
+
+# --- Binary sensors ----------------------------------------------------------
+# The S3-Box-3 home button is the red capacitive circle below the screen
+# (gt911 touch point index 0). Pressing it stops any in-progress conversation.
+binary_sensor:
+  - platform: gt911
+    name: "S3 Box Home Button"
+    id: screen_home_key
+    index: 0
+    on_press:
+      - openai.stop:
+          id: openai
+
+# --- Audio ADC (microphone pre-amp) -----------------------------------------
+audio_adc:
+  - platform: es7210
+    i2c_id: i2c_adc_dac
+    id: es7210_adc
+    bits_per_sample: 16bit
+    sample_rate: 16000
+
+# --- Audio DAC (speaker amp) ------------------------------------------------
+audio_dac:
+  - platform: es8311
+    i2c_id: i2c_adc_dac
+    id: es8311_dac
+    bits_per_sample: 16bit
+    sample_rate: 48000
+
+# --- Microphone -------------------------------------------------------------
+# 16 kHz, 16-bit, mono. This is the fixed format all three components expect
+# (validated at config time). The ES7210 feeds raw PCM via the external ADC.
+microphone:
+  - platform: i2s_audio
+    id: box_mic
+    sample_rate: 16000
+    i2s_din_pin: GPIO16
+    bits_per_sample: 16bit
+    adc_type: external
+
+# --- Speaker ----------------------------------------------------------------
+# 48 kHz hardware sample rate. The component sets the speaker's AudioStreamInfo
+# to the TTS sample rate at playback time so the i2s clock matches the output;
+# the 48 kHz here is the DAC's native rate.
+speaker:
+  - platform: i2s_audio
+    id: box_speaker
+    i2s_dout_pin: GPIO15
+    dac_type: external
+    sample_rate: 48000
+    bits_per_sample: 16bit
+    channel: left
+    audio_dac: es8311_dac
+    buffer_duration: 100ms
+
+# --- Media player (for HA broadcast) -----------------------------------------
+# Wraps the i2s speaker as a media_player entity so Home Assistant can target
+# this device for broadcasts (HassBroadcast). Only the announcement pipeline
+# is configured — no media playback. The announcement pipeline shares the
+# same box_speaker as the voice assistant.
+media_player:
+  - platform: speaker
+    id: box_media_player
+    name: "${friendly_name} Speaker"
+    task_stack_in_psram: true
+    announcement_pipeline:
+      speaker: box_speaker
+      format: WAV
+      sample_rate: 22050
+      num_channels: 1
+    volume_increment: 0.05
+    volume_initial: 0.65
+    volume_max: 1.0
+    volume_min: 0.0
+    # Stop MWW when HA starts an announcement (frees the i2s bus for the
+    # speaker). Restart MWW when the announcement ends, but only if the
+    # assistant is idle (not in the middle of a turn).
+    on_announcement:
+      - micro_wake_word.stop:
+          id: mww
+    on_idle:
+      - if:
+          condition:
+            lambda: 'return !id(openai).is_running();'
+          then:
+            - micro_wake_word.start:
+                id: mww
+
+# --- Micro wake word --------------------------------------------------------
+# Runs on-device wake-word detection. The component OWNS the MWW lifecycle: on
+# request_start it stops MWW (so the assistant gets exclusive mic access), and
+# after each turn it restarts MWW once the speaker has stopped (to avoid i2s
+# bus contention).
+micro_wake_word:
+  id: mww
+  microphone: box_mic
+  task_stack_in_psram: true
+  models:
+    - id: hey_jarvis_model
+      model: https://raw.githubusercontent.com/esphome/micro-wake-word-models/main/models/v2/hey_jarvis.json
+      probability_cutoff: 0.8
+  vad:
+    model: https://raw.githubusercontent.com/esphome/micro-wake-word-models/main/models/v2/vad.json
+  on_wake_word_detected:
+    - logger.log: "WAKE WORD DETECTED"
+    # Don't start a conversation if the media_player is announcing (HA broadcast).
+    - if:
+        condition:
+          lambda: |-
+            return id(box_media_player).state != media_player::MediaPlayerState::MEDIA_PLAYER_STATE_ANNOUNCING;
+        then:
+          - openai.start:
+              wake_word: !lambda return wake_word;
+
+# --- Heartbeat / watchdog ----------------------------------------------------
+# Logs MWW + assistant state every 10s and restarts MWW if it died AND the
+# assistant is idle.
+script:
+  - id: mww_heartbeat
+    mode: single
+    then:
+      - while:
+          condition:
+            lambda: return true;
+          then:
+            - lambda: |-
+                bool mww_running = id(mww).is_running();
+                bool openai_running = id(openai).is_running();
+                bool enabled = id(hey_jarvis_model)->is_enabled();
+                ESP_LOGV("mww_heartbeat", "mww running=%s model_enabled=%s openai_running=%s",
+                         YESNO(mww_running), YESNO(enabled), YESNO(openai_running));
+            - if:
+                condition:
+                  lambda: return !id(mww).is_running() && !id(openai).is_running();
+                then:
+                  - logger.log: "MWW stopped and openai idle; restarting wake word"
+                  - micro_wake_word.start:
+                      id: mww
+            - delay: 10s
+
+# --- Text sensors ------------------------------------------------------------
+text_sensor:
+  - platform: template
+    id: status_text
+    name: "${friendly_name} Status"
+    update_interval: never
+  - platform: template
+    id: request_text
+    name: "${friendly_name} Request"
+    update_interval: never
+  - platform: template
+    id: response_text
+    name: "${friendly_name} Response"
+    update_interval: never
+
+# --- SPI / display -----------------------------------------------------------
+spi:
+  id: spi_bus
+  clk_pin: 7
+  mosi_pin: 6
+
+# --- Display (MDI vector icons) ---------------------------------------------
+# All pages use vector-drawn MDI icons + text, which render ~4x faster than
+# PNG blits and save ~460KB of flash. No external image downloads required.
+display:
+  - platform: mipi_spi
+    id: display_spi
+    spi_id: spi_bus
+    model: S3BOX
+    invert_colors: false
+    data_rate: 40MHz
+    cs_pin: 5
+    dc_pin: 4
+    reset_pin:
+      number: 48
+      inverted: true
+    update_interval: never
+    pages:
+      - id: loading_page
+        lambda: |-
+          it.fill(Color::BLACK);
+          it.printf(it.get_width() / 2, 30, id(font_icon), Color::WHITE, TextAlign::TOP_CENTER, "\U000F12D1");
+          it.printf(it.get_width() / 2, 90, id(font_text), Color::WHITE, TextAlign::TOP_CENTER, "Loading...");
+      - id: idle_page
+        lambda: |-
+          it.fill(Color::BLACK);
+          it.printf(it.get_width() / 2, 60, id(font_icon), Color::WHITE, TextAlign::TOP_CENTER, "\U000F12D1");
+          it.printf(it.get_width() / 2, 120, id(font_text), Color::WHITE, TextAlign::TOP_CENTER, "Idle");
+      - id: listening_page
+        lambda: |-
+          it.fill(Color::BLACK);
+          it.printf(it.get_width() / 2, 30, id(font_icon), Color::WHITE, TextAlign::TOP_CENTER, "\U000F07C5");
+          it.printf(it.get_width() / 2, 90, id(font_text), Color::WHITE, TextAlign::TOP_CENTER, "Listening...");
+      - id: thinking_page
+        lambda: |-
+          it.fill(Color::BLACK);
+          it.printf(it.get_width() / 2, 20, id(font_icon), Color::WHITE, TextAlign::TOP_CENTER, "\U000F07F7");
+          it.printf(it.get_width() / 2, 80, id(font_text), Color::WHITE, TextAlign::TOP_CENTER, "Thinking...");
+          {
+            std::string text = id(request_text).state;
+            std::string line, word;
+            int y = 105, max_chars = 36, lh = 18;
+            for (size_t i = 0; i <= text.size(); i++) {
+              char c = (i < text.size()) ? text[i] : ' ';
+              if (c == ' ' || c == '\n') {
+                if (!word.empty()) {
+                  std::string t = line.empty() ? word : (line + " " + word);
+                  if (t.size() > max_chars && !line.empty()) {
+                    it.print(10, y, id(font_text_sm), Color(200, 200, 200), line.c_str());
+                    y += lh;
+                    if (y > 230) break;
+                    line = word;
+                  } else {
+                    line = t;
+                  }
+                  word.clear();
+                }
+                if (c == '\n' && !line.empty()) {
+                  it.print(10, y, id(font_text_sm), Color(200, 200, 200), line.c_str());
+                  y += lh;
+                  if (y > 230) break;
+                  line.clear();
+                }
+              } else {
+                word += c;
+              }
+            }
+            if (!line.empty() && y <= 230) {
+              it.print(10, y, id(font_text_sm), Color(200, 200, 200), line.c_str());
+            }
+          }
+      - id: searching_page
+        lambda: |-
+          it.fill(Color::BLACK);
+          it.printf(it.get_width() / 2, 30, id(font_icon), Color::WHITE, TextAlign::TOP_CENTER, "\U000F0C7C");
+          it.printf(it.get_width() / 2, 90, id(font_text), Color::WHITE, TextAlign::TOP_CENTER, "Searching...");
+      - id: replying_page
+        lambda: |-
+          it.fill(Color::BLACK);
+          it.printf(it.get_width() / 2, 20, id(font_icon), Color::WHITE, TextAlign::TOP_CENTER, "\U000F0B7B");
+          it.printf(it.get_width() / 2, 80, id(font_text), Color::WHITE, TextAlign::TOP_CENTER, "Speaking...");
+          {
+            std::string text = id(response_text).state;
+            std::string line, word;
+            int y = 105, max_chars = 36, lh = 18;
+            for (size_t i = 0; i <= text.size(); i++) {
+              char c = (i < text.size()) ? text[i] : ' ';
+              if (c == ' ' || c == '\n') {
+                if (!word.empty()) {
+                  std::string t = line.empty() ? word : (line + " " + word);
+                  if (t.size() > max_chars && !line.empty()) {
+                    it.print(10, y, id(font_text_sm), Color::WHITE, line.c_str());
+                    y += lh;
+                    if (y > 230) break;
+                    line = word;
+                  } else {
+                    line = t;
+                  }
+                  word.clear();
+                }
+                if (c == '\n' && !line.empty()) {
+                  it.print(10, y, id(font_text_sm), Color::WHITE, line.c_str());
+                  y += lh;
+                  if (y > 230) break;
+                  line.clear();
+                }
+              } else {
+                word += c;
+              }
+            }
+            if (!line.empty() && y <= 230) {
+              it.print(10, y, id(font_text_sm), Color::WHITE, line.c_str());
+            }
+          }
+      - id: error_page
+        lambda: |-
+          it.fill(Color::BLACK);
+          {
+            std::string text = id(status_text).state;
+            std::string line, word;
+            int y = 100, max_chars = 36, lh = 18;
+            for (size_t i = 0; i <= text.size(); i++) {
+              char c = (i < text.size()) ? text[i] : ' ';
+              if (c == ' ' || c == '\n') {
+                if (!word.empty()) {
+                  std::string t = line.empty() ? word : (line + " " + word);
+                  if (t.size() > max_chars && !line.empty()) {
+                    it.print(10, y, id(font_text_sm), Color(200, 80, 80), line.c_str());
+                    y += lh;
+                    if (y > 230) break;
+                    line = word;
+                  } else {
+                    line = t;
+                  }
+                  word.clear();
+                }
+                if (c == '\n' && !line.empty()) {
+                  it.print(10, y, id(font_text_sm), Color(200, 80, 80), line.c_str());
+                  y += lh;
+                  if (y > 230) break;
+                  line.clear();
+                }
+              } else {
+                word += c;
+              }
+            }
+            if (!line.empty() && y <= 230) {
+              it.print(10, y, id(font_text_sm), Color(200, 80, 80), line.c_str());
+            }
+          }
+      - id: muted_page
+        lambda: |-
+          it.fill(Color::BLACK);
+          it.printf(it.get_width() / 2, 60, id(font_icon), Color::WHITE, TextAlign::TOP_CENTER, "\U000F12D1");
+          it.printf(it.get_width() / 2, 120, id(font_text), Color::WHITE, TextAlign::TOP_CENTER, "Muted");
+
+font:
+  - file: "gfonts://Roboto"
+    id: font_text
+    size: 16
+  - file: "gfonts://Roboto"
+    id: font_text_sm
+    size: 14
+  # Material Design Icons — only the glyphs we need are embedded (~2KB).
+  - file: "https://raw.githubusercontent.com/Templarian/MaterialDesign-Webfont/master/fonts/materialdesignicons-webfont.ttf"
+    id: font_icon
+    size: 48
+    glyphs:
+      - "\U000F07C5"  # ear-hearing (listening)
+      - "\U000F07F7"  # thought-bubble-outline (thinking)
+      - "\U000F12D1"  # chat-sleep (idle)
+      - "\U000F0B7B"  # chat-processing (responding)
+      - "\U000F0C7C"  # file-search (searching/tools)
+
+color:
+  - id: my_white
+    white: 100%
+
+# --- Speaker amplifier enable ------------------------------------------------
+# The S3-Box-3 has a physical speaker amplifier controlled by GPIO46. Without
+# driving this GPIO high, the amplifier is disabled and no sound comes out.
+switch:
+  - platform: gpio
+    name: Speaker Enable
+    pin:
+      number: GPIO46
+      ignore_strapping_warning: true
+    restore_mode: RESTORE_DEFAULT_ON
+    entity_category: config
+    disabled_by_default: true
+  - platform: template
+    name: Mute
+    id: mute
+    icon: "mdi:microphone-off"
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_OFF
+    entity_category: config
+    on_turn_off:
+      - microphone.unmute: box_mic
+      - lambda: id(status_text).publish_state("Idle");
+      - lambda: |-
+          if (!id(init_in_progress)) {
+            id(display_spi).show_page(idle_page);
+            id(display_spi).update();
+          }
+    on_turn_on:
+      - microphone.mute: box_mic
+      - lambda: id(status_text).publish_state("Muted");
+      - lambda: |-
+          if (!id(init_in_progress)) {
+            id(display_spi).show_page(muted_page);
+            id(display_spi).update();
+          }
+
+# --- Backlight ---------------------------------------------------------------
+output:
+  - platform: ledc
+    id: backlight_output
+    pin: GPIO47
+
+light:
+  - platform: monochromatic
+    id: led
+    name: Screen
+    icon: "mdi:television"
+    entity_category: "config"
+    output: backlight_output
+    restore_mode: RESTORE_DEFAULT_ON
+    default_transition_length: 250ms
+
+# =============================================================================
+# Component selection — change this ONE line to switch between the three
+# components. The rest of this file (hardware, display, automations) is shared.
+# =============================================================================
+packages:
+  # --- responses (HTTP, Responses API, most features) ---
+  component: !include ../openai_responses/esp32-openai-responses.yaml
+  # --- conversations (HTTP, Chat Completions API) ---
+  # component: !include ../openai_conversations/esp32-openai-conversations.yaml
+  # --- realtime (WebSocket, Realtime API) ---
+  # component: !include ../openai_realtime/esp32-openai-realtime.yaml

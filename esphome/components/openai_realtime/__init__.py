@@ -354,3 +354,51 @@ async def openai_assistant_connected_to_code(
     var = cg.new_Pvariable(condition_id, template_arg)
     await cg.register_parented(var, config[CONF_ID])
     return var
+
+
+# --- Generic action aliases (work regardless of which component is loaded) ---
+_generic_start_schema = OPENAI_ASSISTANT_ACTION_SCHEMA.extend(
+    {
+        cv.Optional(CONF_SILENCE_DETECTION, default=True): cv.boolean,
+        cv.Optional(CONF_WAKE_WORD): cv.templatable(cv.string),
+    }
+)
+
+
+@register_action(
+    "openai.start",
+    StartAction,
+    _generic_start_schema,
+    synchronous=True,
+)
+async def openai_start_to_code(config, action_id, template_arg, args):
+    var = cg.new_Pvariable(action_id, template_arg)
+    await cg.register_parented(var, config[CONF_ID])
+    cg.add(var.set_silence_detection(config[CONF_SILENCE_DETECTION]))
+    if (wake_word := config.get(CONF_WAKE_WORD)) is not None:
+        templ = await cg.templatable(wake_word, args, cg.std_string)
+        cg.add(var.set_wake_word(templ))
+    return var
+
+
+@register_action(
+    "openai.stop",
+    StopAction,
+    OPENAI_ASSISTANT_ACTION_SCHEMA,
+    synchronous=True,
+)
+async def openai_stop_to_code(config, action_id, template_arg, args):
+    var = cg.new_Pvariable(action_id, template_arg)
+    await cg.register_parented(var, config[CONF_ID])
+    return var
+
+
+@register_condition(
+    "openai.is_running",
+    IsRunningCondition,
+    OPENAI_ASSISTANT_ACTION_SCHEMA,
+)
+async def openai_is_running_to_code(config, condition_id, template_arg, args):
+    var = cg.new_Pvariable(condition_id, template_arg)
+    await cg.register_parented(var, config[CONF_ID])
+    return var

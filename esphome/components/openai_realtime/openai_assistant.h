@@ -86,6 +86,11 @@ class OpenAIAssistant : public Component {
   void request_start(bool silence_detection);
   void request_stop();
 
+  /// No-op stubs for API compatibility with openai_responses/conversations.
+  /// Realtime tools are server-side and models are preloaded by the endpoint.
+  void prefetch_tools() {}
+  void prewarm_models() {}
+
   bool is_running() const { return this->state_ != State::IDLE; }
   bool is_connected() const { return this->connected_; }
 

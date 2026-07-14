@@ -1,339 +1,19 @@
 # =============================================================================
-# ESP32-S3-Box-3 voice assistant using the openai_conversations component.
+# openai_conversations component block.
 #
-# This talks to an OpenAI-compatible server over the Chat Completions + Audio
-# HTTP APIs (no WebSocket). It replaces the openai_realtime component, whose
-# Realtime/MCP tool support was incompatible with the target server.
-#
-# The hardware section below (esp32, psram, i2c, i2s_audio, audio_adc/dac,
-# microphone, speaker, micro_wake_word, display) is taken directly from the
-# voice_assistant example, which is known-good on the S3-Box-3. 
+# This file is meant to be !included from common.yaml. It contains ONLY the
+# component configuration and its automations — all hardware/platform config
+# lives in common.yaml.
 # =============================================================================
 
-# --- Substitutions -----------------------------------------------------------
-# Centralized values so you can tweak them in one place.
-substitutions:
-  device_name: esp32-s3-box-3-640554
-  friendly_name: Jarvis
-
-  # Base URL of the OpenAI-compatible server (no trailing slash). The component
-  # appends /v1/chat/completions, /v1/audio/transcriptions, /v1/audio/speech.
-  openai_endpoint_base: !secret openai_endpoint_base
-
-  # API key. Can be empty ("") if the server doesn't require authentication.
-  openai_api_key: !secret openai_api_key
-
-  # Multimodal chat model: accepts audio input directly (no separate STT step).
-  # For a non-multimodal model, set stt_model below to run in STT+LLM mode.
-  openai_chat_model: "gemma-4-26b-a4b-it-qat"
-
-  # TTS model + voice. The user's server runs piper (kokoro-compatible).
-  openai_tts_model: "voice-en_US-joe-medium"
-  openai_tts_voice: "joe"
-
-  # The system prompt sent with every chat request. Keep it concise — TTS can't
-  # read markdown or thinking tags.
-  openai_prompt: >-
-    You are Jeeves, a voice assistant. Your responses are spoken aloud by a text-to-speech system, so you must write in a way that sounds like natural human conversation.
-    General Rules:Respond in English only.
-    Do not use any markdown (no bold, italics, headers, lists, etc.).
-    Your Text-To-Speech system cannot read markdown; if you include it, it will be spoken literally or sound robotic.
-    Be succinct.
-    Do not ask follow-up questions.
-    Do not reveal your "thinking" process. Only output the final response.
-    Maintain a 5th-grade reading level.
-    If you need clarification, ask the user.
-    If you hear background noise or rambling, respond "*".
-    If the user says "nevermind," "stop," or "cancel," respond "Cancelled."
-    Voice Normalization (CRITICAL):
-    - Because you are speaking, you must manually format text to ensure it sounds natural.
-    - Write out all numbers as words (e.g., "nineteen ninety-four" instead of "1994").
-    - Write out Roman numerals as spoken words (e.g., "Queen Elizabeth the second" instead of "Queen Elizabeth II").
-    - Use full words for abbreviations (e.g., "Doctor" instead of "Dr.").
-    - Avoid symbols that don't translate to natural speech.
-    Tool Usage:
-    - Mode 1 (Home Automation): Use homeassistant tools (e.g., HassTurnOff, GetLiveContext, GetDateTime). Provide a very brief confirmation, such as "Done."
-    - Mode 2 (Research): Use openzim-mcp (Wikipedia archive, June 2026).
-    -- First, determine the most likely article title.
-    -- Use the tool to search for the article.
-    -- Summarize the answer in plain, spoken English, applying the Voice Normalization rules above.
-
 # --- External component ------------------------------------------------------
-# Load openai_conversations from this repository's components directory. Adjust
-# the path if you copy this YAML elsewhere (e.g., /config under ESPHome).
 external_components:
   - source:
       type: local
       path: /config
     components: [openai_conversations]
 
-# --- Packages ----------------------------------------------------------------
-#packages:
-  #- !include sen66.yaml
-  #- !include debug.yaml
-
-# --- ESPHome core -----------------------------------------------------------
-esphome:
-  name: ${device_name}
-  friendly_name: ${friendly_name}
-  min_version: 2025.1.0
-# --- ESP32 platform ---------------------------------------------------------
-# S3-Box-3 board, ESP-IDF framework (required by openai_conversations), 240
-# MHz CPU for enough headroom during HTTP + audio processing.
-esp32:
-  board: esp32s3box
-  flash_size: 16MB
-  cpu_frequency: 240MHz
-  framework:
-    type: esp-idf
-    sdkconfig_options:
-      CONFIG_ESP32S3_DEFAULT_CPU_FREQ_240: "y"
-      CONFIG_ESP32S3_DATA_CACHE_LINE_64B: "y"
-      CONFIG_ESP32S3_CACHE_64KB: "y"
-    advanced:
-      execute_from_psram: true
-
-# --- PSRAM -------------------------------------------------------------------
-# REQUIRED by openai_conversations: all audio/HTTP buffers live in external
-# RAM. Octal mode at 80 MHz matches the S3-Box-3 hardware.
-psram:
-  mode: octal
-  speed: 80MHz
-
-# --- WiFi --------------------------------------------------------------------
-wifi:
-  ssid: !secret wifi_ssid
-  password: !secret wifi_password
-  use_psram: true
-  on_connect:
-    - delay: 5s
-    - lambda: id(openai).prefetch_tools();
-    - lambda: id(openai).prewarm_models();
-
-# --- Globals -----------------------------------------------------------------
-# init_in_progress guards display updates during setup. Template switches
-# with restore_mode fire their on_turn_* automations during setup(), before
-# the display is ready — without this guard, display_spi.update() crashes
-# (StoreProhibited). Set to false in on_client_connected once boot completes.
-globals:
-  - id: init_in_progress
-    type: bool
-    restore_value: false
-    initial_value: "true"
-
-# --- Home Assistant API ------------------------------------------------------
-# The API is used here only for the dashboard/OTA integration; openai_conversations
-# does NOT call Home Assistant services via the api (it talks directly to the LLM
-# server). The on_client_connected hook boots the wake-word engine on startup.
-api:
-  encryption:
-    key: !secret jarviskey
-  on_client_connected:
-    - logger.log: "API connected, starting wake word"
-    - lambda: |-
-        id(display_spi).show_page(idle_page);
-        id(display_spi).update();
-    # Set a comfortable default speaker volume on boot.
-    - lambda: id(box_speaker).set_volume(0.65);
-    # Enable the hey_jarvis model.
-    - micro_wake_word.enable_model: hey_jarvis_model
-    # Start MWW + heartbeat only if openai_conversations is idle. If a turn
-    # is in progress (e.g. HA reconnects mid-TTS), the component's
-    # teardown_to_idle_() will start MWW after the turn ends. Starting MWW
-    # here while the speaker is using the i2s bus causes "Parent bus is busy"
-    # errors.
-    - if:
-        condition:
-          lambda: 'return !id(openai).is_running();'
-        then:
-          - micro_wake_word.start:
-              id: mww
-          - script.execute: mww_heartbeat
-    # Boot complete: allow display updates from automations (e.g. mute switch).
-    - lambda: id(init_in_progress) = false;
-
-# --- OTA ---------------------------------------------------------------------
-ota:
-  - platform: esphome
-    password: !secret otapassword
-
-# --- Logger ------------------------------------------------------------------
-logger:
-  level: DEBUG
-  # For wake-word sensitivity tuning, set micro_wake_word to VERY_VERBOSE to
-  # see every probability output. DEBUG shows only near-miss detections.
-  #logs:
-    #ld2410: DEBUG
-    #sensor: DEBUG
-    #binary_sensor: DEBUG
-    #display.mipi_spi: DEBUG
-
-
-# --- I2C (for the audio codecs) ---------------------------------------------
-# The S3-Box-3 uses an ES7210 (ADC/mic) and ES8311 (DAC/speaker) on a shared
-# I2C bus.
-i2c:
-  - id: i2c_adc_dac
-    scl: GPIO18
-    sda: GPIO8
-
-# --- I2S audio bus -----------------------------------------------------------
-# Shared I2S bus for both mic and speaker. The component handles bus handoff
-# (stops the mic before starting the speaker, and vice-versa) so the two never
-# contend for the bus at the same time.
-i2s_audio:
-  - id: i2s_audio_bus
-    i2s_lrclk_pin:
-      number: GPIO45
-      ignore_strapping_warning: true
-    i2s_bclk_pin: GPIO17
-    i2s_mclk_pin: GPIO2
-
-# --- Touchscreen -------------------------------------------------------------
-# The S3-Box-3 uses a GT911 capacitive touch controller on the shared I2C
-# bus. Touch point index 0 is the red home button below the screen.
-touchscreen:
-  - platform: gt911
-    id: box_touchscreen
-    display: display_spi
-    i2c_id: i2c_adc_dac
-    interrupt_pin: GPIO3
-
-# --- Binary sensors ----------------------------------------------------------
-# The S3-Box-3 home button is the red capacitive circle below the screen
-# (gt911 touch point index 0). Pressing it immediately stops any in-progress
-# conversation and returns to idle.
-binary_sensor:
-  - platform: gt911
-    name: "S3 Box Home Button"
-    id: screen_home_key
-    index: 0
-    on_press:
-      - openai_conversations.stop:
-          id: openai
-
-# --- Audio ADC (microphone pre-amp) -----------------------------------------
-audio_adc:
-  - platform: es7210
-    i2c_id: i2c_adc_dac
-    id: es7210_adc
-    bits_per_sample: 16bit
-    sample_rate: 16000
-
-# --- Audio DAC (speaker amp) ------------------------------------------------
-audio_dac:
-  - platform: es8311
-    i2c_id: i2c_adc_dac
-    id: es8311_dac
-    bits_per_sample: 16bit
-    sample_rate: 48000
-
-# --- Microphone -------------------------------------------------------------
-# 16 kHz, 16-bit, mono. This is the fixed format openai_conversations expects
-# (validated at config time). The ES7210 feeds raw PCM via the external ADC.
-microphone:
-  - platform: i2s_audio
-    id: box_mic
-    sample_rate: 16000
-    i2s_din_pin: GPIO16
-    bits_per_sample: 16bit
-    adc_type: external
-
-# --- Speaker ----------------------------------------------------------------
-# 48 kHz hardware sample rate. The component sets the speaker's AudioStreamInfo
-# to tts_sample_rate (24 kHz) at playback time so the i2s clock matches the TTS
-# output; the 48 kHz here is the DAC's native rate.
-speaker:
-  - platform: i2s_audio
-    id: box_speaker
-    i2s_dout_pin: GPIO15
-    dac_type: external
-    sample_rate: 48000
-    bits_per_sample: 16bit
-    channel: left
-    audio_dac: es8311_dac
-    buffer_duration: 100ms
-
-# --- Media player (for HA broadcast) -----------------------------------------
-# Wraps the i2s speaker as a media_player entity so Home Assistant can target
-# this device for broadcasts (HassBroadcast). Only the announcement pipeline
-# is configured — no media playback. The announcement pipeline shares the
-# same box_speaker as openai_conversations.
-#
-# i2s bus coexistence: MWW uses the mic (i2s rx) and the speaker uses i2s tx.
-# On the S3-Box-3 these share one i2s controller, so the speaker can't start
-# while the mic is running (the "Parent bus is busy" error). To handle HA-
-# initiated broadcasts (tts.speak), we stop MWW when an announcement starts
-# and restart it when the announcement ends. The wake-word guard in
-# on_wake_word_detected below prevents the reverse (starting a conversation
-# during an announcement).
-media_player:
-  - platform: speaker
-    id: box_media_player
-    name: "${friendly_name} Speaker"
-    task_stack_in_psram: true
-    announcement_pipeline:
-      speaker: box_speaker
-      format: WAV
-      sample_rate: 22050
-      num_channels: 1
-    volume_increment: 0.05
-    volume_initial: 0.65
-    volume_max: 1.0
-    volume_min: 0.0
-    # Stop MWW when HA starts an announcement (frees the i2s bus for the
-    # speaker). Restart MWW when the announcement ends, but only if
-    # openai_conversations is idle (not in the middle of a turn).
-    on_announcement:
-      - micro_wake_word.stop:
-          id: mww
-    on_idle:
-      - if:
-          condition:
-            lambda: 'return !id(openai).is_running();'  # openai is IDLE
-          then:
-            - micro_wake_word.start:
-                id: mww
-
-# --- Micro wake word --------------------------------------------------------
-# Runs on-device wake-word detection. The component OWNS the MWW lifecycle: on
-# request_start it stops MWW (so the assistant gets exclusive mic access), and
-# after each turn it restarts MWW once the speaker has stopped (to avoid i2s
-# bus contention). So the on_idle automation below does NOT need to restart
-# MWW manually — the component does it internally.
-#
-# stop_after_detection is left at its default (true): once a wake word fires,
-# MWW stops itself. The component then starts the mic. This avoids the mic
-# running under two owners.
-micro_wake_word:
-  id: mww
-  microphone: box_mic
-  task_stack_in_psram: true
-  models:
-    - id: hey_jarvis_model
-      #model: hey_jarvis
-      model: https://raw.githubusercontent.com/esphome/micro-wake-word-models/main/models/v2/hey_jarvis.json
-      probability_cutoff: 0.8
-  # The VAD model here is used by MWW only to gate wake-word detection (it
-  # suppresses detections during silence). It is NOT used by openai_conversations
-  # for end-of-speech detection — that uses the component's own local RMS VAD.
-  vad:
-    model: https://raw.githubusercontent.com/esphome/micro-wake-word-models/main/models/v2/vad.json
-  on_wake_word_detected:
-    - logger.log: "WAKE WORD DETECTED"
-    # Don't start a conversation if the media_player is announcing (HA broadcast).
-    # This prevents i2s bus contention between the announcement pipeline and
-    # the openai_conversations TTS playback.
-    - if:
-        condition:
-          lambda: |-
-            return id(box_media_player).state != media_player::MediaPlayerState::MEDIA_PLAYER_STATE_ANNOUNCING;
-        then:
-          - openai_conversations.start:
-              wake_word: !lambda return wake_word;
-
 # --- openai_conversations ---------------------------------------------------
-# The voice assistant component. See README.md for the full option reference.
 openai_conversations:
   id: openai
   # --- API / server ---
@@ -341,15 +21,11 @@ openai_conversations:
   api_key: ${openai_api_key}
   # --- Models ---
   chat_model: ${openai_chat_model}
-  # Omit stt_model to run in multimodal mode (audio sent directly to the chat
-  # model). To use STT+LLM mode instead, uncomment and set a transcription model:
   stt_model: "parakeet-cpp-tdt_ctc-1.1b"
-  stt_language: "en"  # ISO 639-1 code; "" = auto-detect
+  stt_language: "en"
   tts_model: ${openai_tts_model}
   tts_voice: ${openai_tts_voice}
-  # Sample rate of the WAV returned by the TTS server. The speaker's stream
-  # info is set to this before playback so the i2s clock matches.
-  tts_sample_rate: 22050  # piper TTS server returns 22050 Hz
+  tts_sample_rate: 22050
   # --- Prompt ---
   system_prompt: ${openai_prompt}
   # --- Hardware ---
@@ -357,34 +33,13 @@ openai_conversations:
   speaker: box_speaker
   micro_wake_word: mww
   # --- Audio / VAD tuning ---
-  # Boost the TTS output volume. 2.5 is a good starting point for the S3-Box
-  # speaker at 0.65 hardware volume; adjust to taste.
   volume_multiplier: 2.5
-  # RMS amplitude (0..1, relative to full-scale int16) below which audio is
-  # considered silence. On the S3-Box-3 with the ES7210 at default gain, idle
-  # noise reads ~0.0001-0.0005 and speech reads ~0.004-0.007, so 0.002 sits
-  # cleanly between them. Tune if your hardware differs.
   silence_threshold: 0.002
-  # How long (ms) of continuous silence after speech started before end-of-
-  # speech is declared.
   silence_duration_ms: 700ms
-  # Safety cap: if no speech is detected within this time, the turn aborts and
-  # returns to idle (treated as a user cancel, not an error).
   max_recording_ms: 30000ms
   # --- Tools (optional) ---
-  # A pre-formatted chat-completions "tools" JSON array, e.g.:
-  #   [{"type":"function","function":{"name":"GetDateTime","description":"...","parameters":{...}}}]
-  # When omitted, the server may auto-inject tools from the model config.
   tools_file: tools.json
-  # How long the live MCP tools cache is valid before a refresh is needed.
-  # The component fetches tools/list from each MCP server at request_start when
-  # the cache is stale (default 24h). Set to 0s to refresh every turn.
   tools_cache_ttl: 24h
-  # --- MCP servers (for client-side tool execution) ---
-  # When the LLM returns finish_reason=tool_calls, the component calls
-  # tools/call on each configured MCP server, injects the results, and
-  # re-queries the LLM. The tool→server routing is built automatically by
-  # calling tools/list on each server on boot, then cached.
   mcp_servers:
     - name: ha
       url: !secret ha_url
@@ -393,13 +48,9 @@ openai_conversations:
       url: !secret openzim_url
       api_key: !secret openzim_token
   # --- Text sensors ---
-  # text_request is only populated in STT mode (Mode 2). In multimodal mode
-  # (Mode 1) there is no transcript.
   text_request: request_text
   text_response: response_text
   # --- Automations ---
-  # Each trigger uses the lightweight callback pattern (no Trigger object
-  # overhead when unused).
   on_listening:
     - lambda: |-
         id(status_text).publish_state("Listening...");
@@ -409,44 +60,31 @@ openai_conversations:
         id(display_spi).show_page(listening_page);
         id(display_spi).update();
   on_start:
-    # No display update here — on_listening fires immediately after (same
-    # loop pass) and shows the listening page. A second update() call would
-    # redundantly redraw the full framebuffer (~580ms wasted).
     - lambda: id(status_text).publish_state("Listening...");
-  # In multimodal mode on_stt_end never fires (no transcript). In STT mode it
-  # fires with the transcribed user text.
   on_stt_end:
     - lambda: id(request_text).publish_state(x);
     - lambda: |-
         id(display_spi).show_page(thinking_page);
         id(display_spi).update();
-  # Fires with the full chat response text before TTS synthesis begins.
   on_tts_start:
     - lambda: id(response_text).publish_state(x);
-  # Fires when the TTS audio stream begins playing through the speaker.
   on_tts_stream_start:
     - lambda: id(status_text).publish_state("Speaking...");
     - lambda: |-
         id(display_spi).show_page(replying_page);
         id(display_spi).update();
-  # Fires when the TTS audio stream finishes (speaker may still be draining).
   on_tts_stream_end:
     - lambda: id(status_text).publish_state("Finished");
-  # Fires with the full response text after TTS playback completes.
   on_tts_end:
     - lambda: id(response_text).publish_state(x);
-  # Fires at the end of every turn (after teardown).
   on_end:
     - lambda: id(status_text).publish_state("Done");
-  # Fires on any error (HTTP failure, empty response, alloc failure, etc.).
   on_error:
     - lambda: |-
         id(status_text).publish_state("Error: " + code);
     - lambda: |-
         id(display_spi).show_page(error_page);
         id(display_spi).update();
-  # Fires when the component returns to idle and MWW has been restarted.
-  # Note: the component restarts MWW itself, so no micro_wake_word.start here.
   on_idle:
     - if:
         condition:
@@ -461,205 +99,3 @@ openai_conversations:
           - lambda: |-
               id(display_spi).show_page(idle_page);
               id(display_spi).update();
-
-# --- Heartbeat / watchdog ----------------------------------------------------
-# Logs MWW + assistant state every 10s and restarts MWW if it died AND the
-# assistant is idle. The component restarts MWW itself after each turn, but
-# this catches cases where MWW crashes unexpectedly mid-idle.
-script:
-  - id: mww_heartbeat
-    mode: single
-    then:
-      - while:
-          condition:
-            lambda: return true;
-          then:
-            - lambda: |-
-                bool mww_running = id(mww).is_running();
-                bool openai_running = id(openai).is_running();
-                bool enabled = id(hey_jarvis_model)->is_enabled();
-                ESP_LOGV("mww_heartbeat", "mww running=%s model_enabled=%s openai_running=%s",
-                         YESNO(mww_running), YESNO(enabled), YESNO(openai_running));
-            - if:
-                condition:
-                  lambda: return !id(mww).is_running() && !id(openai).is_running();
-                then:
-                  - logger.log: "MWW stopped and openai idle; restarting wake word"
-                  - micro_wake_word.start:
-                      id: mww
-            - delay: 10s
-
-# --- Text sensors ------------------------------------------------------------
-# status_text: current assistant state for the display.
-# request_text: the transcribed user request (STT mode only).
-# response_text: the chat response text (streamed as deltas arrive).
-text_sensor:
-  - platform: template
-    id: status_text
-    name: "${friendly_name} Status"
-    update_interval: never
-  - platform: template
-    id: request_text
-    name: "${friendly_name} Request"
-    update_interval: never
-  - platform: template
-    id: response_text
-    name: "${friendly_name} Response"
-    update_interval: never
-
-# --- SPI / display -----------------------------------------------------------
-# The S3-Box-3 has a 320x240 MIPI SPI display. Uses the casita illustration
-# set from the voice_assistant project, with text overlays for request/response.
-spi:
-  id: spi_bus
-  clk_pin: 7
-  mosi_pin: 6
-
-# --- Casita illustrations (from voice_assistant project) ---------------------
-image:
-  - file: https://github.com/esphome/wake-word-voice-assistants/raw/main/casita/idle_320_240.png
-    id: casita_idle
-    resize: 320x240
-    type: RGB
-    transparency: alpha_channel
-  - file: https://github.com/esphome/wake-word-voice-assistants/raw/main/casita/listening_320_240.png
-    id: casita_listening
-    resize: 320x240
-    type: RGB
-    transparency: alpha_channel
-  - file: https://github.com/esphome/wake-word-voice-assistants/raw/main/casita/thinking_320_240.png
-    id: casita_thinking
-    resize: 320x240
-    type: RGB
-    transparency: alpha_channel
-  - file: https://github.com/esphome/wake-word-voice-assistants/raw/main/casita/replying_320_240.png
-    id: casita_replying
-    resize: 320x240
-    type: RGB
-    transparency: alpha_channel
-  - file: https://github.com/esphome/wake-word-voice-assistants/raw/main/casita/error_320_240.png
-    id: casita_error
-    resize: 320x240
-    type: RGB
-    transparency: alpha_channel
-  - file: https://github.com/esphome/wake-word-voice-assistants/raw/main/casita/loading_320_240.png
-    id: casita_loading
-    resize: 320x240
-    type: RGB
-    transparency: alpha_channel
-display:
-  - platform: mipi_spi
-    id: display_spi
-    spi_id: spi_bus
-    model: S3BOX
-    invert_colors: false
-    data_rate: 40MHz
-    cs_pin: 5
-    dc_pin: 4
-    reset_pin:
-      number: 48
-      inverted: true
-    update_interval: never
-    pages:
-      - id: loading_page
-        lambda: |-
-          it.fill(Color::BLACK);
-          it.image((it.get_width() / 2), (it.get_height() / 2), id(casita_loading), ImageAlign::CENTER);
-          it.printf(10, 10, id(font_text), Color::WHITE, "Loading...");
-      - id: idle_page
-        lambda: |-
-          it.fill(Color::BLACK);
-          it.image((it.get_width() / 2), (it.get_height() / 2), id(casita_idle), ImageAlign::CENTER);
-          it.printf(10, 10, id(font_text), Color::WHITE, "Idle");
-      - id: listening_page
-        lambda: |-
-          it.fill(Color::BLACK);
-          it.printf(it.get_width() / 2, it.get_height() / 2, id(font_text), Color::WHITE, TextAlign::CENTER, "Listening...");
-      - id: thinking_page
-        lambda: |-
-          it.fill(Color::BLACK);
-          it.printf(it.get_width() / 2, 30, id(font_text), Color::WHITE, TextAlign::TOP_CENTER, "Thinking...");
-          it.printf(30, 60, id(font_text), Color::WHITE, "%.60s", id(request_text).state.c_str());
-      - id: replying_page
-        lambda: |-
-          it.fill(Color::WHITE);
-          it.image((it.get_width() / 2), (it.get_height() / 2), id(casita_replying), ImageAlign::CENTER);
-          it.filled_rectangle(20, 20, 280, 30, Color::WHITE);
-          it.rectangle(20, 20, 280, 30, Color::BLACK);
-          it.filled_rectangle(20, 190, 280, 30, Color::WHITE);
-          it.rectangle(20, 190, 280, 30, Color::BLACK);
-          it.printf(30, 25, id(font_text), Color::BLACK, "%.60s", id(request_text).state.c_str());
-          it.printf(30, 195, id(font_text), Color::BLACK, "%.60s", id(response_text).state.c_str());
-      - id: error_page
-        lambda: |-
-          it.fill(Color::BLACK);
-          it.image((it.get_width() / 2), (it.get_height() / 2), id(casita_error), ImageAlign::CENTER);
-          it.printf(10, 10, id(font_text), Color::WHITE, "Error: %s", id(status_text).state.c_str());
-      - id: muted_page
-        lambda: |-
-          it.fill(Color::BLACK);
-          it.image((it.get_width() / 2), (it.get_height() / 2), id(casita_idle), ImageAlign::CENTER);
-          it.printf(10, 10, id(font_text), Color::WHITE, "Muted");
-
-font:
-  - file: "gfonts://Roboto"
-    id: font_text
-    size: 16
-
-color:
-  - id: my_white
-    white: 100%
-
-# --- Speaker amplifier enable ------------------------------------------------
-# The S3-Box-3 has a physical speaker amplifier controlled by GPIO46. Without
-# driving this GPIO high, the amplifier is disabled and no sound comes out,
-# even though i2s data is flowing correctly. This switch is copied from the
-# voice_assistant S3-Box-3 reference config.
-switch:
-  - platform: gpio
-    name: Speaker Enable
-    pin:
-      number: GPIO46
-      ignore_strapping_warning: true
-    restore_mode: RESTORE_DEFAULT_ON
-    entity_category: config
-    disabled_by_default: true
-  - platform: template
-    name: Mute
-    id: mute
-    icon: "mdi:microphone-off"
-    optimistic: true
-    restore_mode: RESTORE_DEFAULT_OFF
-    entity_category: config
-    on_turn_off:
-      - microphone.unmute: box_mic
-      - lambda: id(status_text).publish_state("Idle");
-      - lambda: |-
-          if (!id(init_in_progress)) {
-            id(display_spi).show_page(idle_page);
-            id(display_spi).update();
-          }
-    on_turn_on:
-      - microphone.mute: box_mic
-      - lambda: id(status_text).publish_state("Muted");
-      - lambda: |-
-          if (!id(init_in_progress)) {
-            id(display_spi).show_page(muted_page);
-            id(display_spi).update();
-          }
-
-# --- Backlight ---------------------------------------------------------------
-output:
-  - platform: ledc
-    id: backlight_output
-    pin: GPIO47
-
-light:
-  - platform: monochromatic
-    id: led
-    name: Screen
-    icon: "mdi:television"
-    entity_category: "config"
-    output: backlight_output
-    restore_mode: RESTORE_DEFAULT_ON
-    default_transition_length: 250ms
