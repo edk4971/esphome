@@ -35,7 +35,8 @@ substitutions:
   # read markdown or thinking tags.
   openai_prompt: >-
     You are Jeeves, a voice assistant. Your responses are spoken aloud by a text-to-speech system, so you must write in a way that sounds like natural human conversation.
-    General Rules:Respond in English only.
+    General Rules:
+    Respond in English only.
     Do not use any markdown (no bold, italics, headers, bullet points, numbered lists, asterisks, or pound signs). This is CRITICAL for voice output.
     Your Text-To-Speech system cannot read markdown; if you include it, it will be spoken literally or sound robotic.
     When summarizing research or long-form content, present it as flowing paragraphs of spoken prose, not as structured sections with headers.
@@ -78,6 +79,17 @@ esphome:
   name: ${device_name}
   friendly_name: ${friendly_name}
   min_version: 2025.1.0
+  on_boot:
+    priority: -200  # run after all component setup is complete
+    then:
+      - delay: 2s
+      - lambda: |-
+          // The gt911's reset is shared with the LCD reset (GPIO48). The
+          // gt911 initializes before the display, then the display toggles
+          // GPIO48, resetting the gt911 and breaking its config. By now
+          // (2s after setup) the display is done, so we retry the gt911
+          // setup to re-read switches and re-attach the interrupt.
+          id(box_touchscreen).setup();
 # --- ESP32 platform ---------------------------------------------------------
 # S3-Box-3 board, ESP-IDF framework (required by openai_responses), 240
 # MHz CPU for enough headroom during HTTP + audio processing.
@@ -210,6 +222,12 @@ touchscreen:
     display: display_spi
     i2c_id: i2c_adc_dac
     interrupt_pin: GPIO3
+    # No reset_pin — the gt911 reset is shared with the LCD reset (GPIO48),
+    # which is already claimed by the display component. The display
+    # component's setup() toggles GPIO48, resetting both LCD and gt911.
+    # If the gt911's setup() runs before the display's, I2C fails. The
+    # on_boot retry below calls setup() again after the display has reset
+    # GPIO48.
     on_touch:
       - lambda: |-
           // Secondary stop: if the gt911 I2C read succeeds, stop on bottom-area touch.
@@ -388,6 +406,11 @@ openai_responses:
   # Boost the TTS output volume. 2.5 is a good starting point for the S3-Box
   # speaker at 0.65 hardware volume; adjust to taste.
   volume_multiplier: 2.5
+  # Streaming TTS: generate audio for each sentence as it arrives from the
+  # LLM, rather than waiting for the full response. Uses a 2MB PSRAM ring
+  # buffer to decouple bursty TTS generation from continuous speaker
+  # playback. Set to false to revert to single-request TTS (current behavior).
+  streaming_tts: true
   # RMS amplitude (0..1, relative to full-scale int16) below which audio is
   # considered silence. On the S3-Box-3 with the ES7210 at default gain, idle
   # noise reads ~0.0001-0.0005 and speech reads ~0.004-0.007, so 0.002 sits
@@ -449,6 +472,12 @@ openai_responses:
     - lambda: id(status_text).publish_state("Thinking...");
     - lambda: |-
         id(display_spi).show_page(thinking_page);
+        id(display_spi).update();
+  # Fires when the LLM requests tool calls and we transition to EXECUTING_TOOLS.
+  on_tool_start:
+    - lambda: id(status_text).publish_state("Searching...");
+    - lambda: |-
+        id(display_spi).show_page(searching_page);
         id(display_spi).update();
   # Fires with the full chat response text before TTS synthesis begins.
   # The display update (~200ms) overlaps with the TTS HTTP request on a
@@ -542,7 +571,7 @@ text_sensor:
     update_interval: never
 
 # --- SPI / display -----------------------------------------------------------
-# The S3-Box-3 has a 320x240 MIPI SPI display. Uses the casita illustration
+# The S3-Box-3 has a 320x240 MIPI SPI display. All pages use vector-drawn
 # set from the voice_assistant project, with text overlays for request/response.
 spi:
   id: spi_bus
@@ -550,19 +579,8 @@ spi:
   mosi_pin: 6
 
 # --- Casita illustrations (from voice_assistant project) ---------------------
-# Only idle and loading are kept — the other states use vector-drawn layouts
-# with MDI icon glyphs, which render ~4x faster than PNG blits.
-image:
-  - file: https://github.com/esphome/wake-word-voice-assistants/raw/main/casita/idle_320_240.png
-    id: casita_idle
-    resize: 320x240
-    type: RGB
-    transparency: alpha_channel
-  - file: https://github.com/esphome/wake-word-voice-assistants/raw/main/casita/loading_320_240.png
-    id: casita_loading
-    resize: 320x240
-    type: RGB
-    transparency: alpha_channel
+# All pages use vector-drawn MDI icons + text, which render ~4x faster than
+# PNG blits and save ~460KB of flash.
 display:
   - platform: mipi_spi
     id: display_spi
@@ -580,30 +598,28 @@ display:
       - id: loading_page
         lambda: |-
           it.fill(Color::BLACK);
-          it.image((it.get_width() / 2), (it.get_height() / 2), id(casita_loading), ImageAlign::CENTER);
-          it.printf(10, 10, id(font_text), Color::WHITE, "Loading...");
+          it.printf(it.get_width() / 2, 30, id(font_icon), Color::WHITE, TextAlign::TOP_CENTER, "\U000F12D1");
+          it.printf(it.get_width() / 2, 90, id(font_text), Color::WHITE, TextAlign::TOP_CENTER, "Loading...");
       - id: idle_page
         lambda: |-
           it.fill(Color::BLACK);
-          it.image((it.get_width() / 2), (it.get_height() / 2), id(casita_idle), ImageAlign::CENTER);
-          it.printf(it.get_width() / 2, 10, id(font_text), Color::WHITE, TextAlign::TOP_CENTER, "Idle");
+          it.printf(it.get_width() / 2, 60, id(font_icon), Color::WHITE, TextAlign::TOP_CENTER, "\U000F12D1");
+          it.printf(it.get_width() / 2, 120, id(font_text), Color::WHITE, TextAlign::TOP_CENTER, "Idle");
       - id: listening_page
         lambda: |-
           it.fill(Color::BLACK);
-          // ear-hearing icon centered at top
           it.printf(it.get_width() / 2, 30, id(font_icon), Color::WHITE, TextAlign::TOP_CENTER, "\U000F07C5");
           it.printf(it.get_width() / 2, 90, id(font_text), Color::WHITE, TextAlign::TOP_CENTER, "Listening...");
       - id: thinking_page
         lambda: |-
           it.fill(Color::BLACK);
-          // thought-bubble-outline icon centered at top
           it.printf(it.get_width() / 2, 20, id(font_icon), Color::WHITE, TextAlign::TOP_CENTER, "\U000F07F7");
           it.printf(it.get_width() / 2, 80, id(font_text), Color::WHITE, TextAlign::TOP_CENTER, "Thinking...");
-          // Word-wrapped request text
+          // Word-wrapped request text (moved up to fill gap from removed animation)
           {
             std::string text = id(request_text).state;
             std::string line, word;
-            int y = 130, max_chars = 36, lh = 18;
+            int y = 105, max_chars = 36, lh = 18;
             for (size_t i = 0; i <= text.size(); i++) {
               char c = (i < text.size()) ? text[i] : ' ';
               if (c == ' ' || c == '\n') {
@@ -633,17 +649,21 @@ display:
               it.print(10, y, id(font_text_sm), Color(200, 200, 200), line.c_str());
             }
           }
+      - id: searching_page
+        lambda: |-
+          it.fill(Color::BLACK);
+          it.printf(it.get_width() / 2, 30, id(font_icon), Color::WHITE, TextAlign::TOP_CENTER, "\U000F0C7C");
+          it.printf(it.get_width() / 2, 90, id(font_text), Color::WHITE, TextAlign::TOP_CENTER, "Searching...");
       - id: replying_page
         lambda: |-
           it.fill(Color::BLACK);
-          // chat-processing icon centered at top
           it.printf(it.get_width() / 2, 20, id(font_icon), Color::WHITE, TextAlign::TOP_CENTER, "\U000F0B7B");
           it.printf(it.get_width() / 2, 80, id(font_text), Color::WHITE, TextAlign::TOP_CENTER, "Speaking...");
-          // Word-wrapped response text
+          // Word-wrapped response text (moved up to fill gap from removed animation)
           {
             std::string text = id(response_text).state;
             std::string line, word;
-            int y = 110, max_chars = 36, lh = 18;
+            int y = 105, max_chars = 36, lh = 18;
             for (size_t i = 0; i <= text.size(); i++) {
               char c = (i < text.size()) ? text[i] : ' ';
               if (c == ' ' || c == '\n') {
@@ -713,8 +733,8 @@ display:
       - id: muted_page
         lambda: |-
           it.fill(Color::BLACK);
-          it.image((it.get_width() / 2), (it.get_height() / 2), id(casita_idle), ImageAlign::CENTER);
-          it.printf(it.get_width() / 2, 10, id(font_text), Color::WHITE, TextAlign::TOP_CENTER, "Muted");
+          it.printf(it.get_width() / 2, 60, id(font_icon), Color::WHITE, TextAlign::TOP_CENTER, "\U000F12D1");
+          it.printf(it.get_width() / 2, 120, id(font_text), Color::WHITE, TextAlign::TOP_CENTER, "Muted");
 
 font:
   - file: "gfonts://Roboto"
@@ -723,7 +743,7 @@ font:
   - file: "gfonts://Roboto"
     id: font_text_sm
     size: 14
-  # Material Design Icons — only the 5 glyphs we need are embedded (~2KB).
+  # Material Design Icons — only the glyphs we need are embedded (~2KB).
   # Codepoints from https://pictogrammers.com/library/mdi/
   - file: "https://raw.githubusercontent.com/Templarian/MaterialDesign-Webfont/master/fonts/materialdesignicons-webfont.ttf"
     id: font_icon
@@ -733,6 +753,7 @@ font:
       - "\U000F07F7"  # thought-bubble-outline (thinking)
       - "\U000F12D1"  # chat-sleep (idle)
       - "\U000F0B7B"  # chat-processing (responding)
+      - "\U000F0C7C"  # file-search (searching/tools)
 
 color:
   - id: my_white

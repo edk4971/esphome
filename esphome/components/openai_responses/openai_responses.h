@@ -23,6 +23,8 @@
 #include <esp_http_client.h>
 #include <freertos/message_buffer.h>
 
+#include <atomic>
+#include <deque>
 #include <memory>
 #include <string>
 #include <vector>
@@ -76,6 +78,7 @@ enum class HttpMsgType : uint8_t {
   DONE = 1,             // no payload; the HTTP request completed successfully
   ERROR_ = 2,           // 1-byte code length, code bytes, 1-byte message length, message bytes
   TTS_STREAM_START = 3, // no payload; the TTS speaker has started (fire on_tts_stream_start)
+  TTS_STREAM_DONE = 4,  // no payload; the feeder task has drained all audio
 };
 
 // Finite state machine driving one conversation turn. The component is single
@@ -108,6 +111,7 @@ enum class State : uint8_t {
   EXECUTING_TOOLS,     // orchestrating tool calls: execute tools, re-query LLM
 #endif
   DRAINING_AUDIO,  // TTS stream ended; wait for speaker to finish
+  STREAMING_TTS_DRAIN,  // SSE done; TTS producer + feeder still draining
   // Teardown
   ERROR_TEARDOWN,  // cleanup after an error or explicit stop
 };
@@ -164,6 +168,7 @@ class OpenAIResponses : public Component {
   void set_silence_duration_ms(uint32_t v) { this->silence_duration_ms_ = v; }
   void set_max_recording_ms(uint32_t v) { this->max_recording_ms_ = v; }
   void set_volume_multiplier(float v) { this->volume_multiplier_ = v; }
+  void set_streaming_tts(bool v) { this->streaming_tts_ = v; }
   void set_has_tools(bool v) { this->has_tools_ = v; }
   void set_wake_word(const std::string &v) { this->wake_word_ = v; }
 #ifdef USE_OPENAI_RESPONSES_MCP
@@ -205,6 +210,7 @@ class OpenAIResponses : public Component {
     this->on_wake_word_detected_cb_.add(std::forward<F>(cb));
   }
   template<typename F> void add_on_stt_end_callback(F &&cb) { this->on_stt_end_cb_.add(std::forward<F>(cb)); }
+  template<typename F> void add_on_tool_start_callback(F &&cb) { this->on_tool_start_cb_.add(std::forward<F>(cb)); }
   template<typename F> void add_on_tts_start_callback(F &&cb) { this->on_tts_start_cb_.add(std::forward<F>(cb)); }
   template<typename F> void add_on_tts_end_callback(F &&cb) { this->on_tts_end_cb_.add(std::forward<F>(cb)); }
   template<typename F> void add_on_tts_stream_start_callback(F &&cb) {
@@ -262,9 +268,10 @@ class OpenAIResponses : public Component {
   // The task handles open → write → fetch_headers → read loop, sending
   // DATA/DONE/ERROR messages via http_msg_buffer_.
   void start_http_task_();
-  // Kills the HTTP task (if running) and frees the message buffer. Safe to
-  // call from the main loop; uses vTaskDelete for immediate cancellation.
-  void stop_http_task_();
+  // Kills the HTTP task (if running). Non-blocking: returns true if the task
+  // is suspended (or not created), false if still running (retry on next loop).
+  // Avoids force-deleting a task blocked in lwIP recv_tcp() (crashes tcpip).
+  bool stop_http_task_();
   // The task entry point. arg is the OpenAIResponses* this pointer.
   static void http_task_fn_(void *arg);
   void close_http_();
@@ -272,6 +279,32 @@ class OpenAIResponses : public Component {
   // the HTTP task to report failures back to the main loop. code and message
   // must be C string literals (or otherwise outlive the call).
   void send_http_error_(MessageBufferHandle_t buf, const char *code, const char *message);
+
+  // --- Streaming TTS (concurrent with SSE reading) ---
+  // Starts the TTS producer task (pops sentences, does TTS HTTP, writes PCM
+  // to the PSRAM ring buffer). Also starts the speaker feeder task (reads PCM
+  // from the buffer, feeds the i2s speaker continuously).
+  void start_tts_producer_task_();
+  void stop_tts_producer_task_();
+  void start_speaker_feeder_task_();
+  void stop_speaker_feeder_task_();
+  static void tts_producer_task_fn_(void *arg);
+  static void speaker_feeder_task_fn_(void *arg);
+  // Pushes a sentence to the thread-safe tts_queue_ and wakes the producer.
+  // On the first push of a turn, starts the producer + feeder tasks and fires
+  // on_tts_start.
+  void push_tts_sentence_(const std::string &sentence);
+  // Pushes any remaining tts_pending_text_ and sets tts_queue_done_.
+  void flush_tts_pending_();
+  // Builds a TTS request body for the given text (refactored to accept a
+  // parameter for per-sentence streaming TTS).
+  void build_tts_request_body_for_(const std::string &text);
+  // Scans for the last sentence boundary in text. Returns the position after
+  // the boundary, or 0 if none found. Requires 40+ chars before splitting.
+  size_t find_sentence_boundary_(const std::string &text);
+  // Writes PCM data to the PSRAM ring buffer. Blocks if the buffer is full
+  // (natural backpressure — TTS pauses until the speaker catches up).
+  void write_to_audio_buffer_(const uint8_t *data, size_t len);
 
   // --- Response processing ---
   // Feeds bytes from the HTTP message buffer into sse_line_buffer_ and, on
@@ -395,6 +428,41 @@ class OpenAIResponses : public Component {
   volatile bool http_task_should_exit_{false};
   // Read chunk size used by the task when calling esp_http_client_read.
   static constexpr size_t HTTP_TASK_READ_CHUNK = 2048;
+
+  // --- Streaming TTS (concurrent with SSE reading) ---
+  bool streaming_tts_{true};
+
+  // TTS producer task (pops sentences, does TTS HTTP, writes PCM to buffer).
+  StaticTask tts_producer_task_;
+  static constexpr uint32_t TTS_PRODUCER_STACK_SIZE = 8192;
+  // Speaker feeder task (reads PCM from buffer, feeds i2s speaker).
+  StaticTask speaker_feeder_task_;
+  static constexpr uint32_t SPEAKER_FEEDER_STACK_SIZE = 4096;
+  static constexpr UBaseType_t TTS_TASK_PRIORITY = 3;
+  static constexpr size_t SPEAKER_FEEDER_CHUNK = 2048;
+  volatile bool tts_task_should_exit_{false};
+
+  // Thread-safe queue of sentences to TTS.
+  SemaphoreHandle_t tts_queue_mutex_{nullptr};
+  std::deque<std::string> tts_queue_;
+  std::atomic<bool> tts_queue_done_{false};
+  std::atomic<bool> tts_streaming_active_{false};
+
+  // Separate HTTP client for TTS (owned by the TTS producer task).
+  esp_http_client_handle_t tts_http_client_{nullptr};
+
+  // PSRAM ring buffer (2MB) — SPSC, lock-free.
+  // Written by the TTS producer task, read by the speaker feeder task.
+  uint8_t *tts_audio_buffer_{nullptr};
+  static constexpr size_t TTS_AUDIO_BUFFER_SIZE = 2 * 1024 * 1024;
+  std::atomic<size_t> tts_audio_write_offset_{0};
+  std::atomic<size_t> tts_audio_read_offset_{0};
+  SemaphoreHandle_t tts_audio_data_ready_{nullptr};      // producer → feeder
+  SemaphoreHandle_t tts_audio_space_available_{nullptr};  // feeder → producer
+  std::atomic<bool> tts_audio_producer_done_{false};
+
+  // Sentence accumulator for streaming TTS.
+  std::string tts_pending_text_;
 
   // Ring buffer bridging the mic callback (producer, another task) and the
   // main loop (consumer). 16 KiB is enough to absorb mic bursts while the
@@ -543,6 +611,7 @@ class OpenAIResponses : public Component {
   LazyCallbackManager<void()> on_listening_cb_;
   LazyCallbackManager<void()> on_wake_word_detected_cb_;
   LazyCallbackManager<void(std::string)> on_stt_end_cb_;
+  LazyCallbackManager<void()> on_tool_start_cb_;
   LazyCallbackManager<void(std::string)> on_tts_start_cb_;
   LazyCallbackManager<void(std::string)> on_tts_end_cb_;
   LazyCallbackManager<void()> on_tts_stream_start_cb_;

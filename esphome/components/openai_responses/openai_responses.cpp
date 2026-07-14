@@ -122,6 +122,29 @@ static size_t base64_encode_to(const uint8_t *data, size_t len, char *out, size_
   return j;
 }
 
+/// Detects tool-call text leaks — when the model emits tool calls as text
+/// instead of structured function_call items. Multiple variants observed:
+///   <|tool_call>call:...<tool_call|>   (with underscores)
+///   <|toolcall>call:...<toolcall|>     (no underscore)
+///   <<tool_call>` (XML-style)
+/// Checks for all known opening/closing tag patterns.
+static bool is_tool_call_leak_(const std::string &text) {
+  // Opening tags: <|tool_call>, <|toolcall>
+  if (text.find("<|tool") != std::string::npos) {
+    return true;
+  }
+  // Closing tags: <tool_call|>, <toolcall|>
+  if (text.find("tool_call|>") != std::string::npos ||
+      text.find("toolcall|>") != std::string::npos) {
+    return true;
+  }
+  // XML-style: <<tool_call>
+  if (text.find("<tool_call>") != std::string::npos) {
+    return true;
+  }
+  return false;
+}
+
 /// Escapes a string for inclusion in a JSON string value (surrounding quotes
 /// are NOT added). Drops control characters below 0x20.
 static std::string escape_json_string_(const std::string &input) {
@@ -272,7 +295,26 @@ void OpenAIResponses::setup() {
     this->mark_failed();
     return;
   }
-}
+
+  // Streaming TTS: allocate the 2MB PSRAM ring buffer and semaphores.
+  // These stay resident for the component lifetime — reused across turns.
+  ExternalRAMAllocator<uint8_t> ext(ExternalRAMAllocator<uint8_t>::ALLOC_EXTERNAL);
+  this->tts_audio_buffer_ = ext.allocate(TTS_AUDIO_BUFFER_SIZE);
+  if (this->tts_audio_buffer_ == nullptr) {
+    ESP_LOGE(TAG, "Failed to allocate %u-byte TTS audio buffer", (unsigned) TTS_AUDIO_BUFFER_SIZE);
+    this->mark_failed();
+    return;
+  }
+  this->tts_queue_mutex_ = xSemaphoreCreateMutex();
+  this->tts_audio_data_ready_ = xSemaphoreCreateBinary();
+  this->tts_audio_space_available_ = xSemaphoreCreateBinary();
+  if (this->tts_queue_mutex_ == nullptr || this->tts_audio_data_ready_ == nullptr ||
+      this->tts_audio_space_available_ == nullptr) {
+    ESP_LOGE(TAG, "Failed to create TTS semaphores at setup");
+    this->mark_failed();
+    return;
+  }
+ }
 
 float OpenAIResponses::get_setup_priority() const { return setup_priority::AFTER_CONNECTION; }
 
@@ -381,6 +423,18 @@ void OpenAIResponses::deallocate_buffers_() {
   }
   this->speaker_buffer_index_ = 0;
 
+  // Stop streaming TTS tasks if still running.
+  this->stop_tts_producer_task_();
+  this->stop_speaker_feeder_task_();
+
+  // Free the PSRAM audio buffer (allocated in setup, freed on shutdown).
+  if (this->tts_audio_buffer_ != nullptr) {
+    ext.deallocate(this->tts_audio_buffer_, TTS_AUDIO_BUFFER_SIZE);
+    this->tts_audio_buffer_ = nullptr;
+  }
+  this->tts_queue_.clear();
+  this->tts_pending_text_.clear();
+
   this->response_text_.clear();
   this->response_text_.shrink_to_fit();
   this->reasoning_text_.clear();
@@ -446,6 +500,17 @@ void OpenAIResponses::reset_turn_state_() {
   this->speaker_buffer_index_ = 0;
   this->tts_header_skipped_ = false;
   this->tts_stream_started_ = false;
+
+  // Reset streaming TTS state (the PSRAM buffer itself stays allocated).
+  this->tts_pending_text_.clear();
+  this->tts_pending_text_.shrink_to_fit();
+  this->tts_queue_.clear();
+  this->tts_queue_done_ = false;
+  this->tts_streaming_active_ = false;
+  this->tts_audio_producer_done_ = false;
+  this->tts_audio_write_offset_ = 0;
+  this->tts_audio_read_offset_ = 0;
+  this->tts_task_should_exit_ = false;
 
   // Variable-size turn buffers: free (these can be ~1MB+ for multimodal
   // base64 and are rebuilt per turn anyway).
@@ -835,6 +900,24 @@ void OpenAIResponses::request_stop() {
   if (this->speaker_ != nullptr && !this->speaker_->is_stopped()) {
     this->speaker_->stop();
   }
+  // Cancel streaming TTS tasks if active.
+  if (this->tts_streaming_active_) {
+    this->tts_task_should_exit_ = true;
+    if (this->tts_queue_mutex_ != nullptr) {
+      xSemaphoreTake(this->tts_queue_mutex_, portMAX_DELAY);
+      this->tts_queue_.clear();
+      this->tts_queue_done_ = true;
+      xSemaphoreGive(this->tts_queue_mutex_);
+    }
+    if (this->tts_producer_task_.is_created()) {
+      xTaskNotifyGive(this->tts_producer_task_.get_handle());
+    }
+    xSemaphoreGive(this->tts_audio_data_ready_);
+    xSemaphoreGive(this->tts_audio_space_available_);
+    this->tts_audio_write_offset_ = 0;
+    this->tts_audio_read_offset_ = 0;
+    this->tts_audio_producer_done_ = false;
+  }
   // An explicit stop is not an error: teardown without firing on_error.
   this->set_state_(State::ERROR_TEARDOWN);
 }
@@ -940,79 +1023,57 @@ void OpenAIResponses::start_http_task_() {
   }
 }
 
-void OpenAIResponses::stop_http_task_() {
+bool OpenAIResponses::stop_http_task_() {
   // Signal the task to exit. The task checks http_task_should_exit_ in its
   // read/write loops and, when it sees the flag, calls close_http_() itself
   // (cleaning up the esp_http_client + TLS socket from the task that owns
   // them) before reaching vTaskSuspend(nullptr) at the end of http_task_fn_.
   //
-  // We must NOT vTaskDelete immediately after setting the flag: if the task
-  // is blocked inside esp_http_client_read() or xMessageBufferSend() when we
-  // delete it, the lwIP socket's internal state is left inconsistent, and
-  // the subsequent close_http_() from this (main loop) task crashes with an
-  // xQueueGenericSend assert (the socket's queue belongs to the deleted task).
+  // This function is NON-BLOCKING. If the task hasn't suspended yet, it
+  // returns false — ERROR_TEARDOWN retries on the next loop pass. This
+  // avoids blocking the main loop (watchdog) and avoids force-deleting the
+  // task while it's blocked in lwIP recv_tcp() (which corrupts lwIP state
+  // and crashes the tcpip_thread with an Interrupt WDT timeout).
   //
-  // Instead: set the flag, drain the message buffer (so any blocked
-  // xMessageBufferSend in the task unblocks), and wait up to 500ms for the
-  // task to suspend itself. Then destroy the (suspended) task.
+  // During active SSE streaming, the task exits within one read-chunk
+  // interval (~10-50ms). If there's a gap between deltas, it takes longer
+  // but ERROR_TEARDOWN keeps retrying until the task exits.
   this->http_task_should_exit_ = true;
 
-  bool suspended = false;  // hoisted out of the is_created() block
-  if (this->http_task_.is_created()) {
-    // Drain the message buffer so the task's xMessageBufferSend (if blocked
-    // on a full buffer) unblocks and can check the exit flag.
-    if (this->http_msg_buffer_ != nullptr) {
-      uint8_t drain[64];
-      while (xMessageBufferReceive(this->http_msg_buffer_, drain, sizeof(drain), 0) > 0) {
-        // discard
-      }
-    }
-
-    // Wait for the task to reach vTaskSuspend(nullptr). The task checks the
-    // exit flag in its read loops (every chunk, ~10-50ms), calls
-    // close_http_(), then suspends. We poll at 10ms intervals for up to 500ms
-    // (bounded to avoid tripping the main-loop watchdog). In the normal case
-    // (active stream), the task exits within one read-chunk interval.
-    for (int i = 0; i < 50; i++) {
-      if (eTaskGetState(this->http_task_.get_handle()) == eSuspended) {
-        suspended = true;
-        break;
-      }
-      vTaskDelay(pdMS_TO_TICKS(10));
-    }
-    if (!suspended) {
-      ESP_LOGW(TAG, "HTTP task did not suspend within 500ms; force-deleting (socket may be left dirty)");
-    }
-
-    // Now safe to delete — the task is suspended (not mid-syscall) and has
-    // already cleaned up its own HTTP client. If it didn't suspend in time,
-    // vTaskDelete is still safe from FreeRTOS's perspective; we handle the
-    // socket below.
-    this->http_task_.destroy();
-  }
-  this->http_task_should_exit_ = false;
-
-  // If the task suspended cleanly, it already called close_http_() itself
-  // (so http_client_ is null and this is a no-op). If we had to force-delete
-  // (task didn't suspend), do NOT call close_http_() — closing the socket
-  // from this task when its lwIP state is inconsistent crashes with an
-  // xQueueGenericSend assert. A leaked socket is preferable to a crash; it
-  // times out and frees itself.
-  if (suspended) {
-    this->close_http_();
-  } else {
-    this->http_client_ = nullptr;  // prevent double-free / stale access
+  if (!this->http_task_.is_created()) {
+    this->http_task_should_exit_ = false;
+    return true;  // nothing to stop
   }
 
-  // The message buffer is pre-allocated in setup() and reused across turns.
-  // Do NOT delete it here — just drain any pending messages so the next
-  // turn starts with a clean buffer.
+  // Drain the message buffer so the task's xMessageBufferSend (if blocked on
+  // a full buffer) unblocks and can check the exit flag.
   if (this->http_msg_buffer_ != nullptr) {
     uint8_t drain[64];
     while (xMessageBufferReceive(this->http_msg_buffer_, drain, sizeof(drain), 0) > 0) {
       // discard
     }
   }
+
+  // Non-blocking check: is the task suspended?
+  if (eTaskGetState(this->http_task_.get_handle()) != eSuspended) {
+    return false;  // not yet — ERROR_TEARDOWN will retry on the next loop pass
+  }
+
+  // Task suspended cleanly. It already called close_http_() itself, so
+  // http_client_ is null. Safe to destroy (not mid-syscall).
+  this->http_task_.destroy();
+  this->http_task_should_exit_ = false;
+  // close_http_() is a no-op if http_client_ is already null.
+  this->close_http_();
+
+  // Drain any messages the task sent before suspending (DONE/ERROR/etc).
+  if (this->http_msg_buffer_ != nullptr) {
+    uint8_t drain[64];
+    while (xMessageBufferReceive(this->http_msg_buffer_, drain, sizeof(drain), 0) > 0) {
+      // discard
+    }
+  }
+  return true;
 }
 
 void OpenAIResponses::http_task_fn_(void *arg) {
@@ -1618,9 +1679,13 @@ void OpenAIResponses::build_stt_multipart_body_() {
 }
 
 void OpenAIResponses::build_tts_request_body_() {
+  this->build_tts_request_body_for_(this->response_text_);
+}
+
+void OpenAIResponses::build_tts_request_body_for_(const std::string &text) {
   // POST /v1/audio/speech body:
-  //   {"model":"<tts_model>","input":"<response_text>","voice":"<tts_voice>","response_format":"wav"}
-  std::string escaped_input = escape_json_string_(this->response_text_);
+  //   {"model":"<tts_model>","input":"<text>","voice":"<tts_voice>","response_format":"wav"}
+  std::string escaped_input = escape_json_string_(text);
   std::string body =
       "{\"model\":\"" + this->tts_model_ + "\",\"input\":\"" + escaped_input +
       "\",\"voice\":\"" + this->tts_voice_ + "\",\"response_format\":\"wav\"}";
@@ -1638,6 +1703,447 @@ void OpenAIResponses::build_tts_request_body_() {
   memcpy(this->request_body_, body.data(), body.size());
   this->request_body_size_ = body.size();
   this->request_body_sent_ = 0;
+}
+
+// --- Streaming TTS helpers --------------------------------------------------
+
+size_t OpenAIResponses::find_sentence_boundary_(const std::string &text) {
+  if (text.size() < 40) {
+    return 0;
+  }
+  // Scan backward for the last sentence boundary: . ? ! \n
+  // For '.', require the next char to be a space + uppercase letter (avoid
+  // abbreviations like "Dr. Smith" or decimals like "3.14").
+  for (size_t i = text.size() - 1; i > 0; i--) {
+    char c = text[i];
+    if (c == '\n') {
+      return i + 1;
+    }
+    if (i + 2 < text.size()) {
+      if (c == '.' && text[i + 1] == ' ' && text[i + 2] >= 'A' && text[i + 2] <= 'Z') {
+        return i + 2;
+      }
+      if ((c == '?' || c == '!') && text[i + 1] == ' ') {
+        return i + 2;
+      }
+    }
+  }
+  return 0;
+}
+
+void OpenAIResponses::push_tts_sentence_(const std::string &sentence) {
+  if (sentence.empty()) {
+    return;
+  }
+  // Start the TTS producer + feeder tasks on the first sentence of a turn.
+  if (!this->tts_streaming_active_) {
+    this->tts_streaming_active_ = true;
+    this->tts_audio_producer_done_ = false;
+    this->tts_audio_write_offset_ = 0;
+    this->tts_audio_read_offset_ = 0;
+    this->start_tts_producer_task_();
+    this->start_speaker_feeder_task_();
+    // Fire on_tts_start with the partial response text accumulated so far.
+    this->on_tts_start_cb_.call(this->response_text_);
+  }
+  // Push the sentence to the thread-safe queue.
+  if (this->tts_queue_mutex_ != nullptr) {
+    xSemaphoreTake(this->tts_queue_mutex_, portMAX_DELAY);
+    this->tts_queue_.push_back(sentence);
+    xSemaphoreGive(this->tts_queue_mutex_);
+  }
+  // Wake the producer task if it's waiting for a sentence.
+  if (this->tts_producer_task_.is_created()) {
+    xTaskNotifyGive(this->tts_producer_task_.get_handle());
+  }
+}
+
+void OpenAIResponses::flush_tts_pending_() {
+  if (!this->tts_pending_text_.empty()) {
+    std::string text = strip_markdown_(this->tts_pending_text_);
+    if (!is_tool_call_leak_(text)) {
+      this->push_tts_sentence_(text);
+    }
+    this->tts_pending_text_.clear();
+  }
+  this->tts_queue_done_ = true;
+  if (this->tts_producer_task_.is_created()) {
+    xTaskNotifyGive(this->tts_producer_task_.get_handle());
+  }
+}
+
+void OpenAIResponses::write_to_audio_buffer_(const uint8_t *data, size_t len) {
+  // Write PCM data to the PSRAM ring buffer. Blocks if the buffer is full
+  // (natural backpressure — TTS pauses until the speaker catches up).
+  size_t off = 0;
+  while (off < len) {
+    // Check exit flag to avoid deadlock during stop (the feeder may have
+    // been stopped, so no one is draining the buffer).
+    if (this->tts_task_should_exit_) {
+      return;
+    }
+    size_t w = this->tts_audio_write_offset_.load(std::memory_order_relaxed);
+    size_t r = this->tts_audio_read_offset_.load(std::memory_order_relaxed);
+    size_t available_space = (r - w - 1 + TTS_AUDIO_BUFFER_SIZE) % TTS_AUDIO_BUFFER_SIZE;
+    if (available_space == 0) {
+      // Buffer full — wait for the feeder to drain some data.
+      xSemaphoreTake(this->tts_audio_space_available_, pdMS_TO_TICKS(100));
+      continue;
+    }
+    size_t to_write = (len - off < available_space) ? (len - off) : available_space;
+    // Handle wraparound: write in two parts if needed.
+    size_t first_part = (w + to_write > TTS_AUDIO_BUFFER_SIZE) ? (TTS_AUDIO_BUFFER_SIZE - w) : to_write;
+    memcpy(this->tts_audio_buffer_ + w, data + off, first_part);
+    if (to_write > first_part) {
+      memcpy(this->tts_audio_buffer_, data + off + first_part, to_write - first_part);
+    }
+    this->tts_audio_write_offset_ = (w + to_write) % TTS_AUDIO_BUFFER_SIZE;
+    off += to_write;
+    // Wake the feeder if it's waiting for data.
+    xSemaphoreGive(this->tts_audio_data_ready_);
+  }
+}
+
+// --- TTS producer task ------------------------------------------------------
+
+void OpenAIResponses::start_tts_producer_task_() {
+  this->tts_task_should_exit_ = false;
+  if (!this->tts_producer_task_.create(OpenAIResponses::tts_producer_task_fn_, "oai_tts_prod",
+                                        TTS_PRODUCER_STACK_SIZE, this, TTS_TASK_PRIORITY, false)) {
+    ESP_LOGE(TAG, "Failed to create TTS producer task");
+    this->fail_("task_alloc", "Failed to create TTS producer task");
+  }
+}
+
+void OpenAIResponses::stop_tts_producer_task_() {
+  this->tts_task_should_exit_ = true;
+  if (this->tts_producer_task_.is_created()) {
+    xTaskNotifyGive(this->tts_producer_task_.get_handle());
+    xSemaphoreGive(this->tts_audio_space_available_);  // unblock if waiting on full buffer
+    for (int i = 0; i < 50; i++) {
+      if (eTaskGetState(this->tts_producer_task_.get_handle()) == eSuspended) {
+        break;
+      }
+      vTaskDelay(pdMS_TO_TICKS(10));
+    }
+    this->tts_producer_task_.destroy();
+  }
+}
+
+void OpenAIResponses::tts_producer_task_fn_(void *arg) {
+  OpenAIResponses *self = (OpenAIResponses *) arg;
+
+  while (!self->tts_task_should_exit_) {
+    // Wait for a sentence or done signal. Use pdFALSE (counting semaphore)
+    // so multiple notifications don't collapse into one wake. The 100ms
+    // timeout is a safety net: if a notification is missed (e.g. given
+    // while the producer was between ulTaskNotifyTake and the queue check),
+    // the producer still wakes periodically to check for queued sentences.
+    ulTaskNotifyTake(pdFALSE, pdMS_TO_TICKS(100));
+    if (self->tts_task_should_exit_) {
+      break;
+    }
+
+    // Pop a sentence from the queue.
+    std::string sentence;
+    if (self->tts_queue_mutex_ != nullptr) {
+      xSemaphoreTake(self->tts_queue_mutex_, portMAX_DELAY);
+      if (self->tts_queue_.empty()) {
+        bool done = self->tts_queue_done_;
+        xSemaphoreGive(self->tts_queue_mutex_);
+        if (done) {
+          break;
+        }
+        continue;
+      }
+      sentence = std::move(self->tts_queue_.front());
+      self->tts_queue_.pop_front();
+      xSemaphoreGive(self->tts_queue_mutex_);
+    } else {
+      break;
+    }
+
+    if (sentence.empty()) {
+      continue;
+    }
+
+    ESP_LOGD(TAG, "TTS producer: generating audio for sentence (%u chars)",
+             (unsigned) sentence.size());
+
+    // Build TTS request body for this sentence.
+    self->build_tts_request_body_for_(sentence);
+    if (self->request_body_ == nullptr) {
+      ESP_LOGW(TAG, "TTS producer: failed to build request body, skipping sentence");
+      continue;
+    }
+
+    // Build the TTS URL.
+    char url[256];
+    snprintf(url, sizeof(url), "%s/v1/audio/speech", self->endpoint_base_.c_str());
+
+    // Configure the HTTP client.
+    esp_http_client_config_t config = {};
+    config.url = url;
+    config.method = HTTP_METHOD_POST;
+    config.timeout_ms = HTTP_TIMEOUT_MS;
+    config.event_handler = OpenAIResponses::http_event_handler_;
+    config.transport_type = HTTP_TRANSPORT_OVER_TCP;
+#if CONFIG_MBEDTLS_CERTIFICATE_BUNDLE
+    if (strstr(url, "https:") != nullptr) {
+      config.transport_type = HTTP_TRANSPORT_OVER_SSL;
+      config.crt_bundle_attach = esp_crt_bundle_attach;
+    }
+#endif
+
+    self->tts_http_client_ = esp_http_client_init(&config);
+    if (self->tts_http_client_ == nullptr) {
+      ESP_LOGE(TAG, "TTS producer: esp_http_client_init failed");
+      continue;
+    }
+
+    esp_http_client_set_method(self->tts_http_client_, HTTP_METHOD_POST);
+    esp_http_client_set_header(self->tts_http_client_, "Content-Type", "application/json");
+    if (!self->auth_header_value_.empty()) {
+      esp_http_client_set_header(self->tts_http_client_, "Authorization",
+                                 self->auth_header_value_.c_str());
+    }
+
+    // Open connection and write the request body.
+    esp_err_t err = esp_http_client_open(self->tts_http_client_, self->request_body_size_);
+    if (err != ESP_OK) {
+      ESP_LOGE(TAG, "TTS producer: esp_http_client_open failed: %s", esp_err_to_name(err));
+      esp_http_client_cleanup(self->tts_http_client_);
+      self->tts_http_client_ = nullptr;
+      continue;
+    }
+
+    size_t sent = 0;
+    while (sent < self->request_body_size_ && !self->tts_task_should_exit_) {
+      size_t remaining = self->request_body_size_ - sent;
+      size_t to_write = (remaining < HTTP_WRITE_CHUNK) ? remaining : HTTP_WRITE_CHUNK;
+      int written = esp_http_client_write(self->tts_http_client_,
+                                          reinterpret_cast<const char *>(self->request_body_ + sent), to_write);
+      if (written < 0) {
+        ESP_LOGE(TAG, "TTS producer: esp_http_client_write failed");
+        break;
+      }
+      sent += written;
+    }
+
+    if (self->tts_task_should_exit_) {
+      esp_http_client_cleanup(self->tts_http_client_);
+      self->tts_http_client_ = nullptr;
+      break;
+    }
+
+    // Fetch response headers.
+    int64_t header_len = esp_http_client_fetch_headers(self->tts_http_client_);
+    if (header_len < 0) {
+      ESP_LOGE(TAG, "TTS producer: fetch_headers failed");
+      esp_http_client_cleanup(self->tts_http_client_);
+      self->tts_http_client_ = nullptr;
+      continue;
+    }
+
+    int status = esp_http_client_get_status_code(self->tts_http_client_);
+    if (status != 200) {
+      ESP_LOGE(TAG, "TTS producer: HTTP status %d", status);
+      esp_http_client_cleanup(self->tts_http_client_);
+      self->tts_http_client_ = nullptr;
+      continue;
+    }
+
+    // Read the WAV response: skip 44-byte header, apply volume, write PCM to
+    // the PSRAM ring buffer.
+    size_t header_skip = 44;
+    uint8_t read_buf[HTTP_TASK_READ_CHUNK];
+    bool first_write = true;
+
+    while (!self->tts_task_should_exit_) {
+      int got = esp_http_client_read(self->tts_http_client_,
+                                     reinterpret_cast<char *>(read_buf), HTTP_TASK_READ_CHUNK);
+      if (got < 0) {
+        ESP_LOGE(TAG, "TTS producer: esp_http_client_read failed");
+        break;
+      }
+      if (got == 0) {
+        break;  // EOF
+      }
+
+      size_t off = 0;
+      // Skip the 44-byte WAV header (may span multiple chunks).
+      while (off < (size_t) got && header_skip > 0) {
+        size_t to_skip = (header_skip < (size_t) got - off) ? header_skip : ((size_t) got - off);
+        off += to_skip;
+        header_skip -= to_skip;
+      }
+
+      if (off < (size_t) got) {
+        size_t pcm_len = (size_t) got - off;
+        uint8_t *pcm = read_buf + off;
+
+        // Apply volume multiplier to int16 samples.
+        if (self->volume_multiplier_ != 1.0f) {
+          size_t num_samples = pcm_len / sizeof(int16_t);
+          int16_t *samples = reinterpret_cast<int16_t *>(pcm);
+          for (size_t i = 0; i < num_samples; i++) {
+            float scaled = (float) samples[i] * self->volume_multiplier_;
+            if (scaled > 32767.0f) {
+              scaled = 32767.0f;
+            } else if (scaled < -32768.0f) {
+              scaled = -32768.0f;
+            }
+            samples[i] = (int16_t) scaled;
+          }
+        }
+
+        // Write PCM to the PSRAM ring buffer (blocks if full = backpressure).
+        self->write_to_audio_buffer_(pcm, pcm_len);
+
+        if (first_write) {
+          first_write = false;
+          // Wake the feeder to start playing.
+          xSemaphoreGive(self->tts_audio_data_ready_);
+        }
+      }
+    }
+
+    esp_http_client_cleanup(self->tts_http_client_);
+    self->tts_http_client_ = nullptr;
+  }
+
+  // All sentences processed (or exit flag set).
+  self->tts_audio_producer_done_ = true;
+  xSemaphoreGive(self->tts_audio_data_ready_);  // wake feeder to check done flag
+  ESP_LOGD(TAG, "TTS producer task finished");
+  vTaskSuspend(nullptr);
+}
+
+// --- Speaker feeder task ----------------------------------------------------
+
+void OpenAIResponses::start_speaker_feeder_task_() {
+  if (!this->speaker_feeder_task_.create(OpenAIResponses::speaker_feeder_task_fn_, "oai_spk_feed",
+                                          SPEAKER_FEEDER_STACK_SIZE, this, TTS_TASK_PRIORITY, false)) {
+    ESP_LOGE(TAG, "Failed to create speaker feeder task");
+    this->fail_("task_alloc", "Failed to create speaker feeder task");
+  }
+}
+
+void OpenAIResponses::stop_speaker_feeder_task_() {
+  // Ensure the feeder knows to exit (stop_tts_producer_task_ also sets this,
+  // but we set it here too in case stop_speaker_feeder_task_ is called
+  // independently).
+  this->tts_task_should_exit_ = true;
+  // Unblock the feeder if it's waiting on tts_audio_data_ready_.
+  xSemaphoreGive(this->tts_audio_data_ready_);
+  if (this->speaker_feeder_task_.is_created()) {
+    for (int i = 0; i < 50; i++) {
+      if (eTaskGetState(this->speaker_feeder_task_.get_handle()) == eSuspended) {
+        break;
+      }
+      vTaskDelay(pdMS_TO_TICKS(10));
+    }
+    this->speaker_feeder_task_.destroy();
+  }
+}
+
+void OpenAIResponses::speaker_feeder_task_fn_(void *arg) {
+  OpenAIResponses *self = (OpenAIResponses *) arg;
+  bool speaker_started = false;
+  uint8_t read_buf[SPEAKER_FEEDER_CHUNK];
+
+  while (!self->tts_task_should_exit_) {
+    size_t w = self->tts_audio_write_offset_.load(std::memory_order_relaxed);
+    size_t r = self->tts_audio_read_offset_.load(std::memory_order_relaxed);
+    size_t available = (w - r + TTS_AUDIO_BUFFER_SIZE) % TTS_AUDIO_BUFFER_SIZE;
+
+    if (available == 0) {
+      if (self->tts_audio_producer_done_) {
+        // All audio drained.
+        break;
+      }
+      // Buffer empty but more coming — wait for producer.
+      xSemaphoreTake(self->tts_audio_data_ready_, pdMS_TO_TICKS(100));
+      continue;
+    }
+
+    // Read a chunk from the ring buffer (handle wraparound).
+    size_t to_read = (available < SPEAKER_FEEDER_CHUNK) ? available : SPEAKER_FEEDER_CHUNK;
+    size_t first_part = (r + to_read > TTS_AUDIO_BUFFER_SIZE) ? (TTS_AUDIO_BUFFER_SIZE - r) : to_read;
+    memcpy(read_buf, self->tts_audio_buffer_ + r, first_part);
+    if (to_read > first_part) {
+      memcpy(read_buf + first_part, self->tts_audio_buffer_, to_read - first_part);
+    }
+    self->tts_audio_read_offset_ = (r + to_read) % TTS_AUDIO_BUFFER_SIZE;
+
+    // Wake producer if it was blocked on full buffer.
+    xSemaphoreGive(self->tts_audio_space_available_);
+
+    // Start the speaker on the first chunk, or restart it if it stopped
+    // mid-playback (internal ring buffer drained while waiting for more
+    // data from the PSRAM buffer).
+    if (speaker_started && self->speaker_ != nullptr &&
+        self->speaker_->is_stopped()) {
+      // Speaker stopped (underrun). Restart it to accept more audio.
+      self->speaker_->start();
+    }
+    if (!speaker_started) {
+      speaker_started = true;
+      if (self->speaker_ != nullptr) {
+        self->speaker_->set_audio_stream_info(
+            audio::AudioStreamInfo(MIC_BITS_PER_SAMPLE, MIC_CHANNELS, self->tts_sample_rate_));
+        self->speaker_->start();
+      }
+      // Signal the main loop to fire on_tts_stream_start.
+      uint8_t start_msg = (uint8_t) HttpMsgType::TTS_STREAM_START;
+      xMessageBufferSend(self->http_msg_buffer_, &start_msg, 1, portMAX_DELAY);
+    }
+
+    // Feed to speaker — use non-blocking play() (timeout=0) with a retry
+    // loop. The blocking variant (timeout>0) calls vTaskDelay() while the
+    // speaker is in STATE_STARTING, which blocks forever with portMAX_DELAY
+    // even after the speaker transitions to STATE_RUNNING. The retry loop
+    // with vTaskDelay(1) yields to the speaker's task so it can transition
+    // to STATE_RUNNING, then play() succeeds once the ring buffer has space.
+    if (self->speaker_ != nullptr) {
+      size_t off = 0;
+      while (off < to_read && !self->tts_task_should_exit_) {
+        size_t written = self->speaker_->play(read_buf + off, to_read - off, 0);
+        if (written == 0) {
+          // Speaker can't accept data right now. If it's stopped (state
+          // STATE_STOPPED after draining its ring buffer), break out so the
+          // feeder loop can check the PSRAM buffer for more data and either
+          // restart the speaker or finish. Otherwise (STATE_STARTING or ring
+          // buffer full), yield and retry.
+          if (self->speaker_->is_stopped()) {
+            break;
+          }
+          vTaskDelay(pdMS_TO_TICKS(1));
+          continue;
+        }
+        off += written;
+        // Yield to other tasks (especially the main loop) so the gt911 touch
+        // component can process touch events. Without this yield, the feeder
+        // runs in a tight loop (play succeeds immediately when the i2s ring
+        // buffer has space) and starves the main loop, preventing the stop
+        // button from being detected.
+        vTaskDelay(pdMS_TO_TICKS(1));
+      }
+    }
+  }
+
+  // Finished: finish the speaker and signal the main loop.
+  if (speaker_started && self->speaker_ != nullptr && !self->tts_task_should_exit_) {
+    self->speaker_->finish();
+  }
+  // Send TTS_STREAM_DONE to the main loop (unless we're being cancelled —
+  // request_stop handles its own teardown).
+  if (!self->tts_task_should_exit_) {
+    uint8_t done_msg = (uint8_t) HttpMsgType::TTS_STREAM_DONE;
+    xMessageBufferSend(self->http_msg_buffer_, &done_msg, 1, portMAX_DELAY);
+  }
+  ESP_LOGD(TAG, "Speaker feeder task finished");
+  vTaskSuspend(nullptr);
 }
 
 // --- Response processing ---------------------------------------------------
@@ -1780,12 +2286,39 @@ void OpenAIResponses::process_sse_line_(const char *line, size_t len) {
     JsonObject root = doc.as<JsonObject>();
     const char *delta = root["delta"];
     if (delta != nullptr && delta[0] != '\0') {
+      bool first_delta = this->response_text_.empty();
       this->response_text_.append(delta);
 #ifdef USE_TEXT_SENSOR
-      if (this->text_response_sensor_ != nullptr) {
+      // Only publish on the first delta (for initial display) and at DONE
+      // (for final text). Publishing on every delta generates massive log
+      // spam for long responses and the text doesn't all fit on the screen.
+      if (first_delta && this->text_response_sensor_ != nullptr) {
         this->text_response_sensor_->publish_state(this->response_text_);
       }
 #endif
+      // Streaming TTS: accumulate text and push sentences to the TTS queue
+      // as they complete. The TTS producer task generates audio concurrently
+      // with the SSE stream, and the feeder task plays it continuously.
+      if (this->streaming_tts_) {
+        this->tts_pending_text_.append(delta);
+        this->tts_pending_text_ = strip_markdown_(this->tts_pending_text_);
+        size_t split_pos = this->find_sentence_boundary_(this->tts_pending_text_);
+        if (split_pos > 0) {
+          std::string sentence = this->tts_pending_text_.substr(0, split_pos);
+          this->tts_pending_text_ = this->tts_pending_text_.substr(split_pos);
+          if (is_tool_call_leak_(sentence)) {
+            ESP_LOGW(TAG, "Tool call text leak detected, suppressing from TTS: %.80s",
+                     sentence.c_str());
+          } else {
+            this->push_tts_sentence_(sentence);
+          }
+        } else if (this->tts_pending_text_.size() >= 200) {
+          if (!is_tool_call_leak_(this->tts_pending_text_)) {
+            this->push_tts_sentence_(this->tts_pending_text_);
+          }
+          this->tts_pending_text_.clear();
+        }
+      }
     }
     return;
   }
@@ -2872,6 +3405,12 @@ void OpenAIResponses::loop() {
         this->process_sse_bytes_(recv_buf + 1, received - 1);
         break;  // keep draining
       }
+      // TTS_STREAM_START can arrive during READING_CHAT (the feeder task
+      // starts the speaker while SSE is still streaming).
+      if (type == HttpMsgType::TTS_STREAM_START) {
+        this->on_tts_stream_start_cb_.call();
+        break;  // keep draining SSE messages
+      }
       // DONE or ERROR: the HTTP task has finished. Clean up and process.
       this->stop_http_task_();
       if (type == HttpMsgType::ERROR_) {
@@ -2894,6 +3433,18 @@ void OpenAIResponses::loop() {
         if (this->mcp_servers_.empty()) {
           this->fail_("no_mcp_servers", "LLM requested tool calls but no MCP servers configured");
           break;
+        }
+        // Abort any streaming TTS that may have started on preamble text.
+        if (this->tts_streaming_active_) {
+          this->stop_tts_producer_task_();
+          this->stop_speaker_feeder_task_();
+          this->tts_queue_.clear();
+          this->tts_queue_done_ = false;
+          this->tts_streaming_active_ = false;
+          this->tts_audio_producer_done_ = false;
+          this->tts_audio_write_offset_ = 0;
+          this->tts_audio_read_offset_ = 0;
+          this->tts_pending_text_.clear();
         }
         this->tool_round_++;
         if (this->tool_round_ > MAX_TOOL_ROUNDS) {
@@ -2921,6 +3472,7 @@ void OpenAIResponses::loop() {
         // Routes were already built during FETCHING_TOOLS; go straight to execution.
         this->current_tool_index_ = 0;
         this->mcp_phase_ = McpPhase::EXECUTING;
+        this->on_tool_start_cb_.call();
         this->set_state_(State::EXECUTING_TOOLS);
         break;
       }
@@ -2950,12 +3502,34 @@ void OpenAIResponses::loop() {
 #endif
         }
       }
-      // Strip markdown formatting from the response text before TTS — models
-      // don't always follow "no markdown" instructions, and TTS reads markdown
-      // syntax literally (e.g., "hash hash hash" for "###").
+      // Strip markdown formatting from the full response text for display.
       this->response_text_ = strip_markdown_(this->response_text_);
+      // Check for tool-call text leak — if the response is a leaked tool call,
+      // don't TTS it. Use "Done." as a fallback acknowledgment.
+      if (is_tool_call_leak_(this->response_text_)) {
+        ESP_LOGW(TAG, "Tool call text leak in full response, replacing with Done.");
+        this->response_text_ = "Done.";
+      }
+#ifdef USE_TEXT_SENSOR
+      if (this->text_response_sensor_ != nullptr) {
+        this->text_response_sensor_->publish_state(this->response_text_);
+      }
+#endif
       ESP_LOGD(TAG, "Chat response (%u chars): %s", (unsigned) this->response_text_.size(),
                this->response_text_.c_str());
+
+      // --- Streaming TTS path ---
+      // If sentences were pushed to the TTS queue during SSE streaming,
+      // flush any remaining text and transition to STREAMING_TTS_DRAIN to
+      // wait for the feeder task to finish playing.
+      if (this->tts_streaming_active_) {
+        this->flush_tts_pending_();
+        this->set_state_(State::STREAMING_TTS_DRAIN);
+        break;
+      }
+
+      // --- Non-streaming fallback (streaming_tts: false or no text was
+      // streamed) ---
       // Build the TTS request and start the HTTP task BEFORE firing
       // on_tts_start. The HTTP task runs on a separate FreeRTOS task, so once
       // start_http_task_() returns, the network request is in flight. We can
@@ -2977,6 +3551,40 @@ void OpenAIResponses::loop() {
       // Fire on_tts_start now — the display update overlaps with the TTS HTTP
       // request running on the HTTP task.
       this->on_tts_start_cb_.call(this->response_text_);
+      break;
+    }
+
+    case State::STREAMING_TTS_DRAIN: {
+      // SSE done; TTS producer + feeder still draining the PSRAM ring buffer.
+      // Wait for TTS_STREAM_DONE from the feeder task.
+      uint8_t recv_buf[128];
+      size_t received = xMessageBufferReceive(this->http_msg_buffer_, recv_buf, sizeof(recv_buf), 0);
+      if (received == 0) {
+        break;  // no message yet
+      }
+      HttpMsgType type = (HttpMsgType) recv_buf[0];
+      if (type == HttpMsgType::TTS_STREAM_START) {
+        this->on_tts_stream_start_cb_.call();
+        break;
+      }
+      if (type == HttpMsgType::ERROR_) {
+        size_t off = 1;
+        uint8_t code_len = recv_buf[off++];
+        std::string code((const char *) (recv_buf + off), code_len);
+        off += code_len;
+        uint8_t msg_len = recv_buf[off++];
+        std::string message((const char *) (recv_buf + off), msg_len);
+        this->stop_tts_producer_task_();
+        this->stop_speaker_feeder_task_();
+        this->fail_(code, message);
+        break;
+      }
+      // TTS_STREAM_DONE: all audio has been played by the feeder.
+      this->stop_tts_producer_task_();
+      this->stop_speaker_feeder_task_();
+      this->on_tts_stream_end_cb_.call();
+      this->on_tts_end_cb_.call(this->response_text_);
+      this->set_state_(State::DRAINING_AUDIO);
       break;
     }
 
@@ -3258,7 +3866,20 @@ void OpenAIResponses::loop() {
       // Cleanup path for both errors and explicit stops. Kill the HTTP task
       // if still running, stop the speaker + mic, then wait for them to stop
       // before tearing down fully.
-      this->stop_http_task_();
+      // stop_http_task_() is non-blocking: returns false if the task hasn't
+      // suspended yet (blocked in recv_tcp). Retry on the next loop pass.
+      if (!this->stop_http_task_()) {
+        break;  // retry next pass — task is still exiting
+      }
+      // Stop streaming TTS tasks if active (the feeder calls play() on the
+      // speaker, so it must be stopped before we stop the speaker). Stop the
+      // feeder first (consumer) so the producer (which may be blocked on a
+      // full buffer) can exit.
+      if (this->tts_streaming_active_ || this->tts_producer_task_.is_created() ||
+          this->speaker_feeder_task_.is_created()) {
+        this->stop_speaker_feeder_task_();
+        this->stop_tts_producer_task_();
+      }
       if (this->speaker_ != nullptr && !this->speaker_->is_stopped()) {
         this->speaker_->stop();
         break;  // wait for speaker to stop (shared i2s bus)

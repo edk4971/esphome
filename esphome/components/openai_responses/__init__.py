@@ -63,6 +63,7 @@ CONF_SILENCE_THRESHOLD = "silence_threshold"
 CONF_SILENCE_DURATION_MS = "silence_duration_ms"
 CONF_MAX_RECORDING_MS = "max_recording_ms"
 CONF_VOLUME_MULTIPLIER = "volume_multiplier"
+CONF_STREAMING_TTS = "streaming_tts"
 CONF_TOOLS_FILE = "tools_file"
 CONF_TOOLS_CACHE_TTL = "tools_cache_ttl"
 CONF_TEXT_REQUEST = "text_request"
@@ -80,6 +81,7 @@ CONF_MCP_SERVER_API_KEY = "api_key"
 CONF_ON_END = "on_end"
 CONF_ON_LISTENING = "on_listening"
 CONF_ON_STT_END = "on_stt_end"
+CONF_ON_TOOL_START = "on_tool_start"
 CONF_ON_TTS_END = "on_tts_end"
 CONF_ON_TTS_START = "on_tts_start"
 CONF_ON_TTS_STREAM_END = "on_tts_stream_end"
@@ -182,6 +184,7 @@ CONFIG_SCHEMA = cv.All(
             cv.Optional(CONF_VOLUME_MULTIPLIER, default=1.0): cv.float_range(
                 min=0.0, min_included=False
             ),
+            cv.Optional(CONF_STREAMING_TTS, default=True): cv.boolean,
             # A pre-formatted Responses-API "tools" JSON array (flattened:
             # {"type":"function","name":"X","description":"Y","parameters":{...}}).
             # Delivered to C++ as a generated raw-string header (large JSON
@@ -205,6 +208,7 @@ CONFIG_SCHEMA = cv.All(
                 single=True
             ),
             cv.Optional(CONF_ON_STT_END): automation.validate_automation(single=True),
+            cv.Optional(CONF_ON_TOOL_START): automation.validate_automation(single=True),
             cv.Optional(CONF_ON_TTS_START): automation.validate_automation(single=True),
             cv.Optional(CONF_ON_TTS_END): automation.validate_automation(single=True),
             cv.Optional(CONF_ON_TTS_STREAM_START): automation.validate_automation(
@@ -274,6 +278,7 @@ async def to_code(config):
     cg.add(var.set_silence_duration_ms(config[CONF_SILENCE_DURATION_MS]))
     cg.add(var.set_max_recording_ms(config[CONF_MAX_RECORDING_MS]))
     cg.add(var.set_volume_multiplier(config[CONF_VOLUME_MULTIPLIER]))
+    cg.add(var.set_streaming_tts(config[CONF_STREAMING_TTS]))
 
     # MCP tools cache TTL (only meaningful with mcp_servers, but always set).
     cg.add(var.set_tools_cache_ttl_ms(config[CONF_TOOLS_CACHE_TTL]))
@@ -339,6 +344,7 @@ async def to_code(config):
         (CONF_ON_START, "add_on_start_callback", []),
         (CONF_ON_WAKE_WORD_DETECTED, "add_on_wake_word_detected_callback", []),
         (CONF_ON_STT_END, "add_on_stt_end_callback", [(cg.std_string, "x")]),
+        (CONF_ON_TOOL_START, "add_on_tool_start_callback", []),
         (CONF_ON_TTS_START, "add_on_tts_start_callback", [(cg.std_string, "x")]),
         (CONF_ON_TTS_END, "add_on_tts_end_callback", [(cg.std_string, "x")]),
         (CONF_ON_TTS_STREAM_START, "add_on_tts_stream_start_callback", []),

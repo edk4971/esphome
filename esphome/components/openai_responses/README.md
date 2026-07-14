@@ -30,16 +30,28 @@ works.
 - **Client-side MCP tools** — when the LLM returns function_call items, the
   component executes them via MCP servers and re-queries the LLM with the
   results (up to 5 rounds per turn). Round-2+ sends only the tool outputs.
+- **Streaming TTS** — generates audio for each sentence as it arrives from
+  the LLM, using a 2MB PSRAM ring buffer and a feeder task for crackle-free
+  continuous playback. The user hears speech within ~2-3 seconds of the first
+  text delta, not after the full response completes
 - **Streaming chat** — SSE with semantic event types for lower latency
-- **TTS playback** — fetches audio from `/v1/audio/speech` and plays it
-  through the i2s speaker
+- **Markdown stripping** — removes markdown formatting (headers, bold, bullet
+  points, numbered lists) from response text before TTS — models don't always
+  follow "no markdown" instructions
+- **Tool-call text leak suppression** — detects when the model emits tool
+  calls as text (`<|tool_call>`, `<|toolcall>`, `
 - **Home Assistant integration** — text sensors for transcript/response,
-  HA-exposed mute switch, media_player announcement pipeline, and the
-  `HassBroadcast` MCP tool
-- **PSRAM-optimized** — all audio buffers, HTTP request bodies, and JSON
-  documents live in PSRAM to preserve internal heap
+  HA-exposed mute switch, media_player announcement pipeline, the
+  `HassBroadcast` MCP tool, and a `stop_assistant` API service for remote
+  stop during TTS playback
+- **PSRAM-optimized** — all audio buffers, HTTP request bodies, JSON
+  documents, and the 2MB streaming TTS ring buffer live in PSRAM to preserve
+  internal heap
 - **Local VAD** — energy-based voice activity detection with configurable
   threshold, onset, and silence duration
+- **Vector-drawn display** — all display pages use Material Design Icons
+  (MDI) glyphs + text instead of PNG images, rendering ~4x faster and saving
+  ~460KB of flash
 
 ## Installation
 
@@ -103,6 +115,7 @@ openai_responses:
 
   # Audio / VAD
   volume_multiplier: 2.5
+  streaming_tts: true              # sentence-by-sentence TTS (default); false = single request
   silence_threshold: 0.002
   silence_duration_ms: 700ms
   max_recording_ms: 30000ms
@@ -130,8 +143,10 @@ A conversation turn flows through these stages:
 Wake word → stop MWW → start mic → listen (VAD) → record speech →
   stop mic → build request → send to server →
   [STT (Mode 2 only) →] responses (streamed SSE) →
+  [streaming TTS starts on first sentence boundary (concurrent with SSE)] →
   [function_call items → MCP servers → re-query LLM (round 2+) →] →
-  TTS → play audio → restart MWW → idle
+  [SSE done → STREAMING_TTS_DRAIN (wait for feeder to finish playing)] →
+  DRAINING_AUDIO → restart MWW → idle
 ```
 
 The component owns the `micro_wake_word` lifecycle: it stops MWW when a turn
@@ -146,9 +161,37 @@ This means round-2+ requests (after tool execution) send **only** the
 `function_call_output` items — no tools array (~10KB+), no `instructions`,
 no user input. The server already has all of that from the stored response.
 
+The response `id` is captured from the `response.created` and
+`response.completed` SSE events (nested under `data.response.id`, per the
+openresponses spec).
+
 If the server doesn't support `store`/`previous_response_id` (or the id
 expires), the component falls back to rebuilding the full round-1 context
-(tools, instructions, user input) plus the tool outputs.
+(tools, instructions, user input, function_call items, and tool outputs).
+
+### Streaming TTS
+
+When `streaming_tts: true` (default), the component starts TTS playback
+**while the LLM is still streaming the response**. Three concurrent FreeRTOS
+tasks work together:
+
+1. **SSE HTTP task** — reads the LLM response stream, accumulates text,
+   detects sentence boundaries (`. ` + uppercase, `? `, `! `, newline;
+   minimum 40 chars, maximum 200 chars per chunk)
+2. **TTS producer task** — pops sentences from a thread-safe queue, sends
+   TTS HTTP requests, writes PCM to a 2MB PSRAM ring buffer
+3. **Speaker feeder task** — reads PCM from the ring buffer, feeds the i2s
+   speaker continuously via non-blocking play() with 1ms yields
+
+The 2MB PSRAM ring buffer decouples bursty TTS generation from continuous
+speaker playback. The speaker starts once and never stops until all audio
+is drained — no crackle, no underruns. The feeder yields 1ms after each
+play() call so the main loop can process touch events (stop button).
+
+Tool-call text leaks are detected and suppressed from TTS. Markdown
+formatting (headers, bold, bullet points, numbered lists) is stripped
+per-sentence before TTS. Set `streaming_tts: false` to revert to
+single-request TTS (waits for full response, then sends one TTS request).
 
 ### Two audio modes
 
@@ -181,7 +224,8 @@ client-side — no server-side MCP support required:
 
 1. The response streams via SSE. If `function_call` items appear in the
    `response.completed` output array, the component does **not** TTS the
-   response.
+   response. The `on_tool_start` callback fires (display switches to
+   "Searching..." with the MDI file-search icon).
 2. The component calls `tools/call` (JSON-RPC) on the appropriate MCP server,
    passing the tool name and arguments from the LLM's response.
 3. The tool result is injected as a `function_call_output` input item
@@ -297,10 +341,15 @@ micro_wake_word:
   stops it on start and restarts it after each turn (once the speaker stops,
   to avoid i2s bus contention).
 
-### Audio / VAD
+### Audio / VAD / TTS
 
 - **volume_multiplier** (*Optional*, float, default `1.0`): Multiplier applied
   to TTS PCM samples before playback.
+- **streaming_tts** (*Optional*, bool, default `true`): When true, generates
+  TTS audio per-sentence as text deltas arrive from the LLM, using a 2MB
+  PSRAM ring buffer and a feeder task for crackle-free continuous playback.
+  Set to `false` to use single-request TTS (waits for full response, then
+  sends one TTS request — simpler but higher latency for long responses).
 - **silence_threshold** (*Optional*, float, default `0.01`): RMS amplitude
   (0.0–1.0, relative to full-scale int16) below which audio is considered
   silence. On the S3-Box-3 with the ES7210 at default gain, idle noise reads
@@ -355,8 +404,12 @@ All triggers are single-automation. They use the callback-manager pattern
 - **on_wake_word_detected**: Fired if a `wake_word` was supplied to the
   `start` action.
 - **on_stt_end** (`x` = transcript string): Fired when STT completes (Mode 2).
+- **on_tool_start**: Fired when the LLM requests tool calls and the component
+  transitions to EXECUTING_TOOLS. Use to switch the display to a "Searching..."
+  state.
 - **on_tts_start** (`x` = response text): Fired before the TTS request is
-  sent.
+  sent. With streaming TTS, fires when the first sentence is pushed to the
+  queue (before the full response is complete).
 - **on_tts_stream_start**: Fired when the TTS audio stream begins playing.
 - **on_tts_stream_end**: Fired when the TTS audio stream finishes.
 - **on_tts_end** (`x` = response text): Fired after TTS playback completes.
@@ -370,6 +423,9 @@ All triggers are single-automation. They use the callback-manager pattern
   `silence_detection` (bool, default true) and `wake_word` (templatable
   string).
 - **openai_responses.stop**: Stop the current turn and tear down.
+- **stop_assistant** (API service): Stop the current turn remotely from
+  Home Assistant. Useful when the touch button is unresponsive during TTS
+  playback.
 
 ### Conditions
 
@@ -392,8 +448,10 @@ IDLE → STARTING_TURN → STARTING_MICROPHONE → LISTENING (mic on, VAD) →
   BUILDING_REQUEST → SENDING_REQUEST →
     READING_CHAT (multimodal) or READING_STT (Mode 2) →
   [Mode 2: SENDING_REQUEST (chat) → READING_CHAT] →
+  [streaming TTS starts on first sentence (concurrent with READING_CHAT)] →
   [function_call: EXECUTING_TOOLS → SENDING_REQUEST (MCP) → READING_MCP →
     EXECUTING_TOOLS → ... → SENDING_REQUEST (responses round 2) → READING_CHAT] →
+  [streaming TTS: STREAMING_TTS_DRAIN (SSE done, feeder draining buffer)] →
   SENDING_REQUEST (TTS) → READING_TTS → DRAINING_AUDIO → IDLE
 ```
 
@@ -411,8 +469,11 @@ All audio and HTTP buffers live in PSRAM:
 - Ring buffer (mic → loop): 16 KB
 - Recording buffer: `max_recording_ms * 32` bytes (worst case ~960 KB)
 - Request body (JSON + base64, or multipart, or MCP JSON-RPC): sized to payload
-- SSE line buffer: 8 KB
+- SSE line buffer: 32 KB (Responses API lifecycle events can be large)
 - Speaker buffer: 16 KB
+- Streaming TTS ring buffer: 2 MB (PSRAM, allocated once at setup, reused)
+- TTS producer task stack: 8 KB (internal RAM)
+- Speaker feeder task stack: 4 KB (internal RAM)
 - Retained base64 audio (for tool round 2+ multimodal fallback): sized to the b64 payload
 - MCP tools cache (`cached_tools_json_`): sized to the tools/list response
 
@@ -425,19 +486,36 @@ MCP server session state persist across turns (refreshed on a TTL basis).
 - Conversation history is **single-turn**: each round-1 request contains
   only the `instructions` and the current user utterance. Tool rounds within
   a turn use `previous_response_id` to reference the stored response, so
-  round 2+ sends only the `function_call_output` items. The history is
+  round 2+ sends only the new `function_call_output` items. The history is
   cleared when the turn ends; cross-turn conversation memory is a future
   enhancement.
+- Round-2+ requests do **not** re-send the tools array or `instructions`.
+  Per the Responses API spec, the server restores them from the stored
+  response. This shrinks both the request (~200 bytes vs ~16KB) and the
+  response lifecycle events (~763 bytes vs ~17KB).
 - When the LLM returns an empty response (no output_text), the component
-  uses "Done." as a default acknowledgment instead of erroring. This handles
-  broadcast/tool scenarios where the LLM has nothing to say after executing
-  a tool.
-- The TTS WAV header (44 bytes) is skipped once so only raw PCM reaches the
-  speaker. Set `tts_sample_rate` to match your TTS server's output.
+  uses "Done." as a default acknowledgment instead of erroring.
+- Markdown formatting is stripped from response text before TTS — models
+  don't always follow "no markdown" instructions, and TTS reads markdown
+  syntax literally (e.g., "hash hash hash" for "###").
+- Tool-call text leaks (when the model emits tool calls as text instead of
+  structured function_call items) are detected and suppressed from TTS.
+- The text response sensor publishes only on the first delta and at DONE
+  (not every delta) to reduce log spam for long responses.
+- The TTS WAV header (44 bytes) is skipped per sentence in streaming mode,
+  or once in non-streaming mode. Set `tts_sample_rate` to match your TTS
+  server's output.
 - All responses requests use `stream: true` (SSE) to reduce latency.
 - The `tools_file` JSON is used as a fallback when MCP servers are
   unreachable. When `mcp_servers` is configured, the live tools list takes
   precedence.
+- `stop_http_task_()` is non-blocking: if the HTTP task is blocked in lwIP
+  `recv()` (mid-SSE-stream), it returns false and ERROR_TEARDOWN retries on
+  the next loop pass. This avoids force-deleting tasks blocked in lwIP,
+  which corrupts socket state and crashes the tcpip_thread.
+- The `stop_assistant` API service allows stopping a turn from Home
+  Assistant when the touch button is unresponsive (e.g., during TTS
+  playback with I2C bus contention).
 
 ## Responses API vs Chat Completions
 
@@ -457,6 +535,8 @@ the tool results, not the full context.
 | SSE text | `choices[0].delta.content` | `response.output_text.delta` |
 | SSE tool calls | `delta.tool_calls[i].function.arguments` | `response.function_call_arguments.delta` |
 | SSE completion | `finish_reason:"tool_calls"` | `response.completed` with `function_call` items |
+| SSE response id | N/A | `data.response.id` (nested under `response` key) |
+| Streaming TTS | Not supported (wait for full response) | Per-sentence TTS with 2MB PSRAM buffer |
 
 The sibling `openai_conversations` component uses Chat Completions for
 servers that don't implement the Responses API.
