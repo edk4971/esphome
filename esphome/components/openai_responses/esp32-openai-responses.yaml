@@ -218,33 +218,20 @@ touchscreen:
           }
 
 # --- Binary sensors ----------------------------------------------------------
-# The S3-Box-3 home button is the red capacitive circle below the screen.
+# The S3-Box-3 home button is the red capacitive circle below the screen
+# (gt911 touch point index 0). Pressing it stops any in-progress conversation.
 #
-# The gt911 binary_sensor (index 0) relies on an I2C read after the GPIO
-# interrupt fires — if the I2C bus is busy during TTS playback (display
-# update, ADC read), the touch event is never processed and the button
-# appears dead.
+# The gt911 binary_sensor relies on an I2C read after the interrupt fires.
+# This works during most states (listening, thinking, idle) but may not fire
+# during TTS playback when the I2C bus is busy with display/audio tasks.
+# For the TTS case, use the `stop_assistant` API service from Home Assistant.
 #
-# To work around this, a template binary_sensor polls GPIO3 (the gt911 IRQ
-# pin) directly via gpio_get_level(). This reads the raw hardware pin state
-# without claiming the pin or touching the I2C bus — it's a microsecond
-# operation that works regardless of what's happening on I2C. The gt911
-# IRQ line is active-low (pulled low on touch), so level 0 = touched.
+# Note: We previously tried polling GPIO3 (the gt911 IRQ pin) directly via
+# gpio_get_level() to detect touches without I2C. This was removed because
+# the gt911 drives GPIO3 low for its own internal reasons (I2C communication,
+# configuration, polling), causing constant false triggers. The raw pin
+# state is NOT a reliable touch indicator.
 binary_sensor:
-  # Primary stop: raw GPIO3 polling via ESP-IDF (no I2C, no pin conflict).
-  # Template binary sensors are evaluated on every loop() pass, so the poll
-  # rate is effectively the loop frequency (~10ms).
-  - platform: template
-    name: "S3 Box Home Button (GPIO)"
-    id: screen_home_key_gpio
-    lambda: |-
-      return gpio_get_level(GPIO_NUM_3) == 0;
-    on_press:
-      - lambda: |-
-          if (id(openai).is_running()) {
-            id(openai).request_stop();
-          }
-  # Secondary stop: gt911 touch point 0 (works when I2C is free).
   - platform: gt911
     name: "S3 Box Home Button"
     id: screen_home_key
@@ -459,6 +446,7 @@ openai_responses:
   # fires with the transcribed user text.
   on_stt_end:
     - lambda: id(request_text).publish_state(x);
+    - lambda: id(status_text).publish_state("Thinking...");
     - lambda: |-
         id(display_spi).show_page(thinking_page);
         id(display_spi).update();
@@ -562,29 +550,11 @@ spi:
   mosi_pin: 6
 
 # --- Casita illustrations (from voice_assistant project) ---------------------
+# Only idle and loading are kept — the other states use vector-drawn layouts
+# with MDI icon glyphs, which render ~4x faster than PNG blits.
 image:
   - file: https://github.com/esphome/wake-word-voice-assistants/raw/main/casita/idle_320_240.png
     id: casita_idle
-    resize: 320x240
-    type: RGB
-    transparency: alpha_channel
-  - file: https://github.com/esphome/wake-word-voice-assistants/raw/main/casita/listening_320_240.png
-    id: casita_listening
-    resize: 320x240
-    type: RGB
-    transparency: alpha_channel
-  - file: https://github.com/esphome/wake-word-voice-assistants/raw/main/casita/thinking_320_240.png
-    id: casita_thinking
-    resize: 320x240
-    type: RGB
-    transparency: alpha_channel
-  - file: https://github.com/esphome/wake-word-voice-assistants/raw/main/casita/replying_320_240.png
-    id: casita_replying
-    resize: 320x240
-    type: RGB
-    transparency: alpha_channel
-  - file: https://github.com/esphome/wake-word-voice-assistants/raw/main/casita/error_320_240.png
-    id: casita_error
     resize: 320x240
     type: RGB
     transparency: alpha_channel
@@ -616,41 +586,153 @@ display:
         lambda: |-
           it.fill(Color::BLACK);
           it.image((it.get_width() / 2), (it.get_height() / 2), id(casita_idle), ImageAlign::CENTER);
-          it.printf(10, 10, id(font_text), Color::WHITE, "Idle");
+          it.printf(it.get_width() / 2, 10, id(font_text), Color::WHITE, TextAlign::TOP_CENTER, "Idle");
       - id: listening_page
         lambda: |-
           it.fill(Color::BLACK);
-          it.printf(it.get_width() / 2, it.get_height() / 2, id(font_text), Color::WHITE, TextAlign::CENTER, "Listening...");
+          // ear-hearing icon centered at top
+          it.printf(it.get_width() / 2, 30, id(font_icon), Color::WHITE, TextAlign::TOP_CENTER, "\U000F07C5");
+          it.printf(it.get_width() / 2, 90, id(font_text), Color::WHITE, TextAlign::TOP_CENTER, "Listening...");
       - id: thinking_page
         lambda: |-
           it.fill(Color::BLACK);
-          it.printf(it.get_width() / 2, 30, id(font_text), Color::WHITE, TextAlign::TOP_CENTER, "Thinking...");
-          it.printf(30, 60, id(font_text), Color::WHITE, "%.60s", id(request_text).state.c_str());
+          // thought-bubble-outline icon centered at top
+          it.printf(it.get_width() / 2, 20, id(font_icon), Color::WHITE, TextAlign::TOP_CENTER, "\U000F07F7");
+          it.printf(it.get_width() / 2, 80, id(font_text), Color::WHITE, TextAlign::TOP_CENTER, "Thinking...");
+          // Word-wrapped request text
+          {
+            std::string text = id(request_text).state;
+            std::string line, word;
+            int y = 130, max_chars = 36, lh = 18;
+            for (size_t i = 0; i <= text.size(); i++) {
+              char c = (i < text.size()) ? text[i] : ' ';
+              if (c == ' ' || c == '\n') {
+                if (!word.empty()) {
+                  std::string t = line.empty() ? word : (line + " " + word);
+                  if (t.size() > max_chars && !line.empty()) {
+                    it.print(10, y, id(font_text_sm), Color(200, 200, 200), line.c_str());
+                    y += lh;
+                    if (y > 230) break;
+                    line = word;
+                  } else {
+                    line = t;
+                  }
+                  word.clear();
+                }
+                if (c == '\n' && !line.empty()) {
+                  it.print(10, y, id(font_text_sm), Color(200, 200, 200), line.c_str());
+                  y += lh;
+                  if (y > 230) break;
+                  line.clear();
+                }
+              } else {
+                word += c;
+              }
+            }
+            if (!line.empty() && y <= 230) {
+              it.print(10, y, id(font_text_sm), Color(200, 200, 200), line.c_str());
+            }
+          }
       - id: replying_page
         lambda: |-
-          it.fill(Color::WHITE);
-          it.image((it.get_width() / 2), (it.get_height() / 2), id(casita_replying), ImageAlign::CENTER);
-          it.filled_rectangle(20, 20, 280, 30, Color::WHITE);
-          it.rectangle(20, 20, 280, 30, Color::BLACK);
-          it.filled_rectangle(20, 190, 280, 30, Color::WHITE);
-          it.rectangle(20, 190, 280, 30, Color::BLACK);
-          it.printf(30, 25, id(font_text), Color::BLACK, "%.60s", id(request_text).state.c_str());
-          it.printf(30, 195, id(font_text), Color::BLACK, "%.60s", id(response_text).state.c_str());
+          it.fill(Color::BLACK);
+          // chat-processing icon centered at top
+          it.printf(it.get_width() / 2, 20, id(font_icon), Color::WHITE, TextAlign::TOP_CENTER, "\U000F0B7B");
+          it.printf(it.get_width() / 2, 80, id(font_text), Color::WHITE, TextAlign::TOP_CENTER, "Speaking...");
+          // Word-wrapped response text
+          {
+            std::string text = id(response_text).state;
+            std::string line, word;
+            int y = 110, max_chars = 36, lh = 18;
+            for (size_t i = 0; i <= text.size(); i++) {
+              char c = (i < text.size()) ? text[i] : ' ';
+              if (c == ' ' || c == '\n') {
+                if (!word.empty()) {
+                  std::string t = line.empty() ? word : (line + " " + word);
+                  if (t.size() > max_chars && !line.empty()) {
+                    it.print(10, y, id(font_text_sm), Color::WHITE, line.c_str());
+                    y += lh;
+                    if (y > 230) break;
+                    line = word;
+                  } else {
+                    line = t;
+                  }
+                  word.clear();
+                }
+                if (c == '\n' && !line.empty()) {
+                  it.print(10, y, id(font_text_sm), Color::WHITE, line.c_str());
+                  y += lh;
+                  if (y > 230) break;
+                  line.clear();
+                }
+              } else {
+                word += c;
+              }
+            }
+            if (!line.empty() && y <= 230) {
+              it.print(10, y, id(font_text_sm), Color::WHITE, line.c_str());
+            }
+          }
       - id: error_page
         lambda: |-
           it.fill(Color::BLACK);
-          it.image((it.get_width() / 2), (it.get_height() / 2), id(casita_error), ImageAlign::CENTER);
-          it.printf(10, 10, id(font_text), Color::WHITE, "Error: %s", id(status_text).state.c_str());
+          // Word-wrapped error text
+          {
+            std::string text = id(status_text).state;
+            std::string line, word;
+            int y = 100, max_chars = 36, lh = 18;
+            for (size_t i = 0; i <= text.size(); i++) {
+              char c = (i < text.size()) ? text[i] : ' ';
+              if (c == ' ' || c == '\n') {
+                if (!word.empty()) {
+                  std::string t = line.empty() ? word : (line + " " + word);
+                  if (t.size() > max_chars && !line.empty()) {
+                    it.print(10, y, id(font_text_sm), Color(200, 80, 80), line.c_str());
+                    y += lh;
+                    if (y > 230) break;
+                    line = word;
+                  } else {
+                    line = t;
+                  }
+                  word.clear();
+                }
+                if (c == '\n' && !line.empty()) {
+                  it.print(10, y, id(font_text_sm), Color(200, 80, 80), line.c_str());
+                  y += lh;
+                  if (y > 230) break;
+                  line.clear();
+                }
+              } else {
+                word += c;
+              }
+            }
+            if (!line.empty() && y <= 230) {
+              it.print(10, y, id(font_text_sm), Color(200, 80, 80), line.c_str());
+            }
+          }
       - id: muted_page
         lambda: |-
           it.fill(Color::BLACK);
           it.image((it.get_width() / 2), (it.get_height() / 2), id(casita_idle), ImageAlign::CENTER);
-          it.printf(10, 10, id(font_text), Color::WHITE, "Muted");
+          it.printf(it.get_width() / 2, 10, id(font_text), Color::WHITE, TextAlign::TOP_CENTER, "Muted");
 
 font:
   - file: "gfonts://Roboto"
     id: font_text
     size: 16
+  - file: "gfonts://Roboto"
+    id: font_text_sm
+    size: 14
+  # Material Design Icons — only the 5 glyphs we need are embedded (~2KB).
+  # Codepoints from https://pictogrammers.com/library/mdi/
+  - file: "https://raw.githubusercontent.com/Templarian/MaterialDesign-Webfont/master/fonts/materialdesignicons-webfont.ttf"
+    id: font_icon
+    size: 48
+    glyphs:
+      - "\U000F07C5"  # ear-hearing (listening)
+      - "\U000F07F7"  # thought-bubble-outline (thinking)
+      - "\U000F12D1"  # chat-sleep (idle)
+      - "\U000F0B7B"  # chat-processing (responding)
 
 color:
   - id: my_white
@@ -709,3 +791,8 @@ light:
     output: backlight_output
     restore_mode: RESTORE_DEFAULT_ON
     default_transition_length: 250ms
+
+# --- Display animation --------------------------------------------------------
+# Animation interval REMOVED. The periodic display.update() calls were
+# blocking the main loop, which delayed the gt911's I2C touch reads and
+# caused false stop-button activations via the GPIO3 polling workaround.
