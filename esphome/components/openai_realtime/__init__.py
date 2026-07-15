@@ -69,9 +69,13 @@ ConnectedCondition = openai_realtime_ns.class_(
 
 def _validate_endpoint(value):
     value = cv.string(value)
-    if not value.startswith(("ws://", "wss://")):
-        raise cv.Invalid("endpoint must start with ws:// or wss://")
-    return value
+    if value.startswith(("ws://", "wss://")):
+        return value
+    if value.startswith("https://"):
+        return "wss://" + value[len("https://"):]
+    if value.startswith("http://"):
+        return "ws://" + value[len("http://"):]
+    raise cv.Invalid("endpoint must start with http://, https://, ws:// or wss://")
 
 
 CONFIG_SCHEMA = cv.All(
