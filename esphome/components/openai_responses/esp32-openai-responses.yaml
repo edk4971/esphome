@@ -8,10 +8,13 @@
 # =============================================================================
 
 # --- External component ------------------------------------------------------
+# Uses a relative path so the config works regardless of the ESPHome working
+# directory (HA addon, Docker, or CLI). The path resolves relative to the
+# user's main YAML (which !includes common.yaml, which !includes this file).
 external_components:
   - source:
       type: local
-      path: /config
+      path: components
     components: [openai_responses]
 
 # --- openai_responses ---------------------------------------------------
