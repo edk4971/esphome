@@ -198,8 +198,6 @@ void OpenAIConversations::setup() {
   }
 }
 
-float OpenAIConversations::get_setup_priority() const { return setup_priority::AFTER_CONNECTION; }
-
 void OpenAIConversations::dump_config() {
   this->OpenAIHTTPBase::dump_config();
   ESP_LOGCONFIG(TAG, "OpenAI Conversations:");
@@ -2108,18 +2106,18 @@ void OpenAIConversations::loop() {
         if (!srv.initialized && !srv.stateless) {
           // Server hasn't been initialized and isn't known to be stateless.
           if (this->current_mcp_call_type_ == McpCallType::INITIALIZE) {
-            body = mcp_build_initialize_request(this->mcp_request_id_++);
+            body = openai_common::mcp_build_initialize_request(this->mcp_request_id_++);
             ESP_LOGV(TAG, "Initializing MCP server %u (%s)",
                      (unsigned) this->mcp_route_server_index_, srv.name.c_str());
           } else if (this->current_mcp_call_type_ == McpCallType::INITIALIZED_NOTIF) {
-            body = mcp_build_initialized_notification();
+            body = openai_common::mcp_build_initialized_notification();
             ESP_LOGV(TAG, "Sending notifications/initialized to server %u",
                      (unsigned) this->mcp_route_server_index_);
           }
         } else {
           // Already initialized or stateless: send tools/list.
           this->current_mcp_call_type_ = McpCallType::TOOLS_LIST;
-          body = mcp_build_tools_list_request(this->mcp_request_id_++);
+          body = openai_common::mcp_build_tools_list_request(this->mcp_request_id_++);
           ESP_LOGV(TAG, "Fetching tools from MCP server %u (%s)",
                    (unsigned) this->mcp_route_server_index_, srv.name.c_str());
         }
@@ -2190,7 +2188,7 @@ void OpenAIConversations::loop() {
         this->current_mcp_url_ = srv.url;
         this->current_mcp_auth_ = srv.auth_header;
         std::string body =
-            mcp_build_tools_call_request(this->mcp_request_id_++, tool.name, tool.arguments);
+            openai_common::mcp_build_tools_call_request(this->mcp_request_id_++, tool.name, tool.arguments);
         ExternalRAMAllocator<uint8_t> ext(ExternalRAMAllocator<uint8_t>::ALLOC_EXTERNAL);
         if (this->request_body_ != nullptr) {
           ext.deallocate(this->request_body_, this->request_body_capacity_);
