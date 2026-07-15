@@ -19,6 +19,7 @@ import esphome.codegen as cg
 import esphome.config_validation as cv
 from esphome import automation
 from esphome.automation import register_action, register_condition
+from esphome.const import CONF_ID
 
 # Components auto-loaded so their C++ is available without the user listing
 # them in their YAML. ``audio`` provides AudioStreamInfo, ``json`` provides the
