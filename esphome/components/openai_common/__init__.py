@@ -38,7 +38,7 @@ CONF_SILENCE_DETECTION = "silence_detection"
 CONF_WAKE_WORD = "wake_word"
 
 
-async def register_generic_openai_actions(
+def register_generic_openai_actions(
     component_cls, action_schema, start_action_cls, stop_action_cls, is_running_cond_cls
 ):
     """Register ``openai.start``, ``openai.stop`` and ``openai.is_running``.
