@@ -14,7 +14,7 @@
 external_components:
   - source:
       type: local
-      path: components
+      path: /config
     components: [openai_responses]
 
 # --- openai_responses ---------------------------------------------------
