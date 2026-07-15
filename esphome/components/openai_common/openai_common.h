@@ -34,7 +34,7 @@ namespace esphome::openai_common {
 class OpenAIBase : public Component {
  public:
   OpenAIBase() = default;
-  ~OpenAIBase() override = default;
+  ~OpenAIBase() = default;
 
   void dump_config() override;
   float get_setup_priority() const override;

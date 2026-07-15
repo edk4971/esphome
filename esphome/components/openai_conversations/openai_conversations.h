@@ -116,7 +116,7 @@ enum class RequestTarget : uint8_t {
 class OpenAIConversations : public esphome::openai_common::OpenAIHTTPBase {
  public:
   OpenAIConversations();
-  ~OpenAIConversations() override;
+  ~OpenAIConversations();
 
   void setup() override;
   void loop() override;

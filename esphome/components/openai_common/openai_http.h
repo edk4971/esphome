@@ -39,7 +39,7 @@ enum class HttpMsgType : uint8_t {
 class OpenAIHTTPBase : public OpenAIBase {
  public:
   OpenAIHTTPBase() = default;
-  ~OpenAIHTTPBase() override = default;
+  ~OpenAIHTTPBase() = default;
 
   void dump_config() override;
 

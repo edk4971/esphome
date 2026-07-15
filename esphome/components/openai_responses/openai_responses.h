@@ -122,7 +122,7 @@ enum class RequestTarget : uint8_t {
 class OpenAIResponses : public esphome::openai_common::OpenAIHTTPBase {
  public:
   OpenAIResponses();
-  ~OpenAIResponses() override;
+  ~OpenAIResponses();
 
   void setup() override;
   void loop() override;
