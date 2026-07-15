@@ -11,7 +11,7 @@
 
 ---
 
-# ESPHome OpenAI Assistant (Realtime API)
+# ESPHome OpenAI Realtime (Realtime API)
 
 An ESPHome component that connects an ESP32 device directly to an OpenAI-compatible Realtime API WebSocket endpoint for voice conversations.
 
@@ -25,17 +25,43 @@ An ESPHome component that connects an ESP32 device directly to an OpenAI-compati
   via a 2 MB PSRAM ring buffer + dedicated feeder task (from `openai_common`),
   ensuring continuous, crackle-free playback decoupled from the main loop.
 - Optional `text_sensor` entities for transcribed request/response text.
-- Automation triggers modeled on the built-in `voice_assistant` component.
-- MCP/function tool events are logged for debugging; tool execution is assumed to happen on the Realtime API endpoint/server side.
+- Automation callbacks (`on_listening`, `on_stt_end`, `on_tool_start`,
+  `on_tts_start`, `on_tts_stream_start/end`, `on_end`, `on_error`, `on_idle`)
+  matching the pattern used by `openai_responses` and `openai_conversations`.
+- MCP tool events fire `on_tool_start` so the display can show "Searching...".
+- Server-side tool execution (the Realtime API connects to MCP servers itself).
+
+## Installation
+
+```yaml
+external_components:
+  - source:
+      type: git
+      ref: main
+      url: https://github.com/edk4971/esphome
+    components: [ openai_realtime, openai_common ]
+```
+
+> **Shared infrastructure:** This component depends on `openai_common`, which
+> provides the `PsramAudioBuffer` ring buffer + feeder task and the
+> `LazyCallbackManager` callback pattern. It is auto-loaded.
+>
+> **Shared hardware config:** A complete S3-Box-3 config lives in
+> [`openai_common/common.yaml`](../openai_common/common.yaml). The component
+> YAML in [`esp32-openai-realtime.yaml`](./esp32-openai-realtime.yaml) is a
+> thin wrapper. To switch between components, change the `!include` line at
+> the bottom of `common.yaml`.
+>
+> **Endpoint:** Accepts `ws://`, `wss://`, `http://`, or `https://`. HTTP(S)
+> endpoints are auto-converted to WS(S) so all three components can share the
+> same `openai_endpoint_base` secret.
 
 ## Requirements
 
-- ESP32 only.
-- ESP-IDF framework only.
-- PSRAM is **required**. The device YAML must include a `psram:` component.
-- A microphone source providing 16-bit mono PCM at 16 kHz.
-- A speaker sink accepting 16-bit mono PCM at 24 kHz.
-- `micro_wake_word` is the only supported initiation path.
+- ESP32 with PSRAM (ESP-IDF framework only).
+- An OpenAI-compatible server with a Realtime API WebSocket endpoint.
+- ESPHome components: `microphone`, `speaker`, `micro_wake_word`, `psram`,
+  `network`.
 
 ## Configuration
 
@@ -68,7 +94,7 @@ openai_realtime:
     - micro_wake_word.start:
 ```
 
-See `esp32-openai.yaml` for a full ESP32-S3-Box-3 example.
+See [`esp32-openai-realtime.yaml`](./esp32-openai-realtime.yaml) for a full ESP32-S3-Box-3 example.
 
 ## Actions and Conditions
 
