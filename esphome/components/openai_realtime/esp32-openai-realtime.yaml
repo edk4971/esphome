@@ -63,6 +63,11 @@ openai_assistant:
     - lambda: |-
         id(display_spi).show_page(thinking_page);
         id(display_spi).update();
+  on_tool_start:
+    - lambda: id(status_text).publish_state("Searching...");
+    - lambda: |-
+        id(display_spi).show_page(searching_page);
+        id(display_spi).update();
   on_tts_start:
     - lambda: id(response_text).publish_state(x);
   on_tts_stream_start:

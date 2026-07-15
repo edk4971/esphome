@@ -195,7 +195,7 @@ void OpenAIAssistant::connect_() {
   this->websocket_ = esp_websocket_client_init(&config);
   if (this->websocket_ == nullptr) {
     ESP_LOGE(TAG, "Could not initialize websocket client");
-    this->error_trigger_.trigger("websocket-init-failed", "Could not initialize websocket client");
+    this->on_error_cb_.call("websocket-init-failed", "Could not initialize websocket client");
     this->set_state_(State::IDLE);
     return;
   }
@@ -212,7 +212,7 @@ void OpenAIAssistant::connect_() {
   esp_err_t err = esp_websocket_client_start(this->websocket_);
   if (err != ESP_OK) {
     ESP_LOGE(TAG, "Could not start websocket client: %s", esp_err_to_name(err));
-    this->error_trigger_.trigger("websocket-start-failed", "Could not start websocket client");
+    this->on_error_cb_.call("websocket-start-failed", "Could not start websocket client");
     this->disconnect_();
     this->set_state_(State::IDLE);
     return;
@@ -286,10 +286,11 @@ void OpenAIAssistant::request_start(bool silence_detection) {
   this->response_text_.clear();
   this->speech_started_ = false;
   this->tts_streaming_ = false;
+  this->tool_start_fired_ = false;
   this->in_flight_tool_calls_.clear();
 
   if (!this->wake_word_.empty()) {
-    this->wake_word_detected_trigger_.trigger();
+    this->on_wake_word_detected_cb_.call();
   }
 
   this->set_state_(State::CONNECTING);
@@ -350,24 +351,24 @@ void OpenAIAssistant::finish_response_now_() {
   this->stop_audio_pipeline_();
 
   this->publish_response_text_(this->response_text_, true);
-  this->end_trigger_.trigger();
+  this->on_end_cb_.call();
 
   this->disconnect_();
   this->deallocate_buffers_();
 
-  // Defer idle_trigger_ until the speaker has fully stopped. The speaker's
+  // Defer on_idle_cb_ until the speaker has fully stopped. The speaker's
   // finish() is async (signals the speaker task to drain+stop), and the i2s
-  // bus is shared between speaker and mic. If we fire idle_trigger_ now, MWW
+  // bus is shared between speaker and mic. If we fire on_idle_cb_ now, MWW
   // restarts and starts the mic on the same i2s bus the speaker is still
   // releasing → "Parent bus is busy" → speaker error cascade.
 #ifdef USE_SPEAKER
   if (this->speaker_ != nullptr && !this->speaker_->is_stopped()) {
     this->pending_idle_ = true;
   } else {
-    this->idle_trigger_.trigger();
+    this->on_idle_cb_.call();
   }
 #else
-  this->idle_trigger_.trigger();
+  this->on_idle_cb_.call();
 #endif
   this->pending_finish_ = false;
   this->set_state_(State::IDLE);
@@ -513,7 +514,7 @@ void OpenAIAssistant::process_pending_flags_() {
     if (client_connected) {
     this->connected_ = true;
     ESP_LOGD(TAG, "Websocket connected");
-    this->client_connected_trigger_.trigger();
+    this->on_client_connected_cb_.call();
     this->send_session_update_();
   }
 
@@ -521,7 +522,7 @@ void OpenAIAssistant::process_pending_flags_() {
     ESP_LOGD(TAG, "Websocket disconnected");
     if (this->connected_) {
       this->connected_ = false;
-      this->client_disconnected_trigger_.trigger();
+      this->on_client_disconnected_cb_.call();
     }
     if (this->state_ != State::IDLE) {
       this->finish_response_();
@@ -530,7 +531,7 @@ void OpenAIAssistant::process_pending_flags_() {
 
   if (websocket_error) {
     ESP_LOGE(TAG, "Websocket error");
-    this->error_trigger_.trigger("websocket-error", "Websocket error");
+    this->on_error_cb_.call("websocket-error", "Websocket error");
     if (this->state_ != State::IDLE) {
       this->finish_response_();
     }
@@ -622,7 +623,7 @@ void OpenAIAssistant::handle_json_message_(const uint8_t *data, size_t len) {
       this->set_state_(State::STREAMING_RESPONSE);
     }
     // handle_audio_delta_() starts the audio pipeline (which fires
-    // tts_stream_start_trigger_) on the first delta.
+    // on_tts_stream_start_cb_) on the first delta.
     this->last_response_event_time_ = millis();
     this->start_response_timeout_();
     return;
@@ -695,9 +696,9 @@ void OpenAIAssistant::handle_json_message_(const uint8_t *data, size_t len) {
     } else if (strcmp(type, "input_audio_buffer.speech_started") == 0) {
       this->speech_started_ = true;
       this->cancel_no_speech_timeout_();
-      this->stt_vad_start_trigger_.trigger();
+      this->on_stt_vad_start_cb_.call();
     } else if (strcmp(type, "input_audio_buffer.speech_stopped") == 0) {
-      this->stt_vad_end_trigger_.trigger();
+      this->on_stt_vad_end_cb_.call();
       if (this->state_ == State::STREAMING_MICROPHONE) {
         this->set_state_(State::STOP_MICROPHONE);
       }
@@ -711,7 +712,7 @@ void OpenAIAssistant::handle_json_message_(const uint8_t *data, size_t len) {
       const char *transcript = root["transcript"] | "";
       this->request_text_ = transcript;
       this->publish_request_text_(this->request_text_);
-      this->stt_end_trigger_.trigger(this->request_text_);
+      this->on_stt_end_cb_.call(this->request_text_);
     } else if (strcmp(type, "conversation.item.input_audio_transcription.failed") == 0) {
       ESP_LOGW(TAG, "Input audio transcription failed");
     } else if (strcmp(type, "response.output_audio_transcript.delta") == 0 ||
@@ -722,7 +723,7 @@ void OpenAIAssistant::handle_json_message_(const uint8_t *data, size_t len) {
       if (this->state_ == State::AWAITING_RESPONSE) {
         this->set_state_(State::STREAMING_RESPONSE);
       }
-      // tts_stream_start_trigger_ is fired by start_audio_pipeline_() when
+      // on_tts_stream_start_cb_ is fired by start_audio_pipeline_() when
       // the first audio delta arrives. Text transcript deltas typically
       // arrive around the same time as audio deltas.
       this->last_response_event_time_ = millis();
@@ -732,7 +733,7 @@ void OpenAIAssistant::handle_json_message_(const uint8_t *data, size_t len) {
       const char *transcript = root["transcript"] | "";
       this->response_text_ = transcript;
       this->publish_response_text_(this->response_text_, true);
-      this->tts_end_trigger_.trigger(this->response_text_);
+      this->on_tts_end_cb_.call(this->response_text_);
       this->last_response_event_time_ = millis();
       this->start_response_timeout_();
     } else if (strcmp(type, "response.output_audio.done") == 0 ||
@@ -751,15 +752,20 @@ void OpenAIAssistant::handle_json_message_(const uint8_t *data, size_t len) {
       const char *code = root["error"]["code"] | "";
       const char *message = root["error"]["message"] | "";
       ESP_LOGE(TAG, "Error: %s - %s (%s)", error_type, message, code);
-      this->error_trigger_.trigger(code, message);
+      this->on_error_cb_.call(code, message);
       if (this->state_ != State::IDLE) {
         this->finish_response_();
       }
     } else if (strncmp(type, "response.function_call_arguments.", 33) == 0 ||
-               strncmp(type, "response.mcp_call_arguments.", 28) == 0 ||
-               strncmp(type, "response.mcp_call.", 18) == 0 ||
-               strncmp(type, "mcp_list_tools.", 15) == 0) {
+                strncmp(type, "response.mcp_call_arguments.", 28) == 0 ||
+                strncmp(type, "response.mcp_call.", 18) == 0 ||
+                strncmp(type, "mcp_list_tools.", 15) == 0) {
       ESP_LOGI(TAG, "Tool/MCP event: %s", type);
+      // Fire on_tool_start on the first function/MCP call event of this turn.
+      if (!this->tool_start_fired_) {
+        this->tool_start_fired_ = true;
+        this->on_tool_start_cb_.call();
+      }
       // MCP calls reset the response timeout — the server is still working.
       if (strncmp(type, "response.mcp_call", 17) == 0) {
         this->last_response_event_time_ = millis();
@@ -819,7 +825,7 @@ void OpenAIAssistant::start_audio_pipeline_() {
     ESP_LOGE(TAG, "Failed to create audio producer task");
   }
   this->tts_streaming_ = true;
-  this->tts_stream_start_trigger_.trigger();
+  this->on_tts_stream_start_cb_.call();
 }
 
 void OpenAIAssistant::stop_audio_pipeline_() {
@@ -838,7 +844,7 @@ void OpenAIAssistant::stop_audio_pipeline_() {
   this->audio_buffer_.stop_feeder();
   if (this->tts_streaming_) {
     this->tts_streaming_ = false;
-    this->tts_stream_end_trigger_.trigger();
+    this->on_tts_stream_end_cb_.call();
   }
 }
 
@@ -945,7 +951,7 @@ void OpenAIAssistant::publish_response_text_(const std::string &text, bool force
 void OpenAIAssistant::start_no_speech_timeout_() {
   this->set_timeout("no-speech", NO_SPEECH_TIMEOUT_MS, [this]() {
     ESP_LOGW(TAG, "No speech detected");
-    this->error_trigger_.trigger("no-speech", "No speech detected");
+    this->on_error_cb_.call("no-speech", "No speech detected");
     this->finish_response_();
   });
 }
@@ -953,7 +959,7 @@ void OpenAIAssistant::start_no_speech_timeout_() {
 void OpenAIAssistant::start_response_timeout_() {
   this->set_timeout("response", RESPONSE_TIMEOUT_MS, [this]() {
     ESP_LOGW(TAG, "Response timeout");
-    this->error_trigger_.trigger("response-timeout", "Response timeout");
+    this->on_error_cb_.call("response-timeout", "Response timeout");
     this->finish_response_();
   });
 }
@@ -961,10 +967,10 @@ void OpenAIAssistant::start_response_timeout_() {
 void OpenAIAssistant::start_connection_timeout_() {
   this->set_timeout("connection", CONNECTION_TIMEOUT_MS, [this]() {
     ESP_LOGE(TAG, "Connection timeout");
-    this->error_trigger_.trigger("connection-timeout", "Connection timeout");
+    this->on_error_cb_.call("connection-timeout", "Connection timeout");
     this->disconnect_();
     this->deallocate_buffers_();
-    this->idle_trigger_.trigger();
+    this->on_idle_cb_.call();
     this->set_state_(State::IDLE);
   });
 }
@@ -982,23 +988,23 @@ void OpenAIAssistant::loop() {
   switch (this->state_) {
     case State::IDLE:
       this->deallocate_buffers_();
-      // Fire deferred idle trigger once the speaker has fully released the i2s bus.
+      // Fire deferred on_idle_cb_ once the speaker has fully released the i2s bus.
 #ifdef USE_SPEAKER
       if (this->pending_idle_ && (this->speaker_ == nullptr || this->speaker_->is_stopped())) {
         this->pending_idle_ = false;
-        this->idle_trigger_.trigger();
+        this->on_idle_cb_.call();
       }
 #else
       if (this->pending_idle_) {
         this->pending_idle_ = false;
-        this->idle_trigger_.trigger();
+        this->on_idle_cb_.call();
       }
 #endif
       break;
 
     case State::CONNECTING: {
       if (this->connected_ && this->session_configured_) {
-        this->start_trigger_.trigger();
+        this->on_start_cb_.call();
         this->set_state_(State::START_MICROPHONE);
       }
       break;
@@ -1007,7 +1013,7 @@ void OpenAIAssistant::loop() {
     case State::START_MICROPHONE: {
       if (!this->allocate_buffers_()) {
         this->status_set_error();
-        this->error_trigger_.trigger("alloc-failed", "Failed to allocate buffers");
+        this->on_error_cb_.call("alloc-failed", "Failed to allocate buffers");
         this->finish_response_();
         break;
       }
@@ -1021,7 +1027,7 @@ void OpenAIAssistant::loop() {
     case State::STARTING_MICROPHONE: {
       if (this->mic_source_->is_running()) {
         this->set_state_(State::STREAMING_MICROPHONE);
-        this->listening_trigger_.trigger();
+        this->on_listening_cb_.call();
         this->start_no_speech_timeout_();
       }
       break;

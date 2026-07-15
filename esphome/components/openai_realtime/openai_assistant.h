@@ -94,21 +94,29 @@ class OpenAIAssistant : public Component {
   bool is_running() const { return this->state_ != State::IDLE; }
   bool is_connected() const { return this->connected_; }
 
-  Trigger<> *get_listening_trigger() { return &this->listening_trigger_; }
-  Trigger<> *get_start_trigger() { return &this->start_trigger_; }
-  Trigger<> *get_wake_word_detected_trigger() { return &this->wake_word_detected_trigger_; }
-  Trigger<> *get_stt_vad_start_trigger() { return &this->stt_vad_start_trigger_; }
-  Trigger<> *get_stt_vad_end_trigger() { return &this->stt_vad_end_trigger_; }
-  Trigger<std::string> *get_stt_end_trigger() { return &this->stt_end_trigger_; }
-  Trigger<std::string> *get_tts_start_trigger() { return &this->tts_start_trigger_; }
-  Trigger<std::string> *get_tts_end_trigger() { return &this->tts_end_trigger_; }
-  Trigger<> *get_tts_stream_start_trigger() { return &this->tts_stream_start_trigger_; }
-  Trigger<> *get_tts_stream_end_trigger() { return &this->tts_stream_end_trigger_; }
-  Trigger<> *get_end_trigger() { return &this->end_trigger_; }
-  Trigger<std::string, std::string> *get_error_trigger() { return &this->error_trigger_; }
-  Trigger<> *get_idle_trigger() { return &this->idle_trigger_; }
-  Trigger<> *get_client_connected_trigger() { return &this->client_connected_trigger_; }
-  Trigger<> *get_client_disconnected_trigger() { return &this->client_disconnected_trigger_; }
+  // --- Callback registration (template-based, LazyCallbackManager) ---
+  // Matches the pattern used by openai_responses/conversations. Each callback
+  // is 4 bytes when empty (vs. Trigger's vtable overhead).
+  template<typename F> void add_on_listening_callback(F &&cb) { this->on_listening_cb_.add(std::forward<F>(cb)); }
+  template<typename F> void add_on_start_callback(F &&cb) { this->on_start_cb_.add(std::forward<F>(cb)); }
+  template<typename F> void add_on_wake_word_detected_callback(F &&cb) {
+    this->on_wake_word_detected_cb_.add(std::forward<F>(cb));
+  }
+  template<typename F> void add_on_stt_vad_start_callback(F &&cb) { this->on_stt_vad_start_cb_.add(std::forward<F>(cb)); }
+  template<typename F> void add_on_stt_vad_end_callback(F &&cb) { this->on_stt_vad_end_cb_.add(std::forward<F>(cb)); }
+  template<typename F> void add_on_stt_end_callback(F &&cb) { this->on_stt_end_cb_.add(std::forward<F>(cb)); }
+  template<typename F> void add_on_tool_start_callback(F &&cb) { this->on_tool_start_cb_.add(std::forward<F>(cb)); }
+  template<typename F> void add_on_tts_start_callback(F &&cb) { this->on_tts_start_cb_.add(std::forward<F>(cb)); }
+  template<typename F> void add_on_tts_end_callback(F &&cb) { this->on_tts_end_cb_.add(std::forward<F>(cb)); }
+  template<typename F> void add_on_tts_stream_start_callback(F &&cb) { this->on_tts_stream_start_cb_.add(std::forward<F>(cb)); }
+  template<typename F> void add_on_tts_stream_end_callback(F &&cb) { this->on_tts_stream_end_cb_.add(std::forward<F>(cb)); }
+  template<typename F> void add_on_end_callback(F &&cb) { this->on_end_cb_.add(std::forward<F>(cb)); }
+  template<typename F> void add_on_error_callback(F &&cb) { this->on_error_cb_.add(std::forward<F>(cb)); }
+  template<typename F> void add_on_idle_callback(F &&cb) { this->on_idle_cb_.add(std::forward<F>(cb)); }
+  template<typename F> void add_on_client_connected_callback(F &&cb) { this->on_client_connected_cb_.add(std::forward<F>(cb)); }
+  template<typename F> void add_on_client_disconnected_callback(F &&cb) {
+    this->on_client_disconnected_cb_.add(std::forward<F>(cb));
+  }
 
  protected:
   bool allocate_buffers_();
@@ -231,6 +239,7 @@ class OpenAIAssistant : public Component {
   bool silence_detection_{true};
   bool tts_streaming_{false};
   bool speech_started_{false};
+  bool tool_start_fired_{false};
 
   std::string request_text_;
   std::string response_text_;
@@ -248,21 +257,23 @@ class OpenAIAssistant : public Component {
 
   std::map<std::string, InFlightToolCall> in_flight_tool_calls_;
 
-  Trigger<> listening_trigger_;
-  Trigger<> start_trigger_;
-  Trigger<> wake_word_detected_trigger_;
-  Trigger<> stt_vad_start_trigger_;
-  Trigger<> stt_vad_end_trigger_;
-  Trigger<std::string> stt_end_trigger_;
-  Trigger<std::string> tts_start_trigger_;
-  Trigger<std::string> tts_end_trigger_;
-  Trigger<> tts_stream_start_trigger_;
-  Trigger<> tts_stream_end_trigger_;
-  Trigger<> end_trigger_;
-  Trigger<std::string, std::string> error_trigger_;
-  Trigger<> idle_trigger_;
-  Trigger<> client_connected_trigger_;
-  Trigger<> client_disconnected_trigger_;
+  // --- Callback managers (lazy: 4 bytes each when empty) ---
+  LazyCallbackManager<void()> on_listening_cb_;
+  LazyCallbackManager<void()> on_start_cb_;
+  LazyCallbackManager<void()> on_wake_word_detected_cb_;
+  LazyCallbackManager<void()> on_stt_vad_start_cb_;
+  LazyCallbackManager<void()> on_stt_vad_end_cb_;
+  LazyCallbackManager<void(std::string)> on_stt_end_cb_;
+  LazyCallbackManager<void()> on_tool_start_cb_;
+  LazyCallbackManager<void(std::string)> on_tts_start_cb_;
+  LazyCallbackManager<void(std::string)> on_tts_end_cb_;
+  LazyCallbackManager<void()> on_tts_stream_start_cb_;
+  LazyCallbackManager<void()> on_tts_stream_end_cb_;
+  LazyCallbackManager<void()> on_end_cb_;
+  LazyCallbackManager<void(std::string, std::string)> on_error_cb_;
+  LazyCallbackManager<void()> on_idle_cb_;
+  LazyCallbackManager<void()> on_client_connected_cb_;
+  LazyCallbackManager<void()> on_client_disconnected_cb_;
 };
 
 template<typename... Ts> class StartAction : public Action<Ts...>, public Parented<OpenAIAssistant> {

@@ -43,6 +43,7 @@ CONF_ON_LISTENING = "on_listening"
 CONF_ON_STT_END = "on_stt_end"
 CONF_ON_STT_VAD_END = "on_stt_vad_end"
 CONF_ON_STT_VAD_START = "on_stt_vad_start"
+CONF_ON_TOOL_START = "on_tool_start"
 CONF_ON_TTS_END = "on_tts_end"
 CONF_ON_TTS_START = "on_tts_start"
 CONF_ON_TTS_STREAM_END = "on_tts_stream_end"
@@ -127,6 +128,7 @@ CONFIG_SCHEMA = cv.All(
             cv.Optional(CONF_ON_STT_VAD_END): automation.validate_automation(
                 single=True
             ),
+            cv.Optional(CONF_ON_TOOL_START): automation.validate_automation(single=True),
             cv.Optional(CONF_ON_TTS_START): automation.validate_automation(single=True),
             cv.Optional(CONF_ON_TTS_END): automation.validate_automation(single=True),
             cv.Optional(CONF_ON_TTS_STREAM_START): automation.validate_automation(
@@ -229,70 +231,37 @@ async def to_code(config):
         sens = await cg.get_variable(text_response_id)
         cg.add(var.set_text_response_sensor(sens))
 
-    if CONF_ON_LISTENING in config:
-        await automation.build_automation(
-            var.get_listening_trigger(), [], config[CONF_ON_LISTENING]
-        )
-    if CONF_ON_START in config:
-        await automation.build_automation(
-            var.get_start_trigger(), [], config[CONF_ON_START]
-        )
-    if CONF_ON_WAKE_WORD_DETECTED in config:
-        await automation.build_automation(
-            var.get_wake_word_detected_trigger(), [], config[CONF_ON_WAKE_WORD_DETECTED]
-        )
-    if CONF_ON_STT_END in config:
-        await automation.build_automation(
-            var.get_stt_end_trigger(), [(cg.std_string, "x")], config[CONF_ON_STT_END]
-        )
-    if CONF_ON_STT_VAD_START in config:
-        await automation.build_automation(
-            var.get_stt_vad_start_trigger(), [], config[CONF_ON_STT_VAD_START]
-        )
-    if CONF_ON_STT_VAD_END in config:
-        await automation.build_automation(
-            var.get_stt_vad_end_trigger(), [], config[CONF_ON_STT_VAD_END]
-        )
-    if CONF_ON_TTS_START in config:
-        await automation.build_automation(
-            var.get_tts_start_trigger(),
-            [(cg.std_string, "x")],
-            config[CONF_ON_TTS_START],
-        )
-    if CONF_ON_TTS_END in config:
-        await automation.build_automation(
-            var.get_tts_end_trigger(), [(cg.std_string, "x")], config[CONF_ON_TTS_END]
-        )
-    if CONF_ON_TTS_STREAM_START in config:
-        await automation.build_automation(
-            var.get_tts_stream_start_trigger(), [], config[CONF_ON_TTS_STREAM_START]
-        )
-    if CONF_ON_TTS_STREAM_END in config:
-        await automation.build_automation(
-            var.get_tts_stream_end_trigger(), [], config[CONF_ON_TTS_STREAM_END]
-        )
-    if CONF_ON_END in config:
-        await automation.build_automation(
-            var.get_end_trigger(), [], config[CONF_ON_END]
-        )
-    if CONF_ON_ERROR in config:
-        await automation.build_automation(
-            var.get_error_trigger(),
+    # Automations. Each is registered as a lightweight callback (no Trigger
+    # subclass) via build_callback_automation: the parent exposes a templatized
+    # add_on_*_callback() method and a LazyCallbackManager, and the generated
+    # forwarder struct fires the automation directly.
+    #
+    # (conf_key, callback_method, args) tuples.
+    callback_entries = (
+        (CONF_ON_LISTENING, "add_on_listening_callback", []),
+        (CONF_ON_START, "add_on_start_callback", []),
+        (CONF_ON_WAKE_WORD_DETECTED, "add_on_wake_word_detected_callback", []),
+        (CONF_ON_STT_END, "add_on_stt_end_callback", [(cg.std_string, "x")]),
+        (CONF_ON_STT_VAD_START, "add_on_stt_vad_start_callback", []),
+        (CONF_ON_STT_VAD_END, "add_on_stt_vad_end_callback", []),
+        (CONF_ON_TOOL_START, "add_on_tool_start_callback", []),
+        (CONF_ON_TTS_START, "add_on_tts_start_callback", [(cg.std_string, "x")]),
+        (CONF_ON_TTS_END, "add_on_tts_end_callback", [(cg.std_string, "x")]),
+        (CONF_ON_TTS_STREAM_START, "add_on_tts_stream_start_callback", []),
+        (CONF_ON_TTS_STREAM_END, "add_on_tts_stream_end_callback", []),
+        (CONF_ON_END, "add_on_end_callback", []),
+        (CONF_ON_IDLE, "add_on_idle_callback", []),
+        (
+            CONF_ON_ERROR,
+            "add_on_error_callback",
             [(cg.std_string, "code"), (cg.std_string, "message")],
-            config[CONF_ON_ERROR],
-        )
-    if CONF_ON_IDLE in config:
-        await automation.build_automation(
-            var.get_idle_trigger(), [], config[CONF_ON_IDLE]
-        )
-    if CONF_ON_CLIENT_CONNECTED in config:
-        await automation.build_automation(
-            var.get_client_connected_trigger(), [], config[CONF_ON_CLIENT_CONNECTED]
-        )
-    if CONF_ON_CLIENT_DISCONNECTED in config:
-        await automation.build_automation(
-            var.get_client_disconnected_trigger(), [], config[CONF_ON_CLIENT_DISCONNECTED]
-        )
+        ),
+        (CONF_ON_CLIENT_CONNECTED, "add_on_client_connected_callback", []),
+        (CONF_ON_CLIENT_DISCONNECTED, "add_on_client_disconnected_callback", []),
+    )
+    for conf_key, method, args in callback_entries:
+        if (conf := config.get(conf_key)) is not None:
+            await automation.build_callback_automation(var, method, args, conf)
 
     cg.add_define("USE_OPENAI_ASSISTANT")
     cg.add_define("USE_OPENAI_COMMON")
