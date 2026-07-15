@@ -1,7 +1,7 @@
 """ESPHome ``openai_common`` external component.
 
 Shared infrastructure for the ``openai_responses``, ``openai_conversations``
-and ``openai_realtime`` (config key ``openai_assistant``) voice assistant
+and ``openai_realtime`` voice assistant
 components. Provides reusable C++ classes:
 
 * :cpp:class:`esphome::openai_common::OpenAIBase` — mic/speaker/MWW wiring,

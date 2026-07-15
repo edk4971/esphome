@@ -1,8 +1,8 @@
-# Prompt: Re-implement the ESPHome `openai_assistant` component from scratch
+# Prompt: Re-implement the ESPHome `openai_realtime` component from scratch
 
 ## 1. Project goal
 
-Create an ESPHome external component named `openai_assistant` that lets an ESP32 device talk **directly** to an OpenAI-compatible Realtime API WebSocket endpoint, bypassing Home Assistant for the voice loop. The component should model the behavior of the built-in `voice_assistant` (status screens, text boxes, STT/TTS triggers) but is a new implementation, not a drop-in replacement.
+Create an ESPHome external component named `openai_realtime` that lets an ESP32 device talk **directly** to an OpenAI-compatible Realtime API WebSocket endpoint, bypassing Home Assistant for the voice loop. The component should model the behavior of the built-in `voice_assistant` (status screens, text boxes, STT/TTS triggers) but is a new implementation, not a drop-in replacement.
 
 The component is **beta-only** and **auto-response-only**. It does **not** execute Home Assistant services locally. MCP tools and tool execution are assumed to live on the Realtime API endpoint/server side; the device only logs tool/MCP-related events for debugging. A top-level `api:` component may still be present in the device YAML, but it is used only for the ESPHome dashboard connection, not for voice control.
 
@@ -10,7 +10,7 @@ PSRAM is required because base64 audio decoding, pending websocket message buffe
 
 Primary supported flow:
 - Local `micro_wake_word` detects a wake word.
-- The component is started (via the `micro_wake_word.on_wake_word_detected` automation or an explicit `openai_assistant.start` action).
+- The component is started (via the `micro_wake_word.on_wake_word_detected` automation or an explicit `openai_realtime.start` action).
 - The component opens a Realtime API WebSocket, streams microphone PCM audio, and receives server VAD + transcription + TTS audio deltas.
 - If the model requests a tool call (function or MCP), the endpoint is assumed to handle it server-side; the device logs the event for debugging and does not send `function_call_output`.
 - Response audio is played through an ESPHome `speaker`.
@@ -26,7 +26,7 @@ Read these files before writing any code:
 - `esphome/AGENTS.md` — coding standards, heap-allocation rules, C++ style, automation patterns.
 - `esphome/esphome/components/voice_assistant/__init__.py`, `.h`, `.cpp` — exemplar for state machine, triggers, and actions.
 - `esphome/esphome/components/psram/__init__.py` and `psram.h` — how to require and use PSRAM.
-- `esphome/esphome/components/api/` — only if the device YAML includes a top-level `api:` component for the ESPHome dashboard; `openai_assistant` does not call Home Assistant services.
+- `esphome/esphome/components/api/` — only if the device YAML includes a top-level `api:` component for the ESPHome dashboard; `openai_realtime` does not call Home Assistant services.
 - `esphome/esphome/components/micro_wake_word/__init__.py` and `micro_wake_word.h` — how wake-word detection integrates with automations.
 - `esphome/esphome/components/microphone/__init__.py` and `microphone_source.h` — how to consume microphone audio.
 - `esphome/esphome/components/speaker/speaker.h` — how to play raw PCM.
@@ -51,14 +51,14 @@ You may also inspect:
 
 ## 4. YAML-facing configuration
 
-Implement a `CONFIG_SCHEMA` in `esphome/esphome/components/openai_assistant/__init__.py` with at least these options. PSRAM must be enabled in the device YAML with a top-level `psram:` component.
+Implement a `CONFIG_SCHEMA` in `esphome/esphome/components/openai_realtime/__init__.py` with at least these options. PSRAM must be enabled in the device YAML with a top-level `psram:` component.
 
 ```yaml
 psram:
 
 api:  # optional; only for the ESPHome dashboard, not for voice control
 
-openai_assistant:
+openai_realtime:
   api_key: "..."                         # required string; may be "" for local endpoints
   model: "gpt-realtime"                  # required string
   endpoint: "wss://..."                  # required; must start with ws:// or wss://
@@ -93,25 +93,25 @@ openai_assistant:
 ```
 
 Actions to register:
-- `openai_assistant.start` with optional `silence_detection` and templatable `wake_word`.
-- `openai_assistant.stop`.
+- `openai_realtime.start` with optional `silence_detection` and templatable `wake_word`.
+- `openai_realtime.stop`.
 
-There is no `openai_assistant.start_continuous` action and no continuous-listening mode.
+There is no `openai_realtime.start_continuous` action and no continuous-listening mode.
 
 Conditions to register:
-- `openai_assistant.is_running`.
-- `openai_assistant.connected`.
+- `openai_realtime.is_running`.
+- `openai_realtime.connected`.
 
 ## 5. Required supporting components for the reference hardware
 
-The reference device is an **ESP32-S3-Box-3** running the ESP32-S3-Box package. The following components are required in the YAML for `openai_assistant` to execute on that hardware:
+The reference device is an **ESP32-S3-Box-3** running the ESP32-S3-Box package. The following components are required in the YAML for `openai_realtime` to execute on that hardware:
 
 ### Core platform and connectivity
 - `esp32:` with `framework: type: esp-idf` and 240 MHz CPU.
-- `psram:` — required by `openai_assistant` for audio/JSON/tool buffers. On the S3-Box use octal mode at 80 MHz.
+- `psram:` — required by `openai_realtime` for audio/JSON/tool buffers. On the S3-Box use octal mode at 80 MHz.
 - `wifi:` — required for the Realtime API WebSocket.
-- `api:` — optional; only for the ESPHome dashboard, not used by `openai_assistant` for voice control.
-- `ota:`, `logger:`, and `captive_portal:` are standard for the package but not strictly required for `openai_assistant` runtime.
+- `api:` — optional; only for the ESPHome dashboard, not used by `openai_realtime` for voice control.
+- `ota:`, `logger:`, and `captive_portal:` are standard for the package but not strictly required for `openai_realtime` runtime.
 
 ### Audio input chain
 - `i2c:` — the box ADC/DAC share an I2C bus.
@@ -121,10 +121,10 @@ The reference device is an **ESP32-S3-Box-3** running the ESP32-S3-Box package. 
 
 ### Audio output chain
 - `audio_dac:` platform `es8311` — the box's digital-to-analog converter for the speaker.
-- `speaker:` platform `i2s_audio` — the raw speaker sink, 16-bit mono at **24 kHz**; `openai_assistant` sends decoded PCM here.
+- `speaker:` platform `i2s_audio` — the raw speaker sink, 16-bit mono at **24 kHz**; `openai_realtime` sends decoded PCM here.
 
 ### Wake word
-- `micro_wake_word:` — required; triggers `openai_assistant.start` on detection.
+- `micro_wake_word:` — required; triggers `openai_realtime.start` on detection.
 
 ### Display/UI (modeled on voice_assistant, not required for audio loop)
 - `spi:`, `display:` (mipi_spi S3BOX), `image:`, `font:`, `text_sensor:` (template), `color:` — used for the status screen and transcript boxes.
@@ -135,9 +135,9 @@ The reference device is an **ESP32-S3-Box-3** running the ESP32-S3-Box package. 
 ### Notes for the eventual `esp32-openai.yaml`
 - Keep `microphone` and `speaker` as separate `i2s_audio` entities; do not rely on `media_player` for the assistant's response audio.
 - `media_player:` (speaker platform) is optional and may remain in the package only for independent user-initiated announcements; it is not the assistant's PCM output path.
-- Remove continuous listening / streaming wake word support and any references to `voice_assistant` triggers/actions; replace them with `openai_assistant` equivalents.
-- The `micro_wake_word.on_wake_word_detected` automation should call `openai_assistant.start` with the detected wake word.
-- After `openai_assistant.on_idle`, restart `micro_wake_word` so the device resumes listening.
+- Remove continuous listening / streaming wake word support and any references to `voice_assistant` triggers/actions; replace them with `openai_realtime` equivalents.
+- The `micro_wake_word.on_wake_word_detected` automation should call `openai_realtime.start` with the detected wake word.
+- After `openai_realtime.on_idle`, restart `micro_wake_word` so the device resumes listening.
 
 ## 6. C++ architecture requirements
 
@@ -161,7 +161,7 @@ Key rules:
 Obey these rules exactly:
 
 - The ESP-IDF websocket event callback (`websocket_event_handler_`) must **only** set lightweight flags or copy complete JSON text frames into a pending queue, then call `App.wake_loop_threadsafe()`.
-- All JSON parsing, automation triggers, text sensor publishes, state transitions, and speaker playback must happen in `OpenAIAssistant::loop()` from the ESPHome main loop context.
+- All JSON parsing, automation triggers, text sensor publishes, state transitions, and speaker playback must happen in `OpenAIRealtime::loop()` from the ESPHome main loop context.
 - Use two mutex-protected pending structures:
   - `std::vector<std::string> pending_json_messages_` for complete server JSON frames.
   - boolean flags for `client_connected`, `client_disconnected`, `websocket_error`, `session_update`.
@@ -185,17 +185,17 @@ Server JSON frames may be fragmented. Buffer them in `rx_message_` using `payloa
 `micro_wake_word` is the only way a conversation starts; there is no physical button fallback. The component must cooperate cleanly with it:
 
 - Accept a required `micro_wake_word` reference in the schema and store it as a pointer in C++.
-- Provide an `on_wake_word_detected` trigger that fires when `openai_assistant.start` is called with a non-empty wake word.
+- Provide an `on_wake_word_detected` trigger that fires when `openai_realtime.start` is called with a non-empty wake word.
 - The recommended YAML wiring is:
   ```yaml
   micro_wake_word:
     # ... models ...
     on_wake_word_detected:
-      - openai_assistant.start:
+      - openai_realtime.start:
           wake_word: !lambda return wake_word;
   ```
 - When the conversation finishes and `on_idle` fires, the YAML is responsible for restarting `micro_wake_word`. The component must not try to own or directly start/stop `micro_wake_word` internally; that creates microphone-ownership conflicts.
-- While `openai_assistant` is running, the microphone is owned by `openai_assistant` (via `MicrophoneSource`). `micro_wake_word` must not also try to read from the same microphone. The YAML package should ensure only one of them is active at a time.
+- While `openai_realtime` is running, the microphone is owned by `openai_realtime` (via `MicrophoneSource`). `micro_wake_word` must not also try to read from the same microphone. The YAML package should ensure only one of them is active at a time.
 - If no speech is detected within a timeout after streaming begins, return to `IDLE`, disconnect, and trigger `on_idle` so `micro_wake_word` can restart.
 
 ## 7. Realtime API protocol compliance
@@ -343,15 +343,15 @@ These options are accepted and stored for future expansion, but do not build fun
 Create/modify these files:
 
 ```
-esphome/esphome/components/openai_assistant/
+esphome/esphome/components/openai_realtime/
 ├── __init__.py
-├── openai_assistant.h
-├── openai_assistant.cpp
+├── openai_realtime.h
+├── openai_realtime.cpp
 ├── README.md
 └── esp32-openai.yaml   # example ESPHome Box package
 ```
 
-Delete the old `esphome/esphome/components/openai_assistant/version 1 - gpt55/` directory before starting the rebuild.
+Delete the old `esphome/esphome/components/openai_realtime/version 1 - gpt55/` directory before starting the rebuild.
 
 ## 12. Testing checklist
 

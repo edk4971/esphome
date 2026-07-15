@@ -2,7 +2,7 @@
 
 #include "esphome/core/defines.h"
 
-#ifdef USE_OPENAI_ASSISTANT
+#ifdef USE_OPENAI_REALTIME
 
 #include "esphome/core/automation.h"
 #include "esphome/core/component.h"
@@ -27,7 +27,7 @@
 #include <string>
 #include <vector>
 
-namespace esphome::openai_assistant {
+namespace esphome::openai_realtime {
 
 enum class State : uint8_t {
   IDLE,
@@ -48,10 +48,10 @@ struct InFlightToolCall {
   std::string arguments;
 };
 
-class OpenAIAssistant : public Component {
+class OpenAIRealtime : public Component {
  public:
-  OpenAIAssistant();
-  ~OpenAIAssistant();
+  OpenAIRealtime();
+  ~OpenAIRealtime();
 
   void setup() override;
   void loop() override;
@@ -276,7 +276,7 @@ class OpenAIAssistant : public Component {
   LazyCallbackManager<void()> on_client_disconnected_cb_;
 };
 
-template<typename... Ts> class StartAction : public Action<Ts...>, public Parented<OpenAIAssistant> {
+template<typename... Ts> class StartAction : public Action<Ts...>, public Parented<OpenAIRealtime> {
   TEMPLATABLE_VALUE(std::string, wake_word)
 
  public:
@@ -290,21 +290,21 @@ template<typename... Ts> class StartAction : public Action<Ts...>, public Parent
   bool silence_detection_{true};
 };
 
-template<typename... Ts> class StopAction : public Action<Ts...>, public Parented<OpenAIAssistant> {
+template<typename... Ts> class StopAction : public Action<Ts...>, public Parented<OpenAIRealtime> {
  public:
   void play(const Ts &...x) override { this->parent_->request_stop(); }
 };
 
-template<typename... Ts> class IsRunningCondition : public Condition<Ts...>, public Parented<OpenAIAssistant> {
+template<typename... Ts> class IsRunningCondition : public Condition<Ts...>, public Parented<OpenAIRealtime> {
  public:
   bool check(const Ts &...x) override { return this->parent_->is_running(); }
 };
 
-template<typename... Ts> class ConnectedCondition : public Condition<Ts...>, public Parented<OpenAIAssistant> {
+template<typename... Ts> class ConnectedCondition : public Condition<Ts...>, public Parented<OpenAIRealtime> {
  public:
   bool check(const Ts &...x) override { return this->parent_->is_connected(); }
 };
 
-}  // namespace esphome::openai_assistant
+}  // namespace esphome::openai_realtime
 
-#endif  // USE_OPENAI_ASSISTANT
+#endif  // USE_OPENAI_REALTIME

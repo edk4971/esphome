@@ -1,5 +1,5 @@
 ﻿# =============================================================================
-# openai_realtime (openai_assistant) component block.
+# openai_realtime component block.
 #
 # This file is meant to be !included from common.yaml. It contains ONLY the
 # component configuration and its automations — all hardware/platform config
@@ -11,10 +11,10 @@ external_components:
   - source:
       type: local
       path: /config
-    components: [openai_assistant]
+    components: [openai_realtime]
 
-# --- openai_assistant -------------------------------------------------------
-openai_assistant:
+# --- openai_realtime --------------------------------------------------------
+openai_realtime:
   id: openai
   api_key: ${openai_api_key}
   model: ${openai_chat_model}

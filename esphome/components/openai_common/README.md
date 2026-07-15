@@ -1,7 +1,7 @@
 # openai_common
 
 Shared infrastructure for the `openai_responses`, `openai_conversations`, and
-`openai_realtime` (config key `openai_assistant`) ESPHome voice assistant
+`openai_realtime` ESPHome voice assistant
 components.
 
 This is a **dependency-only component** — it has no `CONFIG_SCHEMA` and is

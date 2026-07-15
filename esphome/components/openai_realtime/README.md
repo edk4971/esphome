@@ -45,7 +45,7 @@ psram:
 # Optional: only needed for the ESPHome dashboard, not for voice control
 api:
 
-openai_assistant:
+openai_realtime:
   api_key: "YOUR_OPENAI_API_KEY"  # may be "" for local endpoints
   model: "gpt-4o-realtime-preview-2024-12-17"
   endpoint: "wss://api.openai.com/v1/realtime"
@@ -73,12 +73,12 @@ See `esp32-openai.yaml` for a full ESP32-S3-Box-3 example.
 ## Actions and Conditions
 
 Actions:
-- `openai_assistant.start` — optional `silence_detection` (bool) and templatable `wake_word` (string).
-- `openai_assistant.stop`
+- `openai_realtime.start` — optional `silence_detection` (bool) and templatable `wake_word` (string).
+- `openai_realtime.stop`
 
 Conditions:
-- `openai_assistant.is_running`
-- `openai_assistant.connected`
+- `openai_realtime.is_running`
+- `openai_realtime.connected`
 
 There is no `start_continuous` action and no continuous-listening mode.
 
