@@ -8,6 +8,7 @@
 #include <esp_crt_bundle.h>
 
 #include <cmath>
+#include <algorithm>
 #include <cstring>
 
 namespace esphome::openai_common {
@@ -476,14 +477,10 @@ void OpenAIHTTPBase::close_http_() {
 }
 
 void OpenAIHTTPBase::send_http_error_(MessageBufferHandle_t buf, const char *code, const char *message) {
-  uint8_t code_len = (uint8_t) strlen(code);
-  uint8_t msg_len = (uint8_t) strlen(message);
+  uint8_t code_len = (uint8_t) std::min(strlen(code), (size_t) 120);
+  uint8_t msg_len = (uint8_t) std::min(strlen(message), (size_t)(sizeof(uint8_t[128]) - 3 - code_len));
   size_t total = 3 + code_len + msg_len;
   uint8_t err_buf[128];
-  if (total > sizeof(err_buf)) {
-    msg_len = (uint8_t)(sizeof(err_buf) - 3 - code_len);
-    total = 3 + code_len + msg_len;
-  }
   err_buf[0] = (uint8_t) HttpMsgType::ERROR_;
   err_buf[1] = code_len;
   memcpy(err_buf + 2, code, code_len);

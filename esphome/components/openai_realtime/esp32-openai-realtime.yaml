@@ -33,12 +33,12 @@ openai_assistant:
   tools:
     - type: mcp
       server_label: homeassistant
-      server_url: !secret ha_server
+      server_url: !secret ha_url
       auth_token: !secret ha_token
       require_approval: never
     - type: mcp
       server_label: openzim
-      server_url: !secret openzim_server
+      server_url: !secret openzim_url
       auth_token: !secret openzim_token
       require_approval: never
   text_request: request_text

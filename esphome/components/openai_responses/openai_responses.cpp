@@ -2814,7 +2814,7 @@ void OpenAIResponses::loop() {
       }
       if (this->audio_buffer_.is_stream_done()) {
         this->audio_buffer_.clear_stream_done();
-        // TTS_STREAM_DONE: all audio has been played by the feeder.
+        // Stream done: all audio has been played by the feeder.
         this->stop_tts_producer_task_();
         this->on_tts_stream_end_cb_.call();
         this->on_tts_end_cb_.call(this->response_text_);

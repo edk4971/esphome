@@ -28,7 +28,6 @@ enum class HttpMsgType : uint8_t {
   DONE = 1,             // no payload; the HTTP request completed successfully
   ERROR_ = 2,           // 1-byte code length, code bytes, 1-byte message length, message bytes
   TTS_STREAM_START = 3, // no payload; the TTS speaker has started (fire on_tts_stream_start)
-  TTS_STREAM_DONE = 4,  // no payload; the feeder task has drained all audio
 };
 
 /// HTTP + VAD + MCP infrastructure shared by the responses and conversations

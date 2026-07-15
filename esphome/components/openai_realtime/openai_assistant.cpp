@@ -1068,12 +1068,11 @@ void OpenAIAssistant::loop() {
       break;
 
     case State::STREAMING_RESPONSE:
-      // Check for stream completion signaled by the feeder task.
-      if (this->audio_buffer_.is_stream_done()) {
-        this->audio_buffer_.clear_stream_done();
-        this->set_state_(State::DRAINING_AUDIO);
-      }
-      // Continue receiving response events; timeouts handled by start_response_timeout_.
+      // Don't check stream_done here — response.done (which calls
+      // finish_response_()) is the authoritative end-of-turn signal.
+      // finish_response_() transitions to DRAINING_AUDIO when the audio
+      // pipeline is still active. Checking stream_done here would clear
+      // the flag, making the DRAINING_AUDIO check dead and causing a deadlock.
       break;
 
     case State::DRAINING_AUDIO:

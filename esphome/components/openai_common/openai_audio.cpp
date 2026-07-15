@@ -111,8 +111,13 @@ void PsramAudioBuffer::start_feeder(speaker::Speaker *speaker, uint32_t sample_r
 
 void PsramAudioBuffer::stop_feeder() {
   this->should_exit_ = true;
+  // Unblock both the feeder (waiting on data_ready_) and the producer
+  // (waiting on space_available_) so they observe should_exit_ promptly.
   if (this->data_ready_ != nullptr) {
     xSemaphoreGive(this->data_ready_);
+  }
+  if (this->space_available_ != nullptr) {
+    xSemaphoreGive(this->space_available_);
   }
   if (this->feeder_task_.is_created()) {
     for (int i = 0; i < 50; i++) {
