@@ -82,6 +82,7 @@ CONF_MCP_SERVER_API_KEY = "api_key"
 CONF_ON_END = "on_end"
 CONF_ON_LISTENING = "on_listening"
 CONF_ON_STT_END = "on_stt_end"
+CONF_ON_TOOL_START = "on_tool_start"
 CONF_ON_TTS_END = "on_tts_end"
 CONF_ON_TTS_START = "on_tts_start"
 CONF_ON_TTS_STREAM_END = "on_tts_stream_end"
@@ -206,6 +207,7 @@ CONFIG_SCHEMA = cv.All(
                 single=True
             ),
             cv.Optional(CONF_ON_STT_END): automation.validate_automation(single=True),
+            cv.Optional(CONF_ON_TOOL_START): automation.validate_automation(single=True),
             cv.Optional(CONF_ON_TTS_START): automation.validate_automation(single=True),
             cv.Optional(CONF_ON_TTS_END): automation.validate_automation(single=True),
             cv.Optional(CONF_ON_TTS_STREAM_START): automation.validate_automation(
@@ -340,6 +342,7 @@ async def to_code(config):
         (CONF_ON_START, "add_on_start_callback", []),
         (CONF_ON_WAKE_WORD_DETECTED, "add_on_wake_word_detected_callback", []),
         (CONF_ON_STT_END, "add_on_stt_end_callback", [(cg.std_string, "x")]),
+        (CONF_ON_TOOL_START, "add_on_tool_start_callback", []),
         (CONF_ON_TTS_START, "add_on_tts_start_callback", [(cg.std_string, "x")]),
         (CONF_ON_TTS_END, "add_on_tts_end_callback", [(cg.std_string, "x")]),
         (CONF_ON_TTS_STREAM_START, "add_on_tts_stream_start_callback", []),
