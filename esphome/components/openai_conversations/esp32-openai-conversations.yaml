@@ -21,7 +21,9 @@ openai_conversations:
   api_key: ${openai_api_key}
   # --- Models ---
   chat_model: ${openai_chat_model}
-  stt_model: "parakeet-cpp-tdt_ctc-1.1b"
+  # STT model — set in common.yaml (${openai_stt_model}). Empty ("") = multimodal
+  # mode (audio sent directly to the chat model); a model name = STT + LLM mode.
+  stt_model: ${openai_stt_model}
   stt_language: "en"
   tts_model: ${openai_tts_model}
   tts_voice: ${openai_tts_voice}
@@ -42,11 +44,11 @@ openai_conversations:
   tools_cache_ttl: 24h
   mcp_servers:
     - name: ha
-      url: !secret ha_url
-      api_key: !secret ha_token
+      url: ${ha_url}
+      api_key: ${ha_token}
     - name: openzim
-      url: !secret openzim_url
-      api_key: !secret openzim_token
+      url: ${openzim_url}
+      api_key: ${openzim_token}
   # --- Text sensors ---
   text_request: request_text
   text_response: response_text

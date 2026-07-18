@@ -86,6 +86,11 @@ void OpenAIBase::flush_speaker_buffer_() {
     memmove(this->speaker_buffer_, this->speaker_buffer_ + written, this->speaker_buffer_index_ - written);
   }
   this->speaker_buffer_index_ -= (written <= this->speaker_buffer_index_) ? written : this->speaker_buffer_index_;
+  // play() blocks when the I2S DMA buffer is full (network delivers data faster
+  // than real-time playback). Yield to reset the task watchdog and let other
+  // tasks run. The I2S DMA buffer has enough data to keep playing during the
+  // 1-tick yield (~10ms).
+  vTaskDelay(pdMS_TO_TICKS(1));
 }
 
 void OpenAIBase::fail_(const std::string &code, const std::string &message) {

@@ -86,10 +86,17 @@ class OpenAIRealtime : public Component {
   void request_start(bool silence_detection);
   void request_stop();
 
-  /// No-op stubs for API compatibility with openai_responses/conversations.
-  /// Realtime tools are server-side and models are preloaded by the endpoint.
+  /// No-op stub for API compatibility with openai_responses/conversations.
+  /// Realtime tools are server-side (declared via session.update), so there
+  /// is no client-side routing map to build.
   void prefetch_tools() {}
-  void prewarm_models() {}
+
+  /// POST to /backend/load to preload the model into server memory before the
+  /// first wake-word turn. Spawns a short-lived FreeRTOS task so the main loop
+  /// is not blocked. Call from wifi.on_connect.
+  void prewarm_models();
+  static void prewarm_models_task_(void *arg);
+  static constexpr uint32_t PREWARM_TASK_STACK_SIZE = 8192;
 
   bool is_running() const { return this->state_ != State::IDLE; }
   bool is_connected() const { return this->connected_; }
@@ -150,9 +157,11 @@ class OpenAIRealtime : public Component {
   void start_no_speech_timeout_();
   void start_response_timeout_();
   void start_connection_timeout_();
+  void start_no_audio_timeout_();
   void cancel_no_speech_timeout_();
   void cancel_response_timeout_();
   void cancel_connection_timeout_();
+  void cancel_no_audio_timeout_();
 
   static void websocket_event_handler_(void *handler_args, esp_event_base_t base, int32_t event_id,
                                        void *event_data);
@@ -191,7 +200,7 @@ class OpenAIRealtime : public Component {
   // and feeds the speaker continuously, decoupled from the main loop.
   openai_common::PsramAudioBuffer audio_buffer_;
   StaticTask audio_producer_task_;
-  static constexpr uint32_t AUDIO_PRODUCER_STACK_SIZE = 4096;
+  static constexpr uint32_t AUDIO_PRODUCER_STACK_SIZE = 8192;
   static constexpr UBaseType_t AUDIO_TASK_PRIORITY = 3;
   SemaphoreHandle_t audio_delta_mutex_{nullptr};
   volatile bool audio_producer_should_exit_{false};

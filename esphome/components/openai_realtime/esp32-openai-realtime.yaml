@@ -33,13 +33,13 @@ openai_realtime:
   tools:
     - type: mcp
       server_label: homeassistant
-      server_url: !secret ha_url
-      auth_token: !secret ha_token
+      server_url: ${ha_url}
+      auth_token: ${ha_token}
       require_approval: never
     - type: mcp
       server_label: openzim
-      server_url: !secret openzim_url
-      auth_token: !secret openzim_token
+      server_url: ${openzim_url}
+      auth_token: ${openzim_token}
       require_approval: never
   text_request: request_text
   text_response: response_text

@@ -7,6 +7,8 @@
 #include "esphome/core/log.h"
 #include "esphome/components/json/json_util.h"
 
+#include <esp_http_client.h>
+
 #include <algorithm>
 #include <cinttypes>
 #include <climits>
@@ -37,6 +39,7 @@ static const size_t MAX_PENDING_JSON_MESSAGES = 64;
 static const uint32_t CONNECTION_TIMEOUT_MS = 25000;
 static const uint32_t NO_SPEECH_TIMEOUT_MS = 5000;
 static const uint32_t RESPONSE_TIMEOUT_MS = 30000;  // inactivity timer; resets on each response event
+static const uint32_t NO_AUDIO_TIMEOUT_MS = 10000;  // text transcript arrived but no audio deltas
 
 static const uint32_t AUDIO_STATS_LOG_INTERVAL_MS = 1000;
 
@@ -123,6 +126,70 @@ void OpenAIRealtime::dump_config() {
   ESP_LOGCONFIG(TAG, "  Tools: %s", this->tools_json_.empty() ? "none" : "configured");
 }
 
+void OpenAIRealtime::prewarm_models_task_(void *arg) {
+  auto *self = static_cast<OpenAIRealtime *>(arg);
+  // Build auth header before any HTTP calls.
+  std::string auth;
+  if (!self->api_key_.empty()) {
+    auth = "Bearer " + self->api_key_;
+  }
+  // The realtime endpoint may be ws:// or wss:// (the websocket client accepts
+  // both); convert back to http(s):// for the /backend/load HTTP POST.
+  std::string base = self->endpoint_;
+  if (base.rfind("ws://", 0) == 0) {
+    base.replace(0, 5, "http://");
+  } else if (base.rfind("wss://", 0) == 0) {
+    base.replace(0, 6, "https://");
+  }
+  // Only the realtime model is prewarmed; STT/TTS are server-side.
+  if (self->model_.empty()) {
+    ESP_LOGW(TAG, "prewarm: no model configured");
+    vTaskDelete(nullptr);
+    return;
+  }
+  std::string body = "{\"model\":\"" + self->model_ + "\"}";
+  char url[512];
+  snprintf(url, sizeof(url), "%s/backend/load", base.c_str());
+  esp_http_client_config_t config = {};
+  config.url = url;
+  config.method = HTTP_METHOD_POST;
+  config.timeout_ms = 10000;
+  config.disable_auto_redirect = false;
+  esp_http_client_handle_t client = esp_http_client_init(&config);
+  if (client == nullptr) {
+    ESP_LOGW(TAG, "prewarm: init failed for %s", self->model_.c_str());
+    vTaskDelete(nullptr);
+    return;
+  }
+  esp_http_client_set_header(client, "Content-Type", "application/json");
+  if (!auth.empty()) {
+    esp_http_client_set_header(client, "Authorization", auth.c_str());
+  }
+  esp_err_t err = esp_http_client_open(client, body.size());
+  if (err == ESP_OK) {
+    esp_http_client_write(client, body.c_str(), body.size());
+    esp_http_client_fetch_headers(client);
+    int status = esp_http_client_get_status_code(client);
+    if (status == 200 || status == 201 || status == 204) {
+      ESP_LOGI(TAG, "prewarm: %s loaded (HTTP %d)", self->model_.c_str(), status);
+    } else {
+      ESP_LOGW(TAG, "prewarm: %s returned HTTP %d", self->model_.c_str(), status);
+    }
+  } else {
+    ESP_LOGW(TAG, "prewarm: %s open failed: %s", self->model_.c_str(), esp_err_to_name(err));
+  }
+  esp_http_client_cleanup(client);
+  vTaskDelete(nullptr);  // self-terminate
+}
+
+void OpenAIRealtime::prewarm_models() {
+  // Spawn a short-lived FreeRTOS task so the synchronous HTTP call doesn't
+  // block the main loop. The task self-terminates after the model is loaded.
+  // Uses xTaskCreate (dynamic allocation) since this is a one-shot boot task.
+  xTaskCreate(prewarm_models_task_, "oai_prewarm", PREWARM_TASK_STACK_SIZE, this,
+              3, nullptr);
+}
+
 bool OpenAIRealtime::allocate_buffers_() {
   if (this->ring_buffer_ == nullptr) {
     this->ring_buffer_ = ring_buffer::RingBuffer::create(
@@ -175,7 +242,19 @@ void OpenAIRealtime::connect_() {
     return;
   }
 
-  this->endpoint_with_model_ = this->endpoint_ + "?model=" + this->model_;
+  // Build the WebSocket URI. If the endpoint is just a base URL (no
+  // /v1/realtime path), append /v1/realtime so all three components can share
+  // the same openai_endpoint_base secret. If the endpoint already contains the
+  // realtime path (e.g. "wss://api.openai.com/v1/realtime"), use it as-is.
+  std::string base = this->endpoint_;
+  if (base.find("/v1/realtime") == std::string::npos) {
+    if (!base.empty() && base.back() == '/') {
+      base.pop_back();
+    }
+    base += "/v1/realtime";
+  }
+  this->endpoint_with_model_ = base + "?model=" + this->model_;
+  ESP_LOGI(TAG, "Connecting to %s", this->endpoint_with_model_.c_str());
 
   this->headers_.clear();
   if (!this->api_key_.empty()) {
@@ -262,6 +341,8 @@ static const char *openai_realtime_state_to_string(State state) {
       return "AWAITING_RESPONSE";
     case State::STREAMING_RESPONSE:
       return "STREAMING_RESPONSE";
+    case State::DRAINING_AUDIO:
+      return "DRAINING_AUDIO";
     default:
       return "UNKNOWN";
   }
@@ -339,6 +420,7 @@ void OpenAIRealtime::finish_response_() {
   if (this->audio_producer_task_.is_created() || this->audio_buffer_.is_feeder_active()) {
     ESP_LOGD(TAG, "Deferring finish_response_ — audio pipeline still active");
     this->cancel_response_timeout_();
+    this->cancel_no_audio_timeout_();
     this->pending_finish_ = true;
     this->set_state_(State::DRAINING_AUDIO);
     return;
@@ -349,6 +431,7 @@ void OpenAIRealtime::finish_response_() {
 
 void OpenAIRealtime::finish_response_now_() {
   this->stop_audio_pipeline_();
+  this->cancel_no_audio_timeout_();
 
   this->publish_response_text_(this->response_text_, true);
   this->on_end_cb_.call();
@@ -619,6 +702,8 @@ void OpenAIRealtime::handle_json_message_(const uint8_t *data, size_t len) {
     if (!delta_sv.empty()) {
       this->handle_audio_delta_(delta_sv.data(), delta_sv.size());
     }
+    // Audio arrived — cancel the no-audio timeout (server's TTS is working).
+    this->cancel_no_audio_timeout_();
     if (this->state_ == State::AWAITING_RESPONSE) {
       this->set_state_(State::STREAMING_RESPONSE);
     }
@@ -726,6 +811,11 @@ void OpenAIRealtime::handle_json_message_(const uint8_t *data, size_t len) {
       // on_tts_stream_start_cb_ is fired by start_audio_pipeline_() when
       // the first audio delta arrives. Text transcript deltas typically
       // arrive around the same time as audio deltas.
+      // Start the no-audio timeout — if no audio deltas arrive within
+      // NO_AUDIO_TIMEOUT_MS, the server's TTS pipeline is likely broken.
+      if (!this->tts_streaming_) {
+        this->start_no_audio_timeout_();
+      }
       this->last_response_event_time_ = millis();
       this->start_response_timeout_();
     } else if (strcmp(type, "response.output_audio_transcript.done") == 0 ||
@@ -771,6 +861,15 @@ void OpenAIRealtime::handle_json_message_(const uint8_t *data, size_t len) {
         this->last_response_event_time_ = millis();
         this->start_response_timeout_();
       }
+    } else if (strcmp(type, "response.created") == 0 ||
+               strcmp(type, "response.output_item.added") == 0 ||
+               strcmp(type, "response.content_part.added") == 0 ||
+               strcmp(type, "response.content_part.done") == 0) {
+      // Informational lifecycle events — the server is actively working. Reset
+      // the response timeout so we don't fire while the LLM/TTS is still
+      // generating. No action needed beyond the timeout reset.
+      this->last_response_event_time_ = millis();
+      this->start_response_timeout_();
     } else {
       ESP_LOGV(TAG, "Unhandled event: %s", type);
     }
@@ -964,6 +1063,17 @@ void OpenAIRealtime::start_response_timeout_() {
   });
 }
 
+void OpenAIRealtime::start_no_audio_timeout_() {
+  this->set_timeout("no-audio", NO_AUDIO_TIMEOUT_MS, [this]() {
+    // Text transcript deltas arrived but no audio deltas — the server's TTS
+    // pipeline is likely broken or doesn't support streaming realtime audio.
+    ESP_LOGW(TAG, "No audio received from server (text transcript arrived but no audio deltas within %ums)",
+             (unsigned) NO_AUDIO_TIMEOUT_MS);
+    this->on_error_cb_.call("no-audio", "Server did not send audio response");
+    this->finish_response_();
+  });
+}
+
 void OpenAIRealtime::start_connection_timeout_() {
   this->set_timeout("connection", CONNECTION_TIMEOUT_MS, [this]() {
     ESP_LOGE(TAG, "Connection timeout");
@@ -978,6 +1088,7 @@ void OpenAIRealtime::start_connection_timeout_() {
 void OpenAIRealtime::cancel_no_speech_timeout_() { this->cancel_timeout("no-speech"); }
 void OpenAIRealtime::cancel_response_timeout_() { this->cancel_timeout("response"); }
 void OpenAIRealtime::cancel_connection_timeout_() { this->cancel_timeout("connection"); }
+void OpenAIRealtime::cancel_no_audio_timeout_() { this->cancel_timeout("no-audio"); }
 
 void OpenAIRealtime::loop() {
   if (this->state_ != State::IDLE) {
@@ -1168,8 +1279,8 @@ void OpenAIRealtime::handle_websocket_event_(esp_websocket_event_id_t event_id,
       // Drop oversized frames (e.g. unary .done events containing full audio).
       if (event_data->payload_len > MAX_JSON_FRAME_SIZE) {
         if (event_data->payload_offset == 0) {
-          ESP_LOGW(TAG, "Oversized JSON frame (%" PRIu32 " bytes); dropping type='%s'",
-                   event_data->payload_len, frame_type.c_str());
+          ESP_LOGW(TAG, "Oversized JSON frame (%u bytes); dropping type='%s'",
+                   (unsigned) event_data->payload_len, frame_type.c_str());
         }
         this->rx_drop_oversized_payload_ = true;
         this->rx_message_len_ = 0;
@@ -1177,6 +1288,13 @@ void OpenAIRealtime::handle_websocket_event_(esp_websocket_event_id_t event_id,
       }
 
       if (this->rx_drop_oversized_payload_) {
+        // Only log the first and last fragment to avoid log spam on large frames.
+        if (event_data->payload_offset == 0 ||
+            event_data->payload_offset + event_data->data_len >= event_data->payload_len) {
+          ESP_LOGD(TAG, "Dropping oversized frame: offset=%lu payload_len=%lu",
+                   (unsigned long) event_data->payload_offset,
+                   (unsigned long) event_data->payload_len);
+        }
         if (event_data->payload_offset + event_data->data_len >= event_data->payload_len) {
           this->rx_drop_oversized_payload_ = false;
         }
