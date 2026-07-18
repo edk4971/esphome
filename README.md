@@ -29,9 +29,11 @@ Uses the Chat Completions API (`/v1/chat/completions`). Same hardware, VAD,
 MCP, TTS, and STT features as `openai_responses`, but without streaming TTS
 or server-side conversation state.
 
-### [openai_realtime](./esphome/components/openai_realtime/) — ✅ Working
+### [openai_realtime](./esphome/components/openai_realtime/) — ⚠️ Not working
 
 Uses the Realtime API WebSocket endpoint for low-latency voice conversations.
 Server-side VAD, server-side tool execution, and base64 audio delta playback
 via the shared `PsramAudioBuffer` for crackle-free continuous audio. Accepts
 `ws://`, `wss://`, `http://`, or `https://` endpoints (auto-converted).
+
+See [`todo.md`](./esphome/components/openai_realtime/todo.md) for known issues.
