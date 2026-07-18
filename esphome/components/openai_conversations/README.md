@@ -43,11 +43,21 @@ external_components:
       type: git
       ref: main
       url: https://github.com/edk4971/esphome
-    components: [ openai_conversations ]
+    components: [ openai_conversations, openai_common ]
 ```
 
 If you already have an `external_components` block, just add the
-`openai_conversations` entry to it.
+`openai_conversations` and `openai_common` entries to it.
+
+> **Shared infrastructure:** This component depends on `openai_common`, which
+> provides the `OpenAIBase`/`OpenAIHTTPBase` base classes, `PsramAudioBuffer`,
+> and the unified MCP client. It is auto-loaded.
+>
+> **Shared hardware config:** A complete S3-Box-3 config lives in
+> [`openai_common/common.yaml`](../openai_common/common.yaml). The component
+> YAML in [`esp32-openai-conversations.yaml`](./esp32-openai-conversations.yaml)
+> is a thin wrapper. To switch between components, change the `!include` line
+> at the bottom of `common.yaml`.
 
 ## Requirements
 
@@ -68,7 +78,7 @@ If you already have an `external_components` block, just add the
 ## Quick start
 
 A complete example config for the ESP32-S3-Box-3 is in
-[`esp32-openai.yaml`](./esp32-openai.yaml). The minimal component block:
+[`esp32-openai-conversations.yaml`](./esp32-openai-conversations.yaml). The minimal component block:
 
 ```yaml
 openai_conversations:

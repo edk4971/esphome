@@ -5,32 +5,33 @@ OpenAI-compatible servers — no Home Assistant voice pipeline required.
 
 ## Components
 
-### [openai_conversations](./esphome/components/openai_conversations/) — ✅ Working
-
-A voice assistant using the Chat Completions + Audio HTTP APIs. Supports
-multimodal audio, STT+LLM, client-side MCP tool execution, streaming chat,
-and TTS playback. Designed for the ESP32-S3-Box-3.
+All three components share infrastructure via
+[`openai_common`](./esphome/components/openai_common/), which provides the
+`OpenAIBase`/`OpenAIHTTPBase` base classes, `PsramAudioBuffer` (2MB PSRAM ring
+buffer + feeder task), and a unified MCP client. A shared S3-Box-3 hardware
+config lives in
+[`common.yaml`](./esphome/components/openai_common/common.yaml) — switch
+between components by changing one `!include` line.
 
 ### [openai_responses](./esphome/components/openai_responses/) — ✅ Working
 
-A fork of `openai_conversations` that uses the Responses API
-(`/v1/responses`) instead of Chat Completions. The key advantage is
-server-side conversation state via `store: true` + `previous_response_id`:
-round-2+ requests (after tool execution) resend only the tool results, not
-the full tools array (~10KB+) and message history. Same hardware, VAD, MCP,
-TTS, and STT features as `openai_conversations`, plus:
+Uses the Responses API (`/v1/responses`) with server-side conversation state
+via `store: true` + `previous_response_id`. The most feature-rich component:
 
-- **Streaming TTS** — generates audio per-sentence as text deltas arrive,
-  using a 2MB PSRAM ring buffer for crackle-free continuous playback
-- **Markdown stripping** — removes markdown from response text before TTS
-- **Tool-call text leak suppression** — detects and suppresses leaked tool
-  calls from TTS
-- **MDI icon display** — vector-drawn Material Design Icons instead of PNGs
-  (faster render, saves ~460KB flash)
+- Streaming TTS, markdown stripping, tool-call text leak suppression
+- Client-side MCP tool execution (up to 5 rounds per turn)
+- Local VAD, multimodal or STT+LLM audio modes
+- MDI vector icon display pages
 
-### [openai_realtime](./esphome/components/openai_realtime/) — ⚠️ Nonfunctional
+### [openai_conversations](./esphome/components/openai_conversations/) — ✅ Working
 
-An incomplete, abandoned attempt using the Realtime WebSocket API.
-Development stopped because the Realtime API isn't uniformly supported
-across OpenAI-compatible endpoints. Kept in the repo in case someone wants
-to continue the effort.
+Uses the Chat Completions API (`/v1/chat/completions`). Same hardware, VAD,
+MCP, TTS, and STT features as `openai_responses`, but without streaming TTS
+or server-side conversation state.
+
+### [openai_realtime](./esphome/components/openai_realtime/) — ✅ Working
+
+Uses the Realtime API WebSocket endpoint for low-latency voice conversations.
+Server-side VAD, server-side tool execution, and base64 audio delta playback
+via the shared `PsramAudioBuffer` for crackle-free continuous audio. Accepts
+`ws://`, `wss://`, `http://`, or `https://` endpoints (auto-converted).

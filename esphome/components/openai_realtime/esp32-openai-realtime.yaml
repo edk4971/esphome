@@ -1,62 +1,46 @@
-# =============================================================================
-# openai_responses component block.
+﻿# =============================================================================
+# openai_realtime component block.
 #
 # This file is meant to be !included from common.yaml. It contains ONLY the
 # component configuration and its automations — all hardware/platform config
-# (esp32, psram, wifi, i2c, i2s_audio, microphone, speaker, display, switch,
-# media_player, micro_wake_word, etc.) lives in common.yaml.
+# lives in common.yaml.
 # =============================================================================
 
 # --- External component ------------------------------------------------------
-# Uses a relative path so the config works regardless of the ESPHome working
-# directory (HA addon, Docker, or CLI). The path resolves relative to the
-# user's main YAML (which !includes common.yaml, which !includes this file).
 external_components:
   - source:
       type: local
       path: /config
-    components: [openai_responses]
+    components: [openai_realtime]
 
-# --- openai_responses ---------------------------------------------------
-# The voice assistant component. See README.md for the full option reference.
-openai_responses:
+# --- openai_realtime --------------------------------------------------------
+openai_realtime:
   id: openai
-  # --- API / server ---
-  endpoint_base: ${openai_endpoint_base}
   api_key: ${openai_api_key}
-  # --- Models ---
-  chat_model: ${openai_chat_model}
-  # STT model — set in common.yaml (${openai_stt_model}). Empty ("") = multimodal
-  # mode (audio sent directly to the chat model); a model name = STT + LLM mode.
-  stt_model: ${openai_stt_model}
-  stt_language: "en"  # ISO 639-1 code; "" = auto-detect
-  tts_model: ${openai_tts_model}
-  tts_voice: ${openai_tts_voice}
-  # Sample rate of the WAV returned by the TTS server.
-  tts_sample_rate: 22050  # piper TTS server returns 22050 Hz
-  # --- Prompt ---
+  model: ${openai_chat_model}
+  endpoint: ${openai_endpoint_base}
   system_prompt: ${openai_prompt}
-  # --- Hardware ---
+  voice: ${openai_tts_voice}
+  language: "en"
   microphone: box_mic
   speaker: box_speaker
   micro_wake_word: mww
-  # --- Audio / VAD tuning ---
+  noise_suppression_level: 2
+  auto_gain: 31dBFS
   volume_multiplier: 2.5
-  streaming_tts: true
-  silence_threshold: 0.002
-  silence_duration_ms: 700ms
-  max_recording_ms: 30000ms
-  # --- Tools (optional) ---
-  tools_file: tools.json
-  tools_cache_ttl: 24h
-  mcp_servers:
-    - name: ha
-      url: ${ha_url}
-      api_key: ${ha_token}
-    - name: openzim
-      url: ${openzim_url}
-      api_key: ${openzim_token}
-  # --- Text sensors ---
+  # MCP tool servers — declared in session.update with type:"mcp" so the server
+  # connects to them, imports tools, and executes them server-side.
+  tools:
+    - type: mcp
+      server_label: homeassistant
+      server_url: ${ha_url}
+      auth_token: ${ha_token}
+      require_approval: never
+    - type: mcp
+      server_label: openzim
+      server_url: ${openzim_url}
+      auth_token: ${openzim_token}
+      require_approval: never
   text_request: request_text
   text_response: response_text
   # --- Automations ---
@@ -69,10 +53,13 @@ openai_responses:
         id(display_spi).show_page(listening_page);
         id(display_spi).update();
   on_start:
-    - lambda: id(status_text).publish_state("Listening...");
+    - lambda: id(status_text).publish_state("Connected");
+  on_stt_vad_start:
+    - lambda: id(status_text).publish_state("Speech started");
+  on_stt_vad_end:
+    - lambda: id(status_text).publish_state("Speech ended");
   on_stt_end:
     - lambda: id(request_text).publish_state(x);
-    - lambda: id(status_text).publish_state("Thinking...");
     - lambda: |-
         id(display_spi).show_page(thinking_page);
         id(display_spi).update();
@@ -83,11 +70,11 @@ openai_responses:
         id(display_spi).update();
   on_tts_start:
     - lambda: id(response_text).publish_state(x);
+  on_tts_stream_start:
     - lambda: id(status_text).publish_state("Speaking...");
     - lambda: |-
         id(display_spi).show_page(replying_page);
         id(display_spi).update();
-  on_tts_stream_start: []
   on_tts_stream_end:
     - lambda: id(status_text).publish_state("Finished");
   on_tts_end:
@@ -114,3 +101,7 @@ openai_responses:
           - lambda: |-
               id(display_spi).show_page(idle_page);
               id(display_spi).update();
+  on_client_connected:
+    - lambda: id(status_text).publish_state("OpenAI connected");
+  on_client_disconnected:
+    - lambda: id(status_text).publish_state("OpenAI disconnected");

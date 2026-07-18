@@ -2,15 +2,17 @@
 
 #include "esphome/core/defines.h"
 
-#ifdef USE_OPENAI_ASSISTANT
+#ifdef USE_OPENAI_REALTIME
 
 #include "esphome/core/automation.h"
 #include "esphome/core/component.h"
 #include "esphome/core/helpers.h"
+#include "esphome/core/static_task.h"
 
 #include "esphome/components/microphone/microphone_source.h"
 #include "esphome/components/ring_buffer/ring_buffer.h"
 #include "esphome/components/speaker/speaker.h"
+#include "esphome/components/openai_common/openai_audio.h"
 #ifdef USE_TEXT_SENSOR
 #include "esphome/components/text_sensor/text_sensor.h"
 #endif
@@ -25,7 +27,7 @@
 #include <string>
 #include <vector>
 
-namespace esphome::openai_assistant {
+namespace esphome::openai_realtime {
 
 enum class State : uint8_t {
   IDLE,
@@ -46,10 +48,10 @@ struct InFlightToolCall {
   std::string arguments;
 };
 
-class OpenAIAssistant : public Component {
+class OpenAIRealtime : public Component {
  public:
-  OpenAIAssistant();
-  ~OpenAIAssistant();
+  OpenAIRealtime();
+  ~OpenAIRealtime();
 
   void setup() override;
   void loop() override;
@@ -84,24 +86,44 @@ class OpenAIAssistant : public Component {
   void request_start(bool silence_detection);
   void request_stop();
 
+  /// No-op stub for API compatibility with openai_responses/conversations.
+  /// Realtime tools are server-side (declared via session.update), so there
+  /// is no client-side routing map to build.
+  void prefetch_tools() {}
+
+  /// POST to /backend/load to preload the model into server memory before the
+  /// first wake-word turn. Spawns a short-lived FreeRTOS task so the main loop
+  /// is not blocked. Call from wifi.on_connect.
+  void prewarm_models();
+  static void prewarm_models_task_(void *arg);
+  static constexpr uint32_t PREWARM_TASK_STACK_SIZE = 8192;
+
   bool is_running() const { return this->state_ != State::IDLE; }
   bool is_connected() const { return this->connected_; }
 
-  Trigger<> *get_listening_trigger() { return &this->listening_trigger_; }
-  Trigger<> *get_start_trigger() { return &this->start_trigger_; }
-  Trigger<> *get_wake_word_detected_trigger() { return &this->wake_word_detected_trigger_; }
-  Trigger<> *get_stt_vad_start_trigger() { return &this->stt_vad_start_trigger_; }
-  Trigger<> *get_stt_vad_end_trigger() { return &this->stt_vad_end_trigger_; }
-  Trigger<std::string> *get_stt_end_trigger() { return &this->stt_end_trigger_; }
-  Trigger<std::string> *get_tts_start_trigger() { return &this->tts_start_trigger_; }
-  Trigger<std::string> *get_tts_end_trigger() { return &this->tts_end_trigger_; }
-  Trigger<> *get_tts_stream_start_trigger() { return &this->tts_stream_start_trigger_; }
-  Trigger<> *get_tts_stream_end_trigger() { return &this->tts_stream_end_trigger_; }
-  Trigger<> *get_end_trigger() { return &this->end_trigger_; }
-  Trigger<std::string, std::string> *get_error_trigger() { return &this->error_trigger_; }
-  Trigger<> *get_idle_trigger() { return &this->idle_trigger_; }
-  Trigger<> *get_client_connected_trigger() { return &this->client_connected_trigger_; }
-  Trigger<> *get_client_disconnected_trigger() { return &this->client_disconnected_trigger_; }
+  // --- Callback registration (template-based, LazyCallbackManager) ---
+  // Matches the pattern used by openai_responses/conversations. Each callback
+  // is 4 bytes when empty (vs. Trigger's vtable overhead).
+  template<typename F> void add_on_listening_callback(F &&cb) { this->on_listening_cb_.add(std::forward<F>(cb)); }
+  template<typename F> void add_on_start_callback(F &&cb) { this->on_start_cb_.add(std::forward<F>(cb)); }
+  template<typename F> void add_on_wake_word_detected_callback(F &&cb) {
+    this->on_wake_word_detected_cb_.add(std::forward<F>(cb));
+  }
+  template<typename F> void add_on_stt_vad_start_callback(F &&cb) { this->on_stt_vad_start_cb_.add(std::forward<F>(cb)); }
+  template<typename F> void add_on_stt_vad_end_callback(F &&cb) { this->on_stt_vad_end_cb_.add(std::forward<F>(cb)); }
+  template<typename F> void add_on_stt_end_callback(F &&cb) { this->on_stt_end_cb_.add(std::forward<F>(cb)); }
+  template<typename F> void add_on_tool_start_callback(F &&cb) { this->on_tool_start_cb_.add(std::forward<F>(cb)); }
+  template<typename F> void add_on_tts_start_callback(F &&cb) { this->on_tts_start_cb_.add(std::forward<F>(cb)); }
+  template<typename F> void add_on_tts_end_callback(F &&cb) { this->on_tts_end_cb_.add(std::forward<F>(cb)); }
+  template<typename F> void add_on_tts_stream_start_callback(F &&cb) { this->on_tts_stream_start_cb_.add(std::forward<F>(cb)); }
+  template<typename F> void add_on_tts_stream_end_callback(F &&cb) { this->on_tts_stream_end_cb_.add(std::forward<F>(cb)); }
+  template<typename F> void add_on_end_callback(F &&cb) { this->on_end_cb_.add(std::forward<F>(cb)); }
+  template<typename F> void add_on_error_callback(F &&cb) { this->on_error_cb_.add(std::forward<F>(cb)); }
+  template<typename F> void add_on_idle_callback(F &&cb) { this->on_idle_cb_.add(std::forward<F>(cb)); }
+  template<typename F> void add_on_client_connected_callback(F &&cb) { this->on_client_connected_cb_.add(std::forward<F>(cb)); }
+  template<typename F> void add_on_client_disconnected_callback(F &&cb) {
+    this->on_client_disconnected_cb_.add(std::forward<F>(cb));
+  }
 
  protected:
   bool allocate_buffers_();
@@ -124,8 +146,9 @@ class OpenAIAssistant : public Component {
   void handle_websocket_event_(esp_websocket_event_id_t event_id, esp_websocket_event_data_t *event_data);
   void handle_json_message_(const uint8_t *data, size_t len);
   void handle_audio_delta_(const char *delta, size_t len);
-  void process_pending_audio_delta_();
-  void flush_speaker_buffer_();
+  void start_audio_pipeline_();
+  void stop_audio_pipeline_();
+  static void audio_producer_task_fn_(void *arg);
   void log_response_status_(JsonObject root);
 
   void publish_request_text_(const std::string &text);
@@ -134,9 +157,11 @@ class OpenAIAssistant : public Component {
   void start_no_speech_timeout_();
   void start_response_timeout_();
   void start_connection_timeout_();
+  void start_no_audio_timeout_();
   void cancel_no_speech_timeout_();
   void cancel_response_timeout_();
   void cancel_connection_timeout_();
+  void cancel_no_audio_timeout_();
 
   static void websocket_event_handler_(void *handler_args, esp_event_base_t base, int32_t event_id,
                                        void *event_data);
@@ -168,21 +193,28 @@ class OpenAIAssistant : public Component {
   float volume_multiplier_{1.0f};
 
   std::unique_ptr<ring_buffer::RingBuffer> ring_buffer_;
-  uint8_t *speaker_buffer_{nullptr};
-  static constexpr size_t SPEAKER_BUFFER_SIZE = 16384;  // PSRAM-backed; sized to hold one large audio delta
-  size_t speaker_buffer_index_{0};
 
-  // Audio delta queue. Each delta is copied into PSRAM and decoded in small
-  // chunks across multiple loop() iterations. This prevents speaker_->play()
-  // backpressure from blocking the main loop. Multiple deltas can queue up
-  // without loss — process_pending_audio_delta_() works through them in order.
+  // PSRAM ring buffer + feeder task for continuous, crackle-free speaker
+  // playback. The audio producer task decodes base64 deltas and writes PCM
+  // to the ring buffer; the feeder task (inside PsramAudioBuffer) reads PCM
+  // and feeds the speaker continuously, decoupled from the main loop.
+  openai_common::PsramAudioBuffer audio_buffer_;
+  StaticTask audio_producer_task_;
+  static constexpr uint32_t AUDIO_PRODUCER_STACK_SIZE = 8192;
+  static constexpr UBaseType_t AUDIO_TASK_PRIORITY = 3;
+  SemaphoreHandle_t audio_delta_mutex_{nullptr};
+  volatile bool audio_producer_should_exit_{false};
+
+  // Audio delta queue. Each delta is copied into PSRAM and decoded by the
+  // audio producer task (not the main loop). The queue is protected by
+  // audio_delta_mutex_ since handle_audio_delta_() (main loop) pushes and
+  // audio_producer_task_fn_ (producer task) pops.
   struct AudioDelta {
     uint8_t *data{nullptr};   // PSRAM-allocated base64 data
     size_t len{0};            // total base64 length
-    size_t offset{0};         // current decode offset
   };
   std::vector<AudioDelta> audio_delta_queue_;
-  static constexpr size_t MAX_AUDIO_DELTA_QUEUE = 32;  // safety cap
+  static constexpr size_t MAX_AUDIO_DELTA_QUEUE = 64;  // safety cap
 
   // PSRAM-backed receive buffer for assembling fragmented websocket JSON frames.
   // Allocated once in setup() and reused for every frame — avoids per-frame heap
@@ -216,6 +248,7 @@ class OpenAIAssistant : public Component {
   bool silence_detection_{true};
   bool tts_streaming_{false};
   bool speech_started_{false};
+  bool tool_start_fired_{false};
 
   std::string request_text_;
   std::string response_text_;
@@ -233,24 +266,26 @@ class OpenAIAssistant : public Component {
 
   std::map<std::string, InFlightToolCall> in_flight_tool_calls_;
 
-  Trigger<> listening_trigger_;
-  Trigger<> start_trigger_;
-  Trigger<> wake_word_detected_trigger_;
-  Trigger<> stt_vad_start_trigger_;
-  Trigger<> stt_vad_end_trigger_;
-  Trigger<std::string> stt_end_trigger_;
-  Trigger<std::string> tts_start_trigger_;
-  Trigger<std::string> tts_end_trigger_;
-  Trigger<> tts_stream_start_trigger_;
-  Trigger<> tts_stream_end_trigger_;
-  Trigger<> end_trigger_;
-  Trigger<std::string, std::string> error_trigger_;
-  Trigger<> idle_trigger_;
-  Trigger<> client_connected_trigger_;
-  Trigger<> client_disconnected_trigger_;
+  // --- Callback managers (lazy: 4 bytes each when empty) ---
+  LazyCallbackManager<void()> on_listening_cb_;
+  LazyCallbackManager<void()> on_start_cb_;
+  LazyCallbackManager<void()> on_wake_word_detected_cb_;
+  LazyCallbackManager<void()> on_stt_vad_start_cb_;
+  LazyCallbackManager<void()> on_stt_vad_end_cb_;
+  LazyCallbackManager<void(std::string)> on_stt_end_cb_;
+  LazyCallbackManager<void()> on_tool_start_cb_;
+  LazyCallbackManager<void(std::string)> on_tts_start_cb_;
+  LazyCallbackManager<void(std::string)> on_tts_end_cb_;
+  LazyCallbackManager<void()> on_tts_stream_start_cb_;
+  LazyCallbackManager<void()> on_tts_stream_end_cb_;
+  LazyCallbackManager<void()> on_end_cb_;
+  LazyCallbackManager<void(std::string, std::string)> on_error_cb_;
+  LazyCallbackManager<void()> on_idle_cb_;
+  LazyCallbackManager<void()> on_client_connected_cb_;
+  LazyCallbackManager<void()> on_client_disconnected_cb_;
 };
 
-template<typename... Ts> class StartAction : public Action<Ts...>, public Parented<OpenAIAssistant> {
+template<typename... Ts> class StartAction : public Action<Ts...>, public Parented<OpenAIRealtime> {
   TEMPLATABLE_VALUE(std::string, wake_word)
 
  public:
@@ -264,21 +299,21 @@ template<typename... Ts> class StartAction : public Action<Ts...>, public Parent
   bool silence_detection_{true};
 };
 
-template<typename... Ts> class StopAction : public Action<Ts...>, public Parented<OpenAIAssistant> {
+template<typename... Ts> class StopAction : public Action<Ts...>, public Parented<OpenAIRealtime> {
  public:
   void play(const Ts &...x) override { this->parent_->request_stop(); }
 };
 
-template<typename... Ts> class IsRunningCondition : public Condition<Ts...>, public Parented<OpenAIAssistant> {
+template<typename... Ts> class IsRunningCondition : public Condition<Ts...>, public Parented<OpenAIRealtime> {
  public:
   bool check(const Ts &...x) override { return this->parent_->is_running(); }
 };
 
-template<typename... Ts> class ConnectedCondition : public Condition<Ts...>, public Parented<OpenAIAssistant> {
+template<typename... Ts> class ConnectedCondition : public Condition<Ts...>, public Parented<OpenAIRealtime> {
  public:
   bool check(const Ts &...x) override { return this->parent_->is_connected(); }
 };
 
-}  // namespace esphome::openai_assistant
+}  // namespace esphome::openai_realtime
 
-#endif  // USE_OPENAI_ASSISTANT
+#endif  // USE_OPENAI_REALTIME

@@ -5,13 +5,10 @@
 #ifdef USE_OPENAI_CONVERSATIONS
 
 #include "esphome/core/automation.h"
-#include "esphome/core/component.h"
 #include "esphome/core/helpers.h"
-#include "esphome/core/static_task.h"
 
 #include "esphome/components/audio/audio.h"
 #include "esphome/components/microphone/microphone_source.h"
-#include "esphome/components/ring_buffer/ring_buffer.h"
 #include "esphome/components/speaker/speaker.h"
 #ifdef USE_MICRO_WAKE_WORD
 #include "esphome/components/micro_wake_word/micro_wake_word.h"
@@ -27,11 +24,17 @@
 #include <string>
 #include <vector>
 
+#include "esphome/components/openai_common/openai_http.h"
+
 #ifdef USE_OPENAI_CONVERSATIONS_MCP
-#include "mcp_client.h"
+#include "esphome/components/openai_common/mcp_client.h"
 #endif
 
 namespace esphome::openai_conversations {
+
+// Bring the shared HttpMsgType enum into this namespace so existing
+// unqualified references continue to resolve.
+using openai_common::HttpMsgType;
 
 #ifdef USE_OPENAI_CONVERSATIONS_MCP
 #ifndef MAX_PARALLEL_TOOLS
@@ -62,19 +65,6 @@ struct ToolRoute {
   uint8_t server_index;
 };
 #endif
-
-// Message types sent from the HTTP task to the main loop via a FreeRTOS
-// message buffer. Each message starts with one of these bytes, followed by
-// type-specific payload:
-//   DATA  — raw response bytes (the rest of the message)
-//   DONE  — no payload; the HTTP request completed successfully
-//   ERROR — 1-byte code length, code bytes, 1-byte message length, message bytes
-enum class HttpMsgType : uint8_t {
-  DATA = 0,             // followed by raw response bytes (chat/STT only)
-  DONE = 1,             // no payload; the HTTP request completed successfully
-  ERROR_ = 2,           // 1-byte code length, code bytes, 1-byte message length, message bytes
-  TTS_STREAM_START = 3, // no payload; the TTS speaker has started (fire on_tts_stream_start)
-};
 
 // Finite state machine driving one conversation turn. The component is single
 // threaded: every state transition happens in loop() and processes a bounded
@@ -123,7 +113,7 @@ enum class RequestTarget : uint8_t {
 #endif
 };
 
-class OpenAIConversations : public Component {
+class OpenAIConversations : public esphome::openai_common::OpenAIHTTPBase {
  public:
   OpenAIConversations();
   ~OpenAIConversations();
@@ -131,22 +121,8 @@ class OpenAIConversations : public Component {
   void setup() override;
   void loop() override;
   void dump_config() override;
-  float get_setup_priority() const override;
 
-  // --- Wiring setters (called from codegen) ---
-  void set_microphone_source(microphone::MicrophoneSource *mic_source) { this->mic_source_ = mic_source; }
-  void set_speaker(speaker::Speaker *speaker) { this->speaker_ = speaker; }
-#ifdef USE_MICRO_WAKE_WORD
-  void set_micro_wake_word(micro_wake_word::MicroWakeWord *mww) { this->micro_wake_word_ = mww; }
-#endif
-#ifdef USE_TEXT_SENSOR
-  void set_text_request_sensor(text_sensor::TextSensor *sensor) { this->text_request_sensor_ = sensor; }
-  void set_text_response_sensor(text_sensor::TextSensor *sensor) { this->text_response_sensor_ = sensor; }
-#endif
-
-  void set_endpoint_base(const std::string &v) { this->endpoint_base_ = v; }
-  void set_api_key(const std::string &v) { this->api_key_ = v; }
-  void set_chat_model(const std::string &v) { this->chat_model_ = v; }
+  // --- Conversations-specific wiring setters (called from codegen) ---
   void set_stt_model(const std::string &v) {
     this->stt_model_ = v;
     // Setting an STT model selects Mode 2 (transcribe first). An empty
@@ -157,17 +133,11 @@ class OpenAIConversations : public Component {
   void set_tts_model(const std::string &v) { this->tts_model_ = v; }
   void set_tts_voice(const std::string &v) { this->tts_voice_ = v; }
   void set_tts_sample_rate(uint32_t v) { this->tts_sample_rate_ = v; }
-  void set_system_prompt(const std::string &v) { this->system_prompt_ = v; }
-  void set_silence_threshold(float v) { this->silence_threshold_ = v; }
-  void set_silence_duration_ms(uint32_t v) { this->silence_duration_ms_ = v; }
-  void set_max_recording_ms(uint32_t v) { this->max_recording_ms_ = v; }
-  void set_volume_multiplier(float v) { this->volume_multiplier_ = v; }
   void set_has_tools(bool v) { this->has_tools_ = v; }
-  void set_wake_word(const std::string &v) { this->wake_word_ = v; }
 #ifdef USE_OPENAI_CONVERSATIONS_MCP
   void set_tools_cache_ttl_ms(uint32_t v) { this->tools_cache_ttl_ms_ = v; }
   void add_mcp_server(const std::string &name, const std::string &url, const std::string &api_key) {
-    McpServerConfig cfg;
+    openai_common::McpServerConfig cfg;
     cfg.name = name;
     cfg.url = url;
     if (!api_key.empty()) {
@@ -180,7 +150,6 @@ class OpenAIConversations : public Component {
   // --- Public API (used by actions/conditions) ---
   void request_start(bool silence_detection);
   void request_stop();
-  bool is_running() const { return this->state_ != State::IDLE; }
 
   /// Pre-warm models by POSTing to /backend/load for each configured model.
   /// Called on boot after WiFi connects. Fire-and-forget.
@@ -194,48 +163,34 @@ class OpenAIConversations : public Component {
   void prefetch_tools();
 #endif
 
-  // --- Callback registration (templatized to accept forwarder structs) ---
-  // Each registers into a LazyCallbackManager so idle instances cost only a
-  // nullptr (4 bytes) instead of an empty vector.
-  template<typename F> void add_on_start_callback(F &&cb) { this->on_start_cb_.add(std::forward<F>(cb)); }
-  template<typename F> void add_on_listening_callback(F &&cb) { this->on_listening_cb_.add(std::forward<F>(cb)); }
-  template<typename F> void add_on_wake_word_detected_callback(F &&cb) {
-    this->on_wake_word_detected_cb_.add(std::forward<F>(cb));
-  }
-  template<typename F> void add_on_stt_end_callback(F &&cb) { this->on_stt_end_cb_.add(std::forward<F>(cb)); }
-  template<typename F> void add_on_tts_start_callback(F &&cb) { this->on_tts_start_cb_.add(std::forward<F>(cb)); }
-  template<typename F> void add_on_tts_end_callback(F &&cb) { this->on_tts_end_cb_.add(std::forward<F>(cb)); }
-  template<typename F> void add_on_tts_stream_start_callback(F &&cb) {
-    this->on_tts_stream_start_cb_.add(std::forward<F>(cb));
-  }
-  template<typename F> void add_on_tts_stream_end_callback(F &&cb) {
-    this->on_tts_stream_end_cb_.add(std::forward<F>(cb));
-  }
-  template<typename F> void add_on_end_callback(F &&cb) { this->on_end_cb_.add(std::forward<F>(cb)); }
-  template<typename F> void add_on_idle_callback(F &&cb) { this->on_idle_cb_.add(std::forward<F>(cb)); }
-  template<typename F> void add_on_error_callback(F &&cb) { this->on_error_cb_.add(std::forward<F>(cb)); }
+  // --- Conversations-specific callback registration ---
+  template<typename F> void add_on_tool_start_callback(F &&cb) { this->on_tool_start_cb_.add(std::forward<F>(cb)); }
 
-  protected:
-  // --- Buffer lifecycle ---
-  bool allocate_buffers_();
-  void deallocate_buffers_();
-  // Resets turn-scoped state (indices + variable-size turn buffers) without
-  // freeing the long-lived fixed buffers (ring/recording/speaker/sse). Called
-  // on every IDLE transition so the next turn reuses the pre-allocated PSRAM
-  // instead of freeing ~1MB and reallocating it (which trips the main-loop
-  // watchdog).
-  void reset_turn_state_();
+ protected:
+  // --- OpenAIBase overrides ---
+  bool is_active_() const override;
+  void teardown_to_idle_() override;
+  void fail_(const std::string &code, const std::string &message) override;
+
+  // --- OpenAIHTTPBase virtual hooks ---
+  bool build_http_url_and_content_type_(char *url, size_t buf_size,
+                                        const char *&content_type) const override;
+  void set_http_extra_headers_(esp_http_client_handle_t client) override;
+  bool is_http_status_acceptable_(int status) const override;
+  bool http_feeds_speaker_() const override;
+  void http_feed_speaker_(esp_http_client_handle_t client) override;
+  void process_sse_line_(const char *line, size_t len) override;
+  void on_http_header_(const char *key, const char *value) override;
+
+  // --- Buffer lifecycle overrides (extend the shared base implementations) ---
+  bool allocate_buffers_() override;
+  void deallocate_buffers_() override;
+  void reset_turn_state_() override;
 
   // --- State machine helpers ---
   void set_state_(State s);
   void start_microphone_();
   void stop_microphone_();
-  // Pulls audio from the ring buffer (written by the mic callback on another
-  // task) into the contiguous recording buffer and updates the RMS-based VAD.
-  void drain_ring_buffer_to_recording_();
-  // Computes the RMS amplitude of a block of int16 samples, returned relative
-  // to full-scale (0.0 .. 1.0). Used for the energy-based silence detector.
-  static float compute_rms_(const int16_t *samples, size_t count);
 
   // --- Request body builders (write into request_body_, set request_body_size_) ---
   // Multimodal (Mode 1): builds the chat-completions JSON with an audio_url
@@ -244,40 +199,16 @@ class OpenAIConversations : public Component {
   // Mode 2: builds a multipart/form-data body with a 'file' field (WAV) and a
   // 'model' field, for /v1/audio/transcriptions.
   void build_stt_multipart_body_();
-  // Mode 2: builds the chat-completions JSON with the transcribed user text.
+  // Mode 2 (round 1): builds the chat-completions JSON with the transcribed user
+  // text as a message.
   void build_chat_request_body_text_(const std::string &user_text);
   // Builds the small /v1/audio/speech JSON body.
   void build_tts_request_body_();
 
-  // --- HTTP plumbing (runs in a dedicated FreeRTOS task) ---
-  // All blocking esp_http_client calls (DNS, connect, TLS, write, fetch
-  // headers, read) run in http_task_fn_ on a separate task so the main loop
-  // is never blocked. Response data flows back to the loop via a FreeRTOS
-  // message buffer (http_msg_buffer_).
-  //
-  // Starts the HTTP task for the current request_target_ + request_body_.
-  // The task handles open → write → fetch_headers → read loop, sending
-  // DATA/DONE/ERROR messages via http_msg_buffer_.
-  void start_http_task_();
-  // Kills the HTTP task (if running) and frees the message buffer. Safe to
-  // call from the main loop; uses vTaskDelete for immediate cancellation.
-  void stop_http_task_();
-  // The task entry point. arg is the OpenAIConversations* this pointer.
-  static void http_task_fn_(void *arg);
-  void close_http_();
-  // Sends an ERROR message (code + message) via the message buffer. Used by
-  // the HTTP task to report failures back to the main loop. code and message
-  // must be C string literals (or otherwise outlive the call).
-  void send_http_error_(MessageBufferHandle_t buf, const char *code, const char *message);
-
   // --- Response processing ---
-  // Feeds bytes from the HTTP message buffer into sse_line_buffer_ and, on
-  // each complete '\n'-terminated line, calls process_sse_line_().
-  void process_sse_bytes_(const uint8_t *data, size_t len);
-  // Handles one SSE data line: strips "data: ", parses JSON, accumulates
-  // choices[0].delta.content into response_text_.
-  void process_sse_line_(const char *line, size_t len);
-  // Reads the STT JSON response fully and extracts the "text" field.
+  // process_sse_line_() is implemented as an OpenAIHTTPBase virtual hook
+  // override (declared above). Reads the STT JSON response fully and extracts
+  // the "text" field.
   void process_stt_response_(const uint8_t *data, size_t len);
 
 #ifdef USE_OPENAI_CONVERSATIONS_MCP
@@ -310,123 +241,34 @@ class OpenAIConversations : public Component {
   void build_cached_tools_json_();
 #endif
 
-  // --- Speaker output ---
-  // Appends decoded PCM bytes to speaker_buffer_, applying volume_multiplier_,
-  // and flushes to the speaker when the buffer fills.
-  void feed_speaker_(const uint8_t *data, size_t len);
-  void flush_speaker_buffer_();
-
-  // --- Teardown ---
-  // Frees all PSRAM buffers, closes HTTP, restarts micro_wake_word, fires
-  // on_end/on_idle. Idempotent. Caller must ensure the speaker has stopped
-  // before calling (i2s bus contention with the mic).
-  void teardown_to_idle_();
-  // Fires on_error with code/message and routes to ERROR_TEARDOWN.
-  void fail_(const std::string &code, const std::string &message);
-
-  // Static trampoline for esp_http_client event callback. We don't actually
-  // need event data (status code, content-type are inferred from the request
-  // target), so this is a no-op kept to satisfy the API. Signature matches
-  // http_event_handle_cb: takes only the event pointer.
-  static esp_err_t http_event_handler_(esp_http_client_event_t *event);
-
-  // --- Config (set once at codegen) ---
-  microphone::MicrophoneSource *mic_source_{nullptr};
-  speaker::Speaker *speaker_{nullptr};
-#ifdef USE_MICRO_WAKE_WORD
-  micro_wake_word::MicroWakeWord *micro_wake_word_{nullptr};
-#endif
-#ifdef USE_TEXT_SENSOR
-  text_sensor::TextSensor *text_request_sensor_{nullptr};
-  text_sensor::TextSensor *text_response_sensor_{nullptr};
-#endif
-
-  std::string endpoint_base_;
-  std::string api_key_;
-  std::string chat_model_;
+  // --- Config (conversations-specific; set once at codegen) ---
   std::string stt_model_;
   std::string stt_language_{"en"};
   std::string tts_model_;
   std::string tts_voice_;
-  std::string system_prompt_;
-  std::string wake_word_;
   uint32_t tts_sample_rate_{24000};
-  float silence_threshold_{0.002f};
-  uint32_t silence_duration_ms_{700};
-  uint32_t max_recording_ms_{30000};
-  float volume_multiplier_{1.0f};
   bool has_tools_{false};
   bool multimodal_{true};
 #ifdef USE_OPENAI_CONVERSATIONS_MCP
-  std::vector<McpServerConfig> mcp_servers_;
+  std::vector<openai_common::McpServerConfig> mcp_servers_;
 #endif
 
   // --- Runtime state ---
   State state_{State::IDLE};
   RequestTarget request_target_{RequestTarget::NONE};
   bool silence_detection_{true};
-  esp_http_client_handle_t http_client_{nullptr};
-  // The http client may retain a pointer to the URL string passed to init, so
-  // the URL is kept alive here for the lifetime of the client.
-  std::string current_url_;
-  // "Bearer <api_key>" cached so its pointer stays valid for set_header.
-  std::string auth_header_value_;
 
-  // --- HTTP task (off-loads all blocking esp_http_client calls) ---
-  // The task runs on its own FreeRTOS task with a PSRAM-backed stack. It
-  // performs the full request lifecycle (open, write, fetch headers, read)
-  // and sends response data back to the main loop via a message buffer.
-  StaticTask http_task_;
-  static constexpr uint32_t HTTP_TASK_STACK_SIZE = 8192;
-  static constexpr UBaseType_t HTTP_TASK_PRIORITY = 3;
-  // Message buffer for task → loop communication. Each message is prefixed
-  // with a HttpMsgType byte. Sized to hold several read chunks so the task
-  // doesn't block on sends while the loop is busy processing.
-  static constexpr size_t HTTP_MSG_BUFFER_SIZE = 8192;
-  MessageBufferHandle_t http_msg_buffer_{nullptr};
-  // Set by the loop to request the task exit early (e.g. on request_stop).
-  volatile bool http_task_should_exit_{false};
-  // Read chunk size used by the task when calling esp_http_client_read.
-  static constexpr size_t HTTP_TASK_READ_CHUNK = 2048;
+  // PSRAM speaker bookkeeping for streaming TTS playback (the 16 KiB
+  // speaker_buffer_ itself lives in OpenAIBase).
+  bool tts_stream_started_{false};
 
-  // Ring buffer bridging the mic callback (producer, another task) and the
-  // main loop (consumer). 16 KiB is enough to absorb mic bursts while the
-  // loop drains it in chunks.
-  std::unique_ptr<ring_buffer::RingBuffer> ring_buffer_;
-  static constexpr size_t RING_BUFFER_SIZE = 16384;
-
-  // Contiguous PSRAM buffer that accumulates the recorded WAV PCM. Sized to
-  // max_recording_ms of 16 kHz/16-bit/mono audio (32 bytes/ms).
-  uint8_t *recording_buffer_{nullptr};
-  size_t recording_capacity_{0};
-  size_t recording_size_{0};
-
-  // PSRAM buffer holding a fully-built request body (chat JSON+base64, STT
-  // multipart, or TTS JSON). Written by the build_* methods, drained by the
-  // HTTP task's esp_http_client_write loop.
-  uint8_t *request_body_{nullptr};
-  size_t request_body_capacity_{0};
-  size_t request_body_size_{0};
-  size_t request_body_sent_{0};
-
-  // PSRAM line buffer for reassembling SSE chunks that split across reads.
-  char *sse_line_buffer_{nullptr};
-  size_t sse_line_capacity_{0};
-  size_t sse_line_len_{0};
-
-  // Accumulated chat response text. Only delta.content is accumulated here
-  // (the actual response the user should hear). delta.reasoning (the model's
-  // internal thinking, a non-standard GGUF extension) is accumulated
-  // separately in reasoning_text_ and only used as a fallback if no content
-  // was ever received.
+  // Accumulated chat response text + fallback reasoning text + STT transcript.
   std::string response_text_;
   std::string reasoning_text_;
-  // STT transcript accumulated while reading /v1/audio/transcriptions.
   std::string stt_response_text_;
 
 #ifdef USE_OPENAI_CONVERSATIONS_MCP
   // --- Tool execution state ---
-  // Accumulated tool calls from the current SSE stream (per-index).
   AccumulatedToolCall accumulated_tool_calls_[MAX_PARALLEL_TOOLS];
   size_t accumulated_tool_call_count_{0};
   // Captured finish_reason from the terminal SSE chunk ("tool_calls" or "stop").
@@ -479,7 +321,7 @@ class OpenAIConversations : public Component {
   enum class McpCallType : uint8_t { INITIALIZE, INITIALIZED_NOTIF, TOOLS_LIST, TOOLS_CALL };
   McpCallType current_mcp_call_type_{McpCallType::INITIALIZE};
   // Session ID captured from the `initialize` response header. Set by the
-  // http_task after fetch_headers for MCP_CALL.
+  // on_http_header_ hook after fetch_headers for MCP_CALL.
   std::string current_mcp_session_id_;
   // When true, FETCHING_TOOLS was triggered by prefetch_tools() on boot —
   // return to IDLE when done instead of continuing a conversation turn.
@@ -493,35 +335,8 @@ class OpenAIConversations : public Component {
   uint8_t reinit_server_index_{0};
 #endif
 
-  // PSRAM speaker buffer + bookkeeping for streaming TTS playback.
-  uint8_t *speaker_buffer_{nullptr};
-  static constexpr size_t SPEAKER_BUFFER_SIZE = 16384;
-  size_t speaker_buffer_index_{0};
-  bool tts_stream_started_{false};
-  // The first 44 bytes of the TTS WAV response are the RIFF/fmt header; we
-  // skip them once so only raw PCM reaches the speaker.
-  bool tts_header_skipped_{false};
-
-  // --- VAD state (energy-based) ---
-  uint32_t vad_last_check_ms_{0};
-  uint32_t silence_since_ms_{0};      // timestamp marking the start of the current silent run
-  uint32_t speech_onset_ms_{0};      // timestamp marking the start of the current above-threshold run
-  bool speech_active_{false};         // true once speech onset has been confirmed
-  bool speech_ended_{false};          // set when end-of-speech (silence after speech) is detected
-  uint32_t listening_start_ms_{0};
-
-  // --- Callback managers (lazy: 4 bytes each when empty) ---
-  LazyCallbackManager<void()> on_start_cb_;
-  LazyCallbackManager<void()> on_listening_cb_;
-  LazyCallbackManager<void()> on_wake_word_detected_cb_;
-  LazyCallbackManager<void(std::string)> on_stt_end_cb_;
-  LazyCallbackManager<void(std::string)> on_tts_start_cb_;
-  LazyCallbackManager<void(std::string)> on_tts_end_cb_;
-  LazyCallbackManager<void()> on_tts_stream_start_cb_;
-  LazyCallbackManager<void()> on_tts_stream_end_cb_;
-  LazyCallbackManager<void()> on_end_cb_;
-  LazyCallbackManager<void()> on_idle_cb_;
-  LazyCallbackManager<void(std::string, std::string)> on_error_cb_;
+  // --- Conversations-specific callback (the shared ones live in OpenAIBase) ---
+  LazyCallbackManager<void()> on_tool_start_cb_;
 };
 
 // --- Automation actions / conditions (Parented to the component) ---

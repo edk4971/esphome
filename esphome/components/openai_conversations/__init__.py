@@ -23,6 +23,7 @@ from esphome import automation
 from esphome.automation import register_action, register_condition
 import esphome.codegen as cg
 from esphome.components import esp32, micro_wake_word, microphone, speaker, text_sensor
+from esphome.components.openai_common import register_generic_openai_actions
 import esphome.config_validation as cv
 from esphome.const import (
     CONF_ID,
@@ -40,7 +41,8 @@ from esphome.core import CORE
 # in their YAML. ``audio`` provides AudioStreamInfo, ``json`` provides the
 # ArduinoJson parse/build helpers, ``ring_buffer`` provides the thread-safe mic
 # buffer used to hand audio from the mic callback to the main loop.
-AUTO_LOAD = ["audio", "json", "ring_buffer"]
+# ``openai_common`` provides the shared OpenAIBase / OpenAIHTTPBase classes.
+AUTO_LOAD = ["audio", "json", "ring_buffer", "openai_common"]
 
 # Hard requirements: a microphone source, wake-word detection, networking and
 # PSRAM (all audio/HTTP buffers live in external RAM).
@@ -80,6 +82,7 @@ CONF_MCP_SERVER_API_KEY = "api_key"
 CONF_ON_END = "on_end"
 CONF_ON_LISTENING = "on_listening"
 CONF_ON_STT_END = "on_stt_end"
+CONF_ON_TOOL_START = "on_tool_start"
 CONF_ON_TTS_END = "on_tts_end"
 CONF_ON_TTS_START = "on_tts_start"
 CONF_ON_TTS_STREAM_END = "on_tts_stream_end"
@@ -204,6 +207,7 @@ CONFIG_SCHEMA = cv.All(
                 single=True
             ),
             cv.Optional(CONF_ON_STT_END): automation.validate_automation(single=True),
+            cv.Optional(CONF_ON_TOOL_START): automation.validate_automation(single=True),
             cv.Optional(CONF_ON_TTS_START): automation.validate_automation(single=True),
             cv.Optional(CONF_ON_TTS_END): automation.validate_automation(single=True),
             cv.Optional(CONF_ON_TTS_STREAM_START): automation.validate_automation(
@@ -338,6 +342,7 @@ async def to_code(config):
         (CONF_ON_START, "add_on_start_callback", []),
         (CONF_ON_WAKE_WORD_DETECTED, "add_on_wake_word_detected_callback", []),
         (CONF_ON_STT_END, "add_on_stt_end_callback", [(cg.std_string, "x")]),
+        (CONF_ON_TOOL_START, "add_on_tool_start_callback", []),
         (CONF_ON_TTS_START, "add_on_tts_start_callback", [(cg.std_string, "x")]),
         (CONF_ON_TTS_END, "add_on_tts_end_callback", [(cg.std_string, "x")]),
         (CONF_ON_TTS_STREAM_START, "add_on_tts_stream_start_callback", []),
@@ -355,6 +360,7 @@ async def to_code(config):
             await automation.build_callback_automation(var, method, args, conf)
 
     cg.add_define("USE_OPENAI_CONVERSATIONS")
+    cg.add_define("USE_OPENAI_COMMON")
 
     # esp_http_client is excluded from ESPHome's ESP-IDF build by default (to
     # save compile time). Re-enable it explicitly; audio's to_code (auto-loaded)
@@ -414,3 +420,9 @@ async def openai_conversations_is_running_to_code(
     var = cg.new_Pvariable(condition_id, template_arg)
     await cg.register_parented(var, config[CONF_ID])
     return var
+
+
+# --- Generic action aliases (work regardless of which component is loaded) ---
+_GENERIC_ACTIONS = register_generic_openai_actions(
+    OpenAIConversations, OPENAI_CONVERSATIONS_ACTION_SCHEMA, StartAction, StopAction, IsRunningCondition
+)

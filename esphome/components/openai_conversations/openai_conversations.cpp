@@ -13,7 +13,7 @@
 #include "openai_conversations_tools.h"  // generated header with TOOLS_JSON (raw string literal)
 #endif
 #ifdef USE_OPENAI_CONVERSATIONS_MCP
-#include "mcp_client.h"
+#include "esphome/components/openai_common/mcp_client.h"
 #endif
 
 #include <esp_crt_bundle.h>
@@ -198,22 +198,16 @@ void OpenAIConversations::setup() {
   }
 }
 
-float OpenAIConversations::get_setup_priority() const { return setup_priority::AFTER_CONNECTION; }
-
 void OpenAIConversations::dump_config() {
+  this->OpenAIHTTPBase::dump_config();
   ESP_LOGCONFIG(TAG, "OpenAI Conversations:");
-  ESP_LOGCONFIG(TAG, "  Endpoint: %s", this->endpoint_base_.c_str());
-  ESP_LOGCONFIG(TAG, "  Chat model: %s", this->chat_model_.c_str());
   if (this->multimodal_) {
     ESP_LOGCONFIG(TAG, "  Mode: multimodal (audio sent to chat model)");
   } else {
     ESP_LOGCONFIG(TAG, "  Mode: STT + LLM (stt_model=%s)", this->stt_model_.c_str());
   }
-  ESP_LOGCONFIG(TAG, "  TTS model: %s voice=%s sample_rate=%" PRIu32,
+  ESP_LOGCONFIG(TAG, "  TTS model: %s voice=%s sample_rate: %" PRIu32,
                 this->tts_model_.c_str(), this->tts_voice_.c_str(), this->tts_sample_rate_);
-  ESP_LOGCONFIG(TAG, "  Silence threshold: %.4f duration_ms: %" PRIu32 " max_recording_ms: %" PRIu32,
-                this->silence_threshold_, this->silence_duration_ms_, this->max_recording_ms_);
-  ESP_LOGCONFIG(TAG, "  Volume multiplier: %.2f", this->volume_multiplier_);
   ESP_LOGCONFIG(TAG, "  Tools: %s", this->has_tools_ ? "yes" : "no");
 #ifdef USE_OPENAI_CONVERSATIONS_MCP
   ESP_LOGCONFIG(TAG, "  MCP servers: %u", (unsigned) this->mcp_servers_.size());
@@ -227,84 +221,20 @@ void OpenAIConversations::dump_config() {
 // --- Buffer allocation ------------------------------------------------------
 
 bool OpenAIConversations::allocate_buffers_() {
-  // All long-lived buffers live in PSRAM (the component requires psram). Each
-  // is allocated once and freed in deallocate_buffers_() on teardown. No heap
-  // allocation happens after setup() in steady state.
-  ExternalRAMAllocator<uint8_t> ext(ExternalRAMAllocator<uint8_t>::ALLOC_EXTERNAL);
-
-  if (this->ring_buffer_ == nullptr) {
-    this->ring_buffer_ = ring_buffer::RingBuffer::create(RING_BUFFER_SIZE);
-    if (this->ring_buffer_ == nullptr) {
-      ESP_LOGE(TAG, "Failed to allocate ring buffer (%d bytes)", RING_BUFFER_SIZE);
-      return false;
-    }
+  if (!this->OpenAIHTTPBase::allocate_buffers_()) {
+    return false;
   }
-
-  // Recording buffer: worst case max_recording_ms of audio. 16 kHz/16-bit/mono
-  // = 32 bytes/ms.
-  this->recording_capacity_ = this->max_recording_ms_ * MIC_BYTES_PER_MS;
-  if (this->recording_buffer_ == nullptr) {
-    this->recording_buffer_ = ext.allocate(this->recording_capacity_);
-    if (this->recording_buffer_ == nullptr) {
-      ESP_LOGE(TAG, "Failed to allocate recording buffer (%d bytes)", (int) this->recording_capacity_);
-      return false;
-    }
-  }
-  this->recording_size_ = 0;
-
-  if (this->speaker_buffer_ == nullptr) {
-    this->speaker_buffer_ = ext.allocate(SPEAKER_BUFFER_SIZE);
-    if (this->speaker_buffer_ == nullptr) {
-      ESP_LOGE(TAG, "Failed to allocate speaker buffer (%d bytes)", SPEAKER_BUFFER_SIZE);
-      return false;
-    }
-  }
-  this->speaker_buffer_index_ = 0;
-
-  if (this->sse_line_buffer_ == nullptr) {
-    this->sse_line_buffer_ = reinterpret_cast<char *>(ext.allocate(SSE_LINE_MAX));
-    if (this->sse_line_buffer_ == nullptr) {
-      ESP_LOGE(TAG, "Failed to allocate SSE line buffer (%d bytes)", SSE_LINE_MAX);
-      return false;
-    }
-  }
-  this->sse_line_len_ = 0;
-
+  // Conversations-specific buffers (all in OpenAIHTTPBase now, but kept for
+  // any conversations-specific additions). The base allocates ring, recording,
+  // speaker, and SSE buffers.
   return true;
 }
 
 void OpenAIConversations::deallocate_buffers_() {
-  ExternalRAMAllocator<uint8_t> ext(ExternalRAMAllocator<uint8_t>::ALLOC_EXTERNAL);
+  // Base class frees ring, recording, speaker, SSE, and request body buffers.
+  this->OpenAIHTTPBase::deallocate_buffers_();
 
-  this->ring_buffer_.reset();
-
-  if (this->recording_buffer_ != nullptr) {
-    ext.deallocate(this->recording_buffer_, this->recording_capacity_);
-    this->recording_buffer_ = nullptr;
-  }
-  this->recording_capacity_ = 0;
-  this->recording_size_ = 0;
-
-  if (this->request_body_ != nullptr) {
-    ext.deallocate(this->request_body_, this->request_body_capacity_);
-    this->request_body_ = nullptr;
-  }
-  this->request_body_capacity_ = 0;
-  this->request_body_size_ = 0;
-  this->request_body_sent_ = 0;
-
-  if (this->sse_line_buffer_ != nullptr) {
-    ext.deallocate(reinterpret_cast<uint8_t *>(this->sse_line_buffer_), SSE_LINE_MAX);
-    this->sse_line_buffer_ = nullptr;
-  }
-  this->sse_line_len_ = 0;
-
-  if (this->speaker_buffer_ != nullptr) {
-    ext.deallocate(this->speaker_buffer_, SPEAKER_BUFFER_SIZE);
-    this->speaker_buffer_ = nullptr;
-  }
-  this->speaker_buffer_index_ = 0;
-
+  // Conversations-specific variable-size buffers.
   this->response_text_.clear();
   this->response_text_.shrink_to_fit();
   this->reasoning_text_.clear();
@@ -333,55 +263,29 @@ void OpenAIConversations::deallocate_buffers_() {
   this->current_tool_index_ = 0;
   this->mcp_phase_ = McpPhase::IDLE;
   this->current_mcp_call_type_ = McpCallType::INITIALIZE;
-  // Clear runtime MCP connection state (URL, auth token, session ID).
-  // These are set fresh before each MCP HTTP call.
   this->current_mcp_url_.clear();
   this->current_mcp_url_.shrink_to_fit();
   this->current_mcp_auth_.clear();
   this->current_mcp_auth_.shrink_to_fit();
   this->current_mcp_session_id_.clear();
   this->current_mcp_session_id_.shrink_to_fit();
-  // Reset FETCHING_TOOLS bookkeeping flags.
   this->tools_prefetch_ = false;
   this->tools_reinit_ = false;
   this->reinit_server_index_ = 0;
   this->mcp_route_server_index_ = 0;
   this->round1_b64_offset_ = 0;
   this->round1_b64_len_ = 0;
-  // cached_tools_json_, tool_routes_, tools_cache_timestamp_ms_, and
-  // mcp_servers_[].session_id/initialized/stateless persist across turns
-  // (the cache is refreshed on a TTL basis, not per-turn).
 #endif
 }
 
 void OpenAIConversations::reset_turn_state_() {
-  // Reset turn-scoped indices + free variable-size turn buffers WITHOUT
-  // touching the long-lived fixed buffers (ring/recording/speaker/sse),
-  // which stay allocated for the component lifetime (allocated once in
-  // setup()). This avoids ~1MB of PSRAM alloc/free churn per turn that was
-  // the primary cause of the main-loop watchdog warnings.
+  // Base class resets recording_size, sse_line_len, speaker_buffer_index,
+  // tts_header_skipped_, request_body, and VAD state.
+  this->OpenAIHTTPBase::reset_turn_state_();
 
-  // Fixed buffers: reset indices only (do NOT free).
-  this->recording_size_ = 0;
-  this->sse_line_len_ = 0;
-  this->speaker_buffer_index_ = 0;
-  this->tts_header_skipped_ = false;
+  // Conversations-specific turn state.
   this->tts_stream_started_ = false;
 
-  // Variable-size turn buffers: free (these can be ~1MB+ for multimodal
-  // base64 and are rebuilt per turn anyway).
-  ExternalRAMAllocator<uint8_t> ext(ExternalRAMAllocator<uint8_t>::ALLOC_EXTERNAL);
-  if (this->request_body_ != nullptr) {
-    ext.deallocate(this->request_body_, this->request_body_capacity_);
-    this->request_body_ = nullptr;
-  }
-  this->request_body_capacity_ = 0;
-  this->request_body_size_ = 0;
-  this->request_body_sent_ = 0;
-
-  // Clear turn-scoped strings (release capacity back to the heap so it can
-  // be reused by other allocations — esp_http_client/lwIP churn the same
-  // pools, and shrinking lets those holes get recycled).
   this->response_text_.clear();
   this->response_text_.shrink_to_fit();
   this->reasoning_text_.clear();
@@ -422,8 +326,6 @@ void OpenAIConversations::reset_turn_state_() {
   this->mcp_route_server_index_ = 0;
   this->round1_b64_offset_ = 0;
   this->round1_b64_len_ = 0;
-  // cached_tools_json_, tool_routes_, tools_cache_timestamp_ms_, and
-  // mcp_servers_[].session_id/initialized/stateless persist across turns.
 #endif
 }
 
@@ -445,102 +347,6 @@ void OpenAIConversations::start_microphone_() {
 void OpenAIConversations::stop_microphone_() {
   if (this->mic_source_ != nullptr) {
     this->mic_source_->stop();
-  }
-}
-
-float OpenAIConversations::compute_rms_(const int16_t *samples, size_t count) {
-  if (count == 0) {
-    return 0.0f;
-  }
-  // Accumulate sum-of-squares in 64-bit to avoid overflow. Normalise to
-  // full-scale (1.0 = 32767) so the threshold is a fraction independent of
-  // the int16 range.
-  uint64_t sum_sq = 0;
-  for (size_t i = 0; i < count; i++) {
-    int32_t s = samples[i];
-    sum_sq += (uint64_t) s * (uint64_t) s;
-  }
-  // RMS = sqrt(mean(sample^2)); divide by 32767.0 to get a 0..1 fraction.
-  float rms = sqrtf((float) sum_sq / (float) count) / 32767.0f;
-  return rms;
-}
-
-void OpenAIConversations::drain_ring_buffer_to_recording_() {
-  if (this->ring_buffer_ == nullptr || this->recording_buffer_ == nullptr) {
-    return;
-  }
-  // Drain whatever the mic callback has written, in receive_acquire() chunks
-  // (zero-copy views into the ring buffer's storage), copying into the
-  // contiguous recording buffer. We process one acquired chunk per loop pass
-  // to bound work; remaining data stays in the ring buffer for next pass.
-  size_t length = 0;
-  void *item = this->ring_buffer_->receive_acquire(length, HTTP_READ_CHUNK);
-  if (item == nullptr || length == 0) {
-    return;
-  }
-  // Append to the recording buffer, clamping to capacity (shouldn't happen
-  // before max_recording_ms thanks to the timeout, but guard anyway).
-  size_t free = this->recording_capacity_ - this->recording_size_;
-  size_t to_copy = (length < free) ? length : free;
-  if (to_copy > 0) {
-    memcpy(this->recording_buffer_ + this->recording_size_, item, to_copy);
-    this->recording_size_ += to_copy;
-  }
-  this->ring_buffer_->receive_release(item);
-
-  // --- VAD: check RMS at most once per VAD_CHECK_INTERVAL_MS ---
-  uint32_t now = millis();
-  if (now - this->vad_last_check_ms_ < VAD_CHECK_INTERVAL_MS) {
-    return;
-  }
-  this->vad_last_check_ms_ = now;
-
-  // Compute RMS over the last ~20 ms of audio (320 samples at 16 kHz). We look
-  // at the tail of the recording buffer so the VAD reflects the most recent
-  // mic input.
-  const size_t samples_for_vad = 320;
-  size_t bytes_for_vad = samples_for_vad * sizeof(int16_t);
-  if (this->recording_size_ < bytes_for_vad) {
-    bytes_for_vad = this->recording_size_;
-  }
-  if (bytes_for_vad == 0) {
-    return;
-  }
-  const int16_t *vad_samples =
-      reinterpret_cast<const int16_t *>(this->recording_buffer_ + this->recording_size_ - bytes_for_vad);
-  float rms = this->compute_rms_(vad_samples, bytes_for_vad / sizeof(int16_t));
-
-  // Log the current RMS so the user can observe the mic's baseline noise floor
-  // and tune silence_threshold accordingly. Throttled to once per VAD check.
-  ESP_LOGV(TAG, "VAD rms=%.4f threshold=%.4f active=%d (recording=%u bytes)",
-           rms, this->silence_threshold_, this->speech_active_ ? 1 : 0,
-           (unsigned) this->recording_size_);
-
-  if (rms > this->silence_threshold_) {
-    // Speech above threshold.
-    if (!this->speech_active_) {
-      // Require sustained speech for SPEECH_ONSET_MS before transitioning.
-      if (this->speech_onset_ms_ == 0) {
-        this->speech_onset_ms_ = now;
-      }
-      if (now - this->speech_onset_ms_ >= SPEECH_ONSET_MS) {
-        this->speech_active_ = true;
-        ESP_LOGD(TAG, "Speech detected (rms=%.4f)", rms);
-      }
-    }
-    // While speech is active, reset the silence timer so the silence window
-    // only counts consecutive quiet samples.
-    this->silence_since_ms_ = 0;
-  } else {
-    // Below threshold.
-    if (this->speech_active_) {
-      if (this->silence_since_ms_ == 0) {
-        this->silence_since_ms_ = now;
-      } else if (now - this->silence_since_ms_ >= this->silence_duration_ms_) {
-        ESP_LOGD(TAG, "Silence for %" PRIu32 " ms, end of speech", now - this->silence_since_ms_);
-        this->speech_ended_ = true;
-      }
-    }
   }
 }
 
@@ -797,483 +603,125 @@ void OpenAIConversations::teardown_to_idle_() {
 #endif
 
   this->on_idle_cb_.call();
+
+  // Let the base reset its shared per-turn members (speaker buffer index,
+  // tts_header_skipped_, etc.).
+  this->OpenAIBase::teardown_to_idle_();
+
   this->set_state_(State::IDLE);
 }
 
-// --- HTTP task (all blocking esp_http_client calls run here) ---------------
+// --- OpenAIHTTPBase virtual hooks ------------------------------------------
 
-esp_err_t OpenAIConversations::http_event_handler_(esp_http_client_event_t *event) {
-  // We drive all reads explicitly via esp_http_client_read() in the task, so
-  // the only event we handle here is HTTP_EVENT_ON_HEADER — used to capture
-  // the Mcp-Session-Id response header from the `initialize` handshake.
+bool OpenAIConversations::is_active_() const { return this->state_ != State::IDLE; }
+
+void OpenAIConversations::on_http_header_(const char *key, const char *value) {
 #ifdef USE_OPENAI_CONVERSATIONS_MCP
-  if (event->event_id == HTTP_EVENT_ON_HEADER && event->header_key != nullptr &&
-      event->header_value != nullptr) {
-    if (strcasecmp(event->header_key, "Mcp-Session-Id") == 0) {
-      auto *self = static_cast<OpenAIConversations *>(event->user_data);
-      if (self != nullptr) {
-        self->current_mcp_session_id_ = event->header_value;
-        ESP_LOGV(TAG, "Captured Mcp-Session-Id: %s", self->current_mcp_session_id_.c_str());
-      }
-    }
+  if (strcasecmp(key, "Mcp-Session-Id") == 0) {
+    this->current_mcp_session_id_ = value;
+    ESP_LOGV(TAG, "Captured Mcp-Session-Id: %s", this->current_mcp_session_id_.c_str());
   }
-#endif
-  return ESP_OK;
-}
-
-void OpenAIConversations::start_http_task_() {
-  this->http_task_should_exit_ = false;
-
-  // The message buffer is pre-allocated in setup() and reused across turns.
-  // Drain any stale data from a previous turn before starting.
-  if (this->http_msg_buffer_ != nullptr) {
-    uint8_t drain[64];
-    while (xMessageBufferReceive(this->http_msg_buffer_, drain, sizeof(drain), 0) > 0) {
-      // discard
-    }
-  } else {
-    // Should not happen (allocated in setup), but handle gracefully.
-    this->fail_("msg_buffer_alloc", "Message buffer is null");
-    return;
-  }
-
-  // Create the HTTP task with an internal-RAM stack. PSRAM stacks crash
-  // during interrupt-heavy network I/O (lwip/socket callbacks preempt the
-  // task and the cache may not have the PSRAM stack lines, causing
-  // IllegalInstruction). 8KB of internal RAM is affordable on the S3-Box-3.
-  // The StaticTask::destroy() called in stop_http_task_() keeps the stack
-  // buffer allocated for reuse by the next create() call.
-  if (!this->http_task_.create(OpenAIConversations::http_task_fn_, "oai_http",
-                               HTTP_TASK_STACK_SIZE, this, HTTP_TASK_PRIORITY, false)) {
-    this->fail_("task_alloc", "Failed to create HTTP task");
-    return;
-  }
-}
-
-void OpenAIConversations::stop_http_task_() {
-  // Signal the task to exit. The task checks http_task_should_exit_ in its
-  // read/write loops and, when it sees the flag, calls close_http_() itself
-  // (cleaning up the esp_http_client + TLS socket from the task that owns
-  // them) before reaching vTaskSuspend(nullptr) at the end of http_task_fn_.
-  //
-  // We must NOT vTaskDelete immediately after setting the flag: if the task
-  // is blocked inside esp_http_client_read() or xMessageBufferSend() when we
-  // delete it, the lwIP socket's internal state is left inconsistent, and
-  // the subsequent close_http_() from this (main loop) task crashes with an
-  // xQueueGenericSend assert (the socket's queue belongs to the deleted task).
-  //
-  // Instead: set the flag, drain the message buffer (so any blocked
-  // xMessageBufferSend in the task unblocks), and wait up to 500ms for the
-  // task to suspend itself. Then destroy the (suspended) task.
-  this->http_task_should_exit_ = true;
-
-  bool suspended = false;  // hoisted out of the is_created() block
-  if (this->http_task_.is_created()) {
-    // Drain the message buffer so the task's xMessageBufferSend (if blocked
-    // on a full buffer) unblocks and can check the exit flag.
-    if (this->http_msg_buffer_ != nullptr) {
-      uint8_t drain[64];
-      while (xMessageBufferReceive(this->http_msg_buffer_, drain, sizeof(drain), 0) > 0) {
-        // discard
-      }
-    }
-
-    // Wait for the task to reach vTaskSuspend(nullptr). The task checks the
-    // exit flag in its read loops (every chunk, ~10-50ms), calls
-    // close_http_(), then suspends. We poll at 10ms intervals for up to 500ms
-    // (bounded to avoid tripping the main-loop watchdog). In the normal case
-    // (active stream), the task exits within one read-chunk interval.
-    for (int i = 0; i < 50; i++) {
-      if (eTaskGetState(this->http_task_.get_handle()) == eSuspended) {
-        suspended = true;
-        break;
-      }
-      vTaskDelay(pdMS_TO_TICKS(10));
-    }
-    if (!suspended) {
-      ESP_LOGW(TAG, "HTTP task did not suspend within 500ms; force-deleting (socket may be left dirty)");
-    }
-
-    // Now safe to delete — the task is suspended (not mid-syscall) and has
-    // already cleaned up its own HTTP client. If it didn't suspend in time,
-    // vTaskDelete is still safe from FreeRTOS's perspective; we handle the
-    // socket below.
-    this->http_task_.destroy();
-  }
-  this->http_task_should_exit_ = false;
-
-  // If the task suspended cleanly, it already called close_http_() itself
-  // (so http_client_ is null and this is a no-op). If we had to force-delete
-  // (task didn't suspend), do NOT call close_http_() — closing the socket
-  // from this task when its lwIP state is inconsistent crashes with an
-  // xQueueGenericSend assert. A leaked socket is preferable to a crash; it
-  // times out and frees itself.
-  if (suspended) {
-    this->close_http_();
-  } else {
-    this->http_client_ = nullptr;  // prevent double-free / stale access
-  }
-
-  // The message buffer is pre-allocated in setup() and reused across turns.
-  // Do NOT delete it here — just drain any pending messages so the next
-  // turn starts with a clean buffer.
-  if (this->http_msg_buffer_ != nullptr) {
-    uint8_t drain[64];
-    while (xMessageBufferReceive(this->http_msg_buffer_, drain, sizeof(drain), 0) > 0) {
-      // discard
-    }
-  }
-}
-
-void OpenAIConversations::http_task_fn_(void *arg) {
-  // This task runs on its own FreeRTOS task, separate from the main loop.
-  // It performs the full HTTP request lifecycle:
-  //   1. Build URL + content type from request_target_
-  //   2. esp_http_client_init (allocates client)
-  //   3. esp_http_client_open (DNS + TCP + TLS handshake — blocking)
-  //   4. esp_http_client_write loop (sends request body — blocking per chunk)
-  //   5. esp_http_client_fetch_headers (waits for response start — blocking,
-  //      this is the ~1.3s "time to first token" for LLM endpoints)
-  //   6. esp_http_client_read loop (reads response chunks — blocking)
-  //      Each chunk is sent to the main loop via the message buffer.
-  //   7. On EOF: send DONE. On error: send ERROR. On cancel: just exit.
-  //   8. esp_http_client_cleanup (closes sockets, frees client)
-  //
-  // The main loop never blocks on HTTP I/O — it does 0-timeout
-  // xMessageBufferReceive in the READING_* states.
-  OpenAIConversations *self = static_cast<OpenAIConversations *>(arg);
-
-  // 1) Build URL and content type from the current request target.
-  //    Use a C-style char buffer (not std::string) to avoid heap allocation
-  //    in the task — the std::string destructor crashed at function return
-  //    due to heap corruption from the esp_http_client call chain.
-  //
-  // The entire body is wrapped in a single scope so that the `task_done:`
-  // label is outside all local variable scopes. Otherwise `goto task_done`
-  // would cross initializations, which is a compile error in C++.
-  {
-  char url[512];
-  const char *content_type = "application/json";
-  if (self->request_target_ == RequestTarget::CHAT) {
-    snprintf(url, sizeof(url), "%s/v1/chat/completions", self->endpoint_base_.c_str());
-    content_type = "application/json";
-  } else if (self->request_target_ == RequestTarget::STT) {
-    snprintf(url, sizeof(url), "%s/v1/audio/transcriptions", self->endpoint_base_.c_str());
-    content_type = "multipart/form-data; boundary=----esphome_openai_conv";
-  } else if (self->request_target_ == RequestTarget::TTS) {
-    snprintf(url, sizeof(url), "%s/v1/audio/speech", self->endpoint_base_.c_str());
-    content_type = "application/json";
-#ifdef USE_OPENAI_CONVERSATIONS_MCP
-  } else if (self->request_target_ == RequestTarget::MCP_CALL) {
-    snprintf(url, sizeof(url), "%s", self->current_mcp_url_.c_str());
-    content_type = "application/json";
-#endif
-  } else {
-    // No valid target — shouldn't happen, but handle gracefully.
-    goto task_done;
-  }
-
-  ESP_LOGV(TAG, "HTTP POST %s (content_length=%u)", url, (unsigned) self->request_body_size_);
-
-  // 2) Configure and init the HTTP client. The url char buffer lives on the
-  //    task stack and is valid for the entire function — the client is
-  //    created and destroyed within this function.
-  esp_http_client_config_t config = {};
-  config.url = url;
-  config.cert_pem = nullptr;
-  config.disable_auto_redirect = false;
-  config.max_redirection_count = 5;
-  config.event_handler = OpenAIConversations::http_event_handler_;
-  config.user_data = self;  // passed to event_handler via event->user_data
-  config.buffer_size = HTTP_TASK_READ_CHUNK * 2;
-  config.buffer_size_tx = HTTP_WRITE_CHUNK * 2;
-  config.timeout_ms = HTTP_TIMEOUT_MS;
-
-#if CONFIG_MBEDTLS_CERTIFICATE_BUNDLE
-  if (strstr(url, "https:") != nullptr) {
-    config.crt_bundle_attach = esp_crt_bundle_attach;
-  }
-#endif
-
-  self->http_client_ = esp_http_client_init(&config);
-  if (self->http_client_ == nullptr) {
-    ESP_LOGE(TAG, "esp_http_client_init failed");
-    self->send_http_error_(self->http_msg_buffer_, "http_init", "esp_http_client_init failed");
-    goto task_done;
-  }
-
-  esp_http_client_set_method(self->http_client_, HTTP_METHOD_POST);
-  esp_http_client_set_header(self->http_client_, "Content-Type", content_type);
-#ifdef USE_OPENAI_CONVERSATIONS_MCP
-  if (self->request_target_ == RequestTarget::MCP_CALL) {
-    // MCP servers may return either a single JSON body or an SSE stream.
-    esp_http_client_set_header(self->http_client_, "Accept",
-                               "application/json, text/event-stream");
-    if (!self->current_mcp_auth_.empty()) {
-      esp_http_client_set_header(self->http_client_, "Authorization",
-                                 self->current_mcp_auth_.c_str());
-    }
-    // Include the session ID on all calls after `initialize`.
-    if (!self->current_mcp_session_id_.empty()) {
-      esp_http_client_set_header(self->http_client_, "Mcp-Session-Id",
-                                 self->current_mcp_session_id_.c_str());
-    }
-  } else {
-#endif
-    if (!self->auth_header_value_.empty()) {
-      esp_http_client_set_header(self->http_client_, "Authorization",
-                                 self->auth_header_value_.c_str());
-    }
-#ifdef USE_OPENAI_CONVERSATIONS_MCP
-  }
-#endif
-
-  // 3) Open the connection with the exact content length (Content-Length
-  //    header is set automatically by open() when write_len > 0).
-  esp_err_t err = esp_http_client_open(self->http_client_, self->request_body_size_);
-  if (err != ESP_OK) {
-    ESP_LOGE(TAG, "esp_http_client_open failed: %s", esp_err_to_name(err));
-    self->close_http_();
-    self->send_http_error_(self->http_msg_buffer_, "http_open", esp_err_to_name(err));
-    goto task_done;
-  }
-
-  // 4) Write the request body in chunks. Each write may block on the socket
-  //    send buffer.
-  size_t sent = 0;
-  while (sent < self->request_body_size_ && !self->http_task_should_exit_) {
-    size_t remaining = self->request_body_size_ - sent;
-    size_t to_write = (remaining < HTTP_WRITE_CHUNK) ? remaining : HTTP_WRITE_CHUNK;
-    int written = esp_http_client_write(self->http_client_,
-                                        reinterpret_cast<const char *>(self->request_body_ + sent), to_write);
-    if (written < 0) {
-      ESP_LOGE(TAG, "esp_http_client_write failed");
-      self->close_http_();
-      self->send_http_error_(self->http_msg_buffer_, "http_write", "Failed to write request body");
-      goto task_done;
-    }
-    sent += written;
-  }
-
-  // Check if we were cancelled during the write loop.
-  if (self->http_task_should_exit_) {
-    self->close_http_();
-    goto task_done;  // no message sent; the loop called stop_http_task_
-  }
-
-  // 5) Fetch response headers. This is the biggest blocking call — it waits
-  //    for the server to begin responding. For LLM endpoints this is the
-  //    "time to first token" (observed ~1.3s for a local Gemma model).
-  int64_t header_len = esp_http_client_fetch_headers(self->http_client_);
-  if (header_len < 0) {
-    ESP_LOGE(TAG, "esp_http_client_fetch_headers failed");
-    self->close_http_();
-    self->send_http_error_(self->http_msg_buffer_, "http_headers", "Failed to fetch response headers");
-    goto task_done;
-  }
-
-  // 5b) For MCP calls, the Mcp-Session-Id response header is captured by the
-  //     HTTP_EVENT_ON_HEADER event handler (set during `initialize`).
-  //     No action needed here.
-
-  // 6) Check the HTTP status code. Accept 200 for normal responses and 202
-  //    for MCP notifications (which have no JSON-RPC response body).
-  int status = esp_http_client_get_status_code(self->http_client_);
-#ifdef USE_OPENAI_CONVERSATIONS_MCP
-  bool is_notification = (self->request_target_ == RequestTarget::MCP_CALL &&
-                          self->current_mcp_call_type_ == McpCallType::INITIALIZED_NOTIF);
-  if (status != 200 && !(is_notification && status == 202)) {
 #else
-  if (status != 200) {
+  (void) key;
+  (void) value;
 #endif
-    ESP_LOGE(TAG, "HTTP status %d", status);
-    self->close_http_();
-    char status_msg[32];
-    snprintf(status_msg, sizeof(status_msg), "HTTP %d", status);
-    self->send_http_error_(self->http_msg_buffer_, "http_status", status_msg);
-    goto task_done;
-  }
+}
 
-  // 7) Read the response body. For chat/STT, each chunk is sent to the main
-  //    loop via the message buffer for SSE/JSON parsing. For TTS, the task
-  //    feeds the speaker directly — play(portMAX_DELAY) blocks until the
-  //    speaker consumes the data (natural backpressure), and the main loop
-  //    never blocks on speaker I/O.
-  if (self->request_target_ == RequestTarget::TTS) {
-    // --- TTS: feed speaker directly ---
-    // play(data, len, portMAX_DELAY) handles the full speaker lifecycle:
-    //   - If not started: calls start() internally
-    //   - If STARTING: waits portMAX_DELAY for STATE_RUNNING
-    //   - If RUNNING: writes to ring buffer (blocks if full = backpressure)
-    //   - If STOPPED: returns 0 (data dropped — shouldn't happen)
-    bool speaker_started = false;
-    size_t header_skip = 44;  // WAV header bytes to skip
-    uint8_t read_buf[HTTP_TASK_READ_CHUNK];
-
-    while (!self->http_task_should_exit_) {
-      int got = esp_http_client_read(self->http_client_,
-                                     reinterpret_cast<char *>(read_buf), HTTP_TASK_READ_CHUNK);
-      if (got < 0) {
-        ESP_LOGE(TAG, "esp_http_client_read failed (TTS)");
-        self->close_http_();
-        self->send_http_error_(self->http_msg_buffer_, "http_read", "Failed to read TTS response");
-        goto task_done;
-      }
-      if (got == 0) {
-        break;  // EOF
-      }
-
-      size_t off = 0;
-
-      // Start the speaker on the first chunk (data is already in hand — no
-      // underrun window). Signal the main loop to fire on_tts_stream_start.
-      if (!speaker_started) {
-        speaker_started = true;
-        if (self->speaker_ != nullptr) {
-          ESP_LOGV(TAG, "Starting speaker (sample_rate=%u bits=%u ch=%u)",
-                   (unsigned) self->tts_sample_rate_, (unsigned) MIC_BITS_PER_SAMPLE, (unsigned) MIC_CHANNELS);
-          self->speaker_->set_audio_stream_info(
-              audio::AudioStreamInfo(MIC_BITS_PER_SAMPLE, MIC_CHANNELS, self->tts_sample_rate_));
-          // Explicitly start the speaker. play() would call start() internally,
-          // but only if state_ is not STATE_RUNNING or STATE_STARTING — and our
-          // is_stopped() guard would bail before play() ever runs.
-          self->speaker_->start();
-        }
-        uint8_t start_msg = (uint8_t) HttpMsgType::TTS_STREAM_START;
-        xMessageBufferSend(self->http_msg_buffer_, &start_msg, 1, portMAX_DELAY);
-      }
-
-      // Skip the 44-byte WAV header (may span multiple chunks).
-      while (off < (size_t) got && header_skip > 0) {
-        size_t to_skip = (header_skip < (size_t) got - off) ? header_skip : ((size_t) got - off);
-        off += to_skip;
-        header_skip -= to_skip;
-      }
-
-        if (off < (size_t) got) {
-          size_t pcm_len = (size_t) got - off;
-          uint8_t *pcm = read_buf + off;
-
-          // Apply volume multiplier to int16 samples.
-        if (self->volume_multiplier_ != 1.0f) {
-          size_t num_samples = pcm_len / sizeof(int16_t);
-          int16_t *samples = reinterpret_cast<int16_t *>(pcm);
-          for (size_t i = 0; i < num_samples; i++) {
-            float scaled = (float) samples[i] * self->volume_multiplier_;
-            if (scaled > 32767.0f) {
-              scaled = 32767.0f;
-            } else if (scaled < -32768.0f) {
-              scaled = -32768.0f;
-            }
-            samples[i] = (int16_t) scaled;
-          }
-        }
-
-        // Feed directly to the speaker. We use play(data, len, 0) — the
-        // non-blocking variant — because the 3-arg play() with ticks_to_wait>0
-        // calls vTaskDelay(ticks_to_wait) while the speaker is in
-        // STATE_STARTING. During that delay the speaker's 100ms buffer
-        // underruns and it stops before we ever write any data.
-        //
-        // Instead: play(data, len, 0) auto-starts the speaker if needed, then
-        // tries to write to the ring buffer immediately (0 = non-blocking).
-        // If the speaker isn't ready yet (ring buffer not created), it
-        // returns 0. We retry after a short 10ms delay — this gives the
-        // speaker task time to create its ring buffer without underrunning.
-        if (self->speaker_ != nullptr) {
-          size_t pcm_off = 0;
-          while (pcm_off < pcm_len && !self->http_task_should_exit_) {
-            // Only check is_stopped() after play() has been called at least
-            // once. Before that, the speaker may still be in STATE_STARTING
-            // (not STOPPED), and we need play() to trigger the ring buffer
-            // write once STATE_RUNNING is reached.
-            if (pcm_off > 0 && self->speaker_->is_stopped()) {
-              ESP_LOGW(TAG, "Speaker stopped during TTS playback at byte %u/%u",
-                       (unsigned) pcm_off, (unsigned) pcm_len);
-              break;
-            }
-            size_t written = self->speaker_->play(pcm + pcm_off, pcm_len - pcm_off, 0);
-            pcm_off += written;
-            if (written == 0) {
-              // Ring buffer not ready or full. Wait 10ms for the speaker
-              // task to create its ring buffer or consume data, then retry.
-              vTaskDelay(pdMS_TO_TICKS(10));
-            }
-          }
-        }
-      }
-    }
+bool OpenAIConversations::build_http_url_and_content_type_(char *url, size_t buf_size,
+                                                           const char *&content_type) const {
+  content_type = "application/json";
+  if (this->request_target_ == RequestTarget::CHAT) {
+    snprintf(url, buf_size, "%s/v1/chat/completions", this->endpoint_base_.c_str());
+  } else if (this->request_target_ == RequestTarget::STT) {
+    snprintf(url, buf_size, "%s/v1/audio/transcriptions", this->endpoint_base_.c_str());
+    content_type = "multipart/form-data; boundary=----esphome_openai_conv";
+  } else if (this->request_target_ == RequestTarget::TTS) {
+    snprintf(url, buf_size, "%s/v1/audio/speech", this->endpoint_base_.c_str());
+#ifdef USE_OPENAI_CONVERSATIONS_MCP
+  } else if (this->request_target_ == RequestTarget::MCP_CALL) {
+    snprintf(url, buf_size, "%s", this->current_mcp_url_.c_str());
+#endif
   } else {
-    // --- Chat/STT: send DATA messages via message buffer ---
-    uint8_t send_buf[HTTP_TASK_READ_CHUNK + 1];
-    send_buf[0] = (uint8_t) HttpMsgType::DATA;
+    return false;
+  }
+  return true;
+}
 
-    while (!self->http_task_should_exit_) {
-      int got = esp_http_client_read(self->http_client_,
-                                     reinterpret_cast<char *>(send_buf + 1), HTTP_TASK_READ_CHUNK);
-      if (got < 0) {
-        ESP_LOGE(TAG, "esp_http_client_read failed");
-        self->close_http_();
-        self->send_http_error_(self->http_msg_buffer_, "http_read", "Failed to read response");
-        goto task_done;
+void OpenAIConversations::set_http_extra_headers_(esp_http_client_handle_t client) {
+#ifdef USE_OPENAI_CONVERSATIONS_MCP
+  if (this->request_target_ == RequestTarget::MCP_CALL) {
+    esp_http_client_set_header(client, "Accept", "application/json, text/event-stream");
+    if (!this->current_mcp_auth_.empty()) {
+      esp_http_client_set_header(client, "Authorization", this->current_mcp_auth_.c_str());
+    }
+    if (!this->current_mcp_session_id_.empty()) {
+      esp_http_client_set_header(client, "Mcp-Session-Id", this->current_mcp_session_id_.c_str());
+    }
+    return;
+  }
+#endif
+  if (!this->auth_header_value_.empty()) {
+    esp_http_client_set_header(client, "Authorization", this->auth_header_value_.c_str());
+  }
+}
+
+bool OpenAIConversations::is_http_status_acceptable_(int status) const {
+  if (status == 200) {
+    return true;
+  }
+#ifdef USE_OPENAI_CONVERSATIONS_MCP
+  if (status == 202 && this->request_target_ == RequestTarget::MCP_CALL &&
+      this->current_mcp_call_type_ == McpCallType::INITIALIZED_NOTIF) {
+    return true;
+  }
+#endif
+  return false;
+}
+
+bool OpenAIConversations::http_feeds_speaker_() const {
+  return this->request_target_ == RequestTarget::TTS;
+}
+
+void OpenAIConversations::http_feed_speaker_(esp_http_client_handle_t client) {
+  bool speaker_started = false;
+  size_t header_skip = 44;
+  uint8_t read_buf[HTTP_TASK_READ_CHUNK];
+
+  while (!this->http_task_should_exit_) {
+    int got = esp_http_client_read(client, reinterpret_cast<char *>(read_buf), HTTP_TASK_READ_CHUNK);
+    if (got < 0) {
+      ESP_LOGE(TAG, "esp_http_client_read failed (TTS)");
+      this->close_http_();
+      this->send_http_error_(this->http_msg_buffer_, "http_read", "Failed to read TTS response");
+      return;
+    }
+    if (got == 0) {
+      break;
+    }
+
+    size_t off = 0;
+
+    if (!speaker_started) {
+      speaker_started = true;
+      if (this->speaker_ != nullptr) {
+        this->speaker_->set_audio_stream_info(
+            audio::AudioStreamInfo(MIC_BITS_PER_SAMPLE, MIC_CHANNELS, this->tts_sample_rate_));
+        this->speaker_->start();
       }
-      if (got == 0) {
-        break;  // EOF
-      }
-      xMessageBufferSend(self->http_msg_buffer_, send_buf, (size_t) got + 1, portMAX_DELAY);
+      uint8_t start_msg = (uint8_t) HttpMsgType::TTS_STREAM_START;
+      xMessageBufferSend(this->http_msg_buffer_, &start_msg, 1, portMAX_DELAY);
+    }
+
+    while (off < (size_t) got && header_skip > 0) {
+      size_t to_skip = (header_skip < (size_t) got - off) ? header_skip : ((size_t) got - off);
+      off += to_skip;
+      header_skip -= to_skip;
+    }
+
+    if (off < (size_t) got) {
+      this->feed_speaker_(read_buf + off, (size_t) got - off);
     }
   }
-
-  // 8) Clean up the HTTP client.
-  self->close_http_();
-
-  // 9) Send DONE to signal the loop that the response is complete. If we were
-  //    cancelled, skip this — the loop called stop_http_task_ which already
-  //    cleaned up.
-  if (!self->http_task_should_exit_) {
-    uint8_t done = (uint8_t) HttpMsgType::DONE;
-    xMessageBufferSend(self->http_msg_buffer_, &done, 1, portMAX_DELAY);
-  }
-
-  // Log the stack high-water mark so we can detect if we're close to
-  // overflow. This is the minimum free stack (in words) ever seen.
-  UBaseType_t high_water = uxTaskGetStackHighWaterMark(nullptr);
-  ESP_LOGV(TAG, "HTTP task stack high-water mark: %u words free", (unsigned) high_water);
-  }  // end of scope for all locals
-
-task_done:
-  // A FreeRTOS task must NEVER return from its entry function — doing so
-  // causes an IllegalInstruction crash (the return address is 0x00000000).
-  // Suspend ourselves and wait for stop_http_task_() to call vTaskDelete(),
-  // which safely deletes a suspended task.
-  vTaskSuspend(nullptr);
-}
-
-void OpenAIConversations::close_http_() {
-  if (this->http_client_ != nullptr) {
-    esp_http_client_cleanup(this->http_client_);
-    this->http_client_ = nullptr;
-  }
-}
-
-void OpenAIConversations::send_http_error_(MessageBufferHandle_t buf, const char *code, const char *message) {
-  // Pack the error code and message into a single message buffer message:
-  //   [ERROR_ type byte] [code_len byte] [code bytes] [msg_len byte] [msg bytes]
-  uint8_t code_len = (uint8_t) strlen(code);
-  uint8_t msg_len = (uint8_t) strlen(message);
-  size_t total = 3 + code_len + msg_len;
-  uint8_t err_buf[128];
-  if (total > sizeof(err_buf)) {
-    // Truncate the message if it doesn't fit.
-    msg_len = (uint8_t)(sizeof(err_buf) - 3 - code_len);
-    total = 3 + code_len + msg_len;
-  }
-  err_buf[0] = (uint8_t) HttpMsgType::ERROR_;
-  err_buf[1] = code_len;
-  memcpy(err_buf + 2, code, code_len);
-  err_buf[2 + code_len] = msg_len;
-  memcpy(err_buf + 3 + code_len, message, msg_len);
-  xMessageBufferSend(buf, err_buf, total, portMAX_DELAY);
 }
 
 // --- Request body builders -------------------------------------------------
@@ -1645,30 +1093,6 @@ void OpenAIConversations::build_tts_request_body_() {
 
 // --- Response processing ---------------------------------------------------
 
-void OpenAIConversations::process_sse_bytes_(const uint8_t *data, size_t len) {
-  // Append bytes to the line buffer, and whenever a '\n' is found, process
-  // the complete line. SSE events are separated by '\n'; a line starting with
-  // "data: " carries a JSON payload. The stream terminates with "data: [DONE]".
-  for (size_t i = 0; i < len; i++) {
-    char c = (char) data[i];
-    if (c == '\n') {
-      // NUL-terminate and process the accumulated line.
-      if (this->sse_line_len_ < SSE_LINE_MAX) {
-        this->sse_line_buffer_[this->sse_line_len_] = '\0';
-      } else {
-        this->sse_line_buffer_[SSE_LINE_MAX - 1] = '\0';
-      }
-      this->process_sse_line_(this->sse_line_buffer_, this->sse_line_len_);
-      this->sse_line_len_ = 0;
-    } else if (c != '\r') {
-      if (this->sse_line_len_ < SSE_LINE_MAX - 1) {
-        this->sse_line_buffer_[this->sse_line_len_++] = c;
-      }
-      // else: line too long; drop excess until the next newline.
-    }
-  }
-}
-
 void OpenAIConversations::process_sse_line_(const char *line, size_t len) {
   if (len == 0) {
     return;  // blank line separates events
@@ -1806,61 +1230,6 @@ void OpenAIConversations::process_stt_response_(const uint8_t *data, size_t len)
 }
 
 // --- Speaker output --------------------------------------------------------
-
-void OpenAIConversations::feed_speaker_(const uint8_t *data, size_t len) {
-  if (this->speaker_ == nullptr || this->speaker_buffer_ == nullptr) {
-    return;
-  }
-  size_t offset = 0;
-  while (offset < len) {
-    size_t free = SPEAKER_BUFFER_SIZE - this->speaker_buffer_index_;
-    size_t to_copy = (len - offset < free) ? (len - offset) : free;
-    memcpy(this->speaker_buffer_ + this->speaker_buffer_index_, data + offset, to_copy);
-    this->speaker_buffer_index_ += to_copy;
-    offset += to_copy;
-
-    // Apply volume multiplier to the newly copied int16 samples.
-    if (this->volume_multiplier_ != 1.0f && to_copy > 0) {
-      size_t start_sample_index = (this->speaker_buffer_index_ - to_copy) / sizeof(int16_t);
-      size_t num_samples = to_copy / sizeof(int16_t);
-      int16_t *samples = reinterpret_cast<int16_t *>(this->speaker_buffer_);
-      for (size_t i = 0; i < num_samples; i++) {
-        float scaled = (float) samples[start_sample_index + i] * this->volume_multiplier_;
-        if (scaled > 32767.0f) {
-          scaled = 32767.0f;
-        } else if (scaled < -32768.0f) {
-          scaled = -32768.0f;
-        }
-        samples[start_sample_index + i] = (int16_t) scaled;
-      }
-    }
-
-    if (this->speaker_buffer_index_ >= SPEAKER_BUFFER_SIZE) {
-      this->flush_speaker_buffer_();
-    }
-  }
-}
-
-void OpenAIConversations::flush_speaker_buffer_() {
-  if (this->speaker_ == nullptr || this->speaker_buffer_ == nullptr || this->speaker_buffer_index_ == 0) {
-    return;
-  }
-  // If the speaker has stopped (e.g. underrun on a short TTS response),
-  // play() would block forever waiting for a dead speaker task to consume
-  // data. Drop the buffer and let the loop transition to teardown.
-  if (this->speaker_->is_stopped()) {
-    ESP_LOGW(TAG, "Speaker stopped during TTS playback; dropping %u bytes",
-             (unsigned) this->speaker_buffer_index_);
-    this->speaker_buffer_index_ = 0;
-    return;
-  }
-  size_t written = this->speaker_->play(this->speaker_buffer_, this->speaker_buffer_index_);
-  // Move any unwritten bytes to the front of the buffer.
-  if (written > 0 && written < this->speaker_buffer_index_) {
-    memmove(this->speaker_buffer_, this->speaker_buffer_ + written, this->speaker_buffer_index_ - written);
-  }
-  this->speaker_buffer_index_ -= (written <= this->speaker_buffer_index_) ? written : this->speaker_buffer_index_;
-}
 
 // --- Main loop state machine ------------------------------------------------
 
@@ -2619,6 +1988,7 @@ void OpenAIConversations::loop() {
         }
         ESP_LOGD(TAG, "Tool calls requested (round %u, %u tools)",
                  (unsigned) this->tool_round_, (unsigned) this->accumulated_tool_call_count_);
+        this->on_tool_start_cb_.call();
         // Retain base64 audio (multimodal) so round 2+ can re-include it.
         if (this->multimodal_ && this->retained_b64_audio_ == nullptr) {
           this->retain_b64_audio_(this->round1_b64_offset_, this->round1_b64_len_);
@@ -2736,18 +2106,18 @@ void OpenAIConversations::loop() {
         if (!srv.initialized && !srv.stateless) {
           // Server hasn't been initialized and isn't known to be stateless.
           if (this->current_mcp_call_type_ == McpCallType::INITIALIZE) {
-            body = mcp_build_initialize_request(this->mcp_request_id_++);
+            body = openai_common::mcp_build_initialize_request(this->mcp_request_id_++);
             ESP_LOGV(TAG, "Initializing MCP server %u (%s)",
                      (unsigned) this->mcp_route_server_index_, srv.name.c_str());
           } else if (this->current_mcp_call_type_ == McpCallType::INITIALIZED_NOTIF) {
-            body = mcp_build_initialized_notification();
+            body = openai_common::mcp_build_initialized_notification();
             ESP_LOGV(TAG, "Sending notifications/initialized to server %u",
                      (unsigned) this->mcp_route_server_index_);
           }
         } else {
           // Already initialized or stateless: send tools/list.
           this->current_mcp_call_type_ = McpCallType::TOOLS_LIST;
-          body = mcp_build_tools_list_request(this->mcp_request_id_++);
+          body = openai_common::mcp_build_tools_list_request(this->mcp_request_id_++);
           ESP_LOGV(TAG, "Fetching tools from MCP server %u (%s)",
                    (unsigned) this->mcp_route_server_index_, srv.name.c_str());
         }
@@ -2818,7 +2188,7 @@ void OpenAIConversations::loop() {
         this->current_mcp_url_ = srv.url;
         this->current_mcp_auth_ = srv.auth_header;
         std::string body =
-            mcp_build_tools_call_request(this->mcp_request_id_++, tool.name, tool.arguments);
+            openai_common::mcp_build_tools_call_request(this->mcp_request_id_++, tool.name, tool.arguments);
         ExternalRAMAllocator<uint8_t> ext(ExternalRAMAllocator<uint8_t>::ALLOC_EXTERNAL);
         if (this->request_body_ != nullptr) {
           ext.deallocate(this->request_body_, this->request_body_capacity_);

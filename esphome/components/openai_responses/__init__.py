@@ -23,6 +23,7 @@ from esphome import automation
 from esphome.automation import register_action, register_condition
 import esphome.codegen as cg
 from esphome.components import esp32, micro_wake_word, microphone, speaker, text_sensor
+from esphome.components.openai_common import register_generic_openai_actions
 import esphome.config_validation as cv
 from esphome.const import (
     CONF_ID,
@@ -40,7 +41,7 @@ from esphome.core import CORE
 # in their YAML. ``audio`` provides AudioStreamInfo, ``json`` provides the
 # ArduinoJson parse/build helpers, ``ring_buffer`` provides the thread-safe mic
 # buffer used to hand audio from the mic callback to the main loop.
-AUTO_LOAD = ["audio", "json", "ring_buffer"]
+AUTO_LOAD = ["audio", "json", "ring_buffer", "openai_common"]
 
 # Hard requirements: a microphone source, wake-word detection, networking and
 # PSRAM (all audio/HTTP buffers live in external RAM).
@@ -362,6 +363,7 @@ async def to_code(config):
             await automation.build_callback_automation(var, method, args, conf)
 
     cg.add_define("USE_OPENAI_RESPONSES")
+    cg.add_define("USE_OPENAI_COMMON")
 
     # esp_http_client is excluded from ESPHome's ESP-IDF build by default (to
     # save compile time). Re-enable it explicitly; audio's to_code (auto-loaded)
@@ -421,3 +423,12 @@ async def openai_responses_is_running_to_code(
     var = cg.new_Pvariable(condition_id, template_arg)
     await cg.register_parented(var, config[CONF_ID])
     return var
+
+
+# --- Generic action aliases (work regardless of which component is loaded) ---
+# Only one component is loaded at a time (via the !include in common.yaml), so
+# there is no registration conflict. These allow common.yaml to use openai.start
+# / openai.stop / openai.is_running instead of component-specific names.
+_GENERIC_ACTIONS = register_generic_openai_actions(
+    OpenAIResponses, openai_responses_ACTION_SCHEMA, StartAction, StopAction, IsRunningCondition
+)

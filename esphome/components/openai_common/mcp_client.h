@@ -2,7 +2,7 @@
 
 #include <string>
 
-namespace esphome::openai_responses {
+namespace esphome::openai_common {
 
 /// Configuration for one MCP server (streamable-HTTP transport).
 /// The component owns a vector of these, populated at codegen time.
@@ -27,7 +27,7 @@ struct McpServerConfig {
 /// The server responds with its capabilities and a `Mcp-Session-Id` header.
 inline std::string mcp_build_initialize_request(int id) {
   return std::string("{\"jsonrpc\":\"2.0\",\"method\":\"initialize\",\"params\":{\"protocolVersion\":"
-                     "\"2025-11-25\",\"capabilities\":{},\"clientInfo\":{\"name\":\"esphome-openai-conv\","
+                     "\"2025-11-25\",\"capabilities\":{},\"clientInfo\":{\"name\":\"esphome-openai\","
                      "\"version\":\"1.0\"}},\"id\":") +
          std::to_string(id) + "}";
 }
@@ -67,4 +67,4 @@ inline std::string mcp_build_tools_call_request(int id, const std::string &name,
          "\",\"arguments\":" + args + "},\"id\":" + std::to_string(id) + "}";
 }
 
-}  // namespace esphome::openai_responses
+}  // namespace esphome::openai_common

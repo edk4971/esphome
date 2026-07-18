@@ -64,11 +64,25 @@ external_components:
       type: git
       ref: main
       url: https://github.com/edk4971/esphome
-    components: [ openai_responses ]
+    components: [ openai_responses, openai_common ]
 ```
 
 If you already have an `external_components` block, just add the
-`openai_responses` entry to it.
+`openai_responses` and `openai_common` entries to it.
+
+> **Shared infrastructure:** This component depends on `openai_common`, which
+> provides the `OpenAIBase`/`OpenAIHTTPBase` base classes, `PsramAudioBuffer`
+> (2MB PSRAM ring buffer + feeder task), and the unified MCP client. It is
+> auto-loaded — you don't need to configure it separately.
+>
+> **Shared hardware config:** A complete S3-Box-3 config (hardware, display,
+> wake word, media player, etc.) lives in
+> [`openai_common/common.yaml`](../openai_common/common.yaml). The component
+> YAML in [`esp32-openai-responses.yaml`](./esp32-openai-responses.yaml) is a
+> thin wrapper that `!include`s from `common.yaml` and adds just the
+> `openai_responses:` block + automations. To switch between the three
+> components (responses, conversations, realtime), change the `!include` line
+> at the bottom of `common.yaml`.
 
 ## Requirements
 
