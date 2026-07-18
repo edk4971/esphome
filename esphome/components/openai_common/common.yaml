@@ -48,7 +48,7 @@ substitutions:
 
   # Chat model. responses/conversations: `chat_model` config key.
   # realtime: `model` config key. All three reference this substitution.
-  openai_chat_model: "gemma-4-12b-it-GGUF"
+  openai_chat_model: "gemma-4-12b-it-GGUF-mcp"
 
   # STT (speech-to-text) model. responses/conversations only; realtime
   # ignores this (it streams raw PCM with server-side VAD).
@@ -100,6 +100,8 @@ substitutions:
     - Mode 2 (Research): Use openzim-mcp (Wikipedia archive, June 2026).
     -- First, determine the most likely article title.
     -- Use the tool to search for the article.
+    -- If a search returns unexpected results, silently retry with a different query. Never narrate failed searches, intermediate reasoning, or tool results to the user.
+    -- Only output the final response after all tool calls are complete.
     -- Summarize the answer in plain, spoken English, applying the Voice Normalization rules above.
 
 # =============================================================================
