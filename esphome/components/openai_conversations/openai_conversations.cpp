@@ -122,6 +122,7 @@ static size_t base64_encode_to(const uint8_t *data, size_t len, char *out, size_
 
 /// Escapes a string for inclusion in a JSON string value (surrounding quotes
 /// are NOT added). Drops control characters below 0x20.
+#ifdef USE_OPENAI_CONVERSATIONS_MCP
 static std::string escape_json_string_(const std::string &input) {
   std::string out;
   out.reserve(input.size() + 16);
@@ -146,6 +147,7 @@ static std::string escape_json_string_(const std::string &input) {
   }
   return out;
 }
+#endif  // USE_OPENAI_CONVERSATIONS_MCP
 
 // --- Lifecycle -------------------------------------------------------------
 
@@ -285,6 +287,7 @@ void OpenAIConversations::reset_turn_state_() {
 
   // Conversations-specific turn state.
   this->tts_stream_started_ = false;
+  this->fired_tool_start_ = false;
 
   this->response_text_.clear();
   this->response_text_.shrink_to_fit();
@@ -631,7 +634,7 @@ bool OpenAIConversations::build_http_url_and_content_type_(char *url, size_t buf
                                                            const char *&content_type) const {
   content_type = "application/json";
   if (this->request_target_ == RequestTarget::CHAT) {
-    snprintf(url, buf_size, "%s/v1/chat/completions", this->endpoint_base_.c_str());
+    snprintf(url, buf_size, "%s/v1/mcp/chat/completions", this->endpoint_base_.c_str());
   } else if (this->request_target_ == RequestTarget::STT) {
     snprintf(url, buf_size, "%s/v1/audio/transcriptions", this->endpoint_base_.c_str());
     content_type = "multipart/form-data; boundary=----esphome_openai_conv";
@@ -1132,7 +1135,15 @@ void OpenAIConversations::process_sse_line_(const char *line, size_t len) {
   JsonObject root = doc.as<JsonObject>();
   JsonArray choices = root["choices"].as<JsonArray>();
   if (choices.isNull() || choices.size() == 0) {
-    ESP_LOGW(TAG, "SSE: no choices in chunk");
+    // Server-side MCP: the server sends tool execution results as SSE chunks
+    // with a "name" and "result" field but no "choices" array. This indicates
+    // the server executed a tool — fire on_tool_start once per turn.
+    const char *tool_name = root["name"];
+    if (tool_name != nullptr && !this->fired_tool_start_) {
+      this->fired_tool_start_ = true;
+      ESP_LOGD(TAG, "Server-side tool executed: %s", tool_name);
+      this->on_tool_start_cb_.call();
+    }
     return;
   }
   JsonObject first_choice = choices[0].as<JsonObject>();

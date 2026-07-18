@@ -134,8 +134,15 @@ class OpenAIConversations : public esphome::openai_common::OpenAIHTTPBase {
   void set_tts_voice(const std::string &v) { this->tts_voice_ = v; }
   void set_tts_sample_rate(uint32_t v) { this->tts_sample_rate_ = v; }
   void set_has_tools(bool v) { this->has_tools_ = v; }
+  // No-op stub when MCP is not enabled. Called unconditionally from codegen.
+  void set_tools_cache_ttl_ms(uint32_t v) {
 #ifdef USE_OPENAI_CONVERSATIONS_MCP
-  void set_tools_cache_ttl_ms(uint32_t v) { this->tools_cache_ttl_ms_ = v; }
+    this->tools_cache_ttl_ms_ = v;
+#else
+    (void) v;
+#endif
+  }
+#ifdef USE_OPENAI_CONVERSATIONS_MCP
   void add_mcp_server(const std::string &name, const std::string &url, const std::string &api_key) {
     openai_common::McpServerConfig cfg;
     cfg.name = name;
@@ -161,6 +168,10 @@ class OpenAIConversations : public esphome::openai_common::OpenAIHTTPBase {
   /// connects so the first wake-word turn doesn't pay the fetch latency.
   /// No-op if already cached or not idle.
   void prefetch_tools();
+#else
+  /// No-op stub when MCP is not enabled (server-side MCP). Called from
+  /// common.yaml's wifi.on_connect — must exist for all components.
+  void prefetch_tools() {}
 #endif
 
   // --- Conversations-specific callback registration ---
@@ -233,13 +244,15 @@ class OpenAIConversations : public esphome::openai_common::OpenAIHTTPBase {
   std::string extract_mcp_json_();
   // Processes the parsed MCP response. Called from READING_MCP on DONE.
   void process_mcp_response_();
-  // Continuation of request_start after the tools cache is refreshed (or when
-  // the cache is valid). Fires on_start, stops MWW, allocates buffers, starts mic.
-  void continue_request_start_();
   // Builds the cached OpenAI-format tools JSON array from raw MCP tools/list
   // responses stored in raw_tools_per_server_. Called after all servers queried.
   void build_cached_tools_json_();
 #endif
+
+  // Continuation of request_start after the tools cache is refreshed (or when
+  // the cache is valid). Fires on_start, stops MWW, allocates buffers, starts mic.
+  // Called from STARTING_TURN state regardless of MCP support.
+  void continue_request_start_();
 
   // --- Config (conversations-specific; set once at codegen) ---
   std::string stt_model_;
@@ -337,6 +350,11 @@ class OpenAIConversations : public esphome::openai_common::OpenAIHTTPBase {
 
   // --- Conversations-specific callback (the shared ones live in OpenAIBase) ---
   LazyCallbackManager<void()> on_tool_start_cb_;
+
+  // Tracks whether on_tool_start has been fired for the current turn.
+  // Fires when the server sends an SSE chunk with no choices (indicating
+  // server-side tool execution in progress).
+  bool fired_tool_start_{false};
 };
 
 // --- Automation actions / conditions (Parented to the component) ---

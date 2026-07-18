@@ -39,16 +39,6 @@ openai_conversations:
   silence_threshold: 0.002
   silence_duration_ms: 700ms
   max_recording_ms: 30000ms
-  # --- Tools (optional) ---
-  tools_file: tools.json
-  tools_cache_ttl: 24h
-  mcp_servers:
-    - name: ha
-      url: ${ha_url}
-      api_key: ${ha_token}
-    - name: openzim
-      url: ${openzim_url}
-      api_key: ${openzim_token}
   # --- Text sensors ---
   text_request: request_text
   text_response: response_text
